@@ -1,0 +1,28 @@
+{
+  "name": "dev-team-orchestrator-mcp",
+  "version": "1.0.0",
+  "description": "MCP server: spec-driven LangGraph pipeline (SA → TA → specs → SE → QA) via 9router",
+  "main": "src/orchestrator.ts",
+  "scripts": {
+    "start": "tsx src/orchestrator.ts",
+    "pipeline": "tsx scripts/run-pipeline.mjs",
+    "pipeline:docs": "tsx scripts/run-pipeline.mjs --docs-only",
+    "graph": "tsx scripts/print-graph.mjs"
+  },
+  "keywords": ["mcp", "langgraph", "9router"],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@langchain/langgraph": "^1.4.17",
+    "@langchain/openai": "^1.5.13",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^18.0.3",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

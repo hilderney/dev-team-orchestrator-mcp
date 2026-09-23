@@ -1,0 +1,38 @@
+---
+description: Route team work through MCP LangGraph + 9router models, not Cursor Task
+alwaysApply: true
+---
+
+# Dev Team Orchestrator routing
+
+When the user asks for team/feature work via **dev-team-orchestrator** (requirements, tech design, implementation plan, tests, or a full pipeline):
+
+1. Call the MCP tool `run_development_pipeline` on `user-dev-team-orchestrator`.
+2. Do **not** use Cursor `Task` with `software-engineer`, `qa-engineer`, `system-architect`, or `technology-architect` for that work.
+3. Those Cursor Task subagents use Cursor models and **never** hit 9router.
+
+## Spec-driven pipeline
+
+The MCP tool runs LangGraph. Pass optional `projectRoot` (default `"."`) — that folder is treated as the **app root** for all writes (resolved under `WORKSPACE_ROOT` or `cwd`). Prefer setting `projectRoot` (e.g. `samples/my-app`) so the MCP package README is not overwritten.
+
+| Stage | Env var | Default | Writes / reads |
+|---|---|---|---|
+| System Architect (requirements) | `MODEL_SYSTEM_ARCHITECT` | `9RSA-system-architect-free` | `README.md` + `.docs/requirements.md` |
+| Technology Architect | `MODEL_TECHNOLOGY_ARCHITECT` | `9RTA-technology-architect-free` | `.docs/technologies.md` + README update |
+| System Architect (specs) | `MODEL_SYSTEM_ARCHITECT` | same | `.docs/todo.md` + `.docs/specs/*.spec.md` + README |
+| Software Engineer | `MODEL_SOFTWARE_ENGINEER` | `9RSE-software-engineer-free` | Implements **one** pending spec at a time; marks todo |
+| QA Engineer | `MODEL_QA_ENGINEER` | `9RQA-qa-free` | Tests per spec; runs tests; SE fix loop on failure |
+| Orchestrator finalize | (no LLM) | — | README pipeline status |
+
+**Docs-only:** pass `docsOnly: true` (or CLI `npm run pipeline:docs` / `--docs-only`) to run through todo+specs + finalize (no SE/QA).
+
+**CLI:** `npm run pipeline -- --project-root samples/foo "idea…"` and `--docs-only`.
+
+**Graph viz:** `npm run graph` prints Mermaid and writes `.docs/langgraph.mmd`.
+
+```text
+❌ BAD:  Task(subagent_type="qa-engineer")
+✅ GOOD: CallDynamicTool(user-dev-team-orchestrator.run_development_pipeline)
+```
+
+Exception: editing **this** MCP server's own source (e.g. `src/orchestrator.ts`) may use normal tools; still prefer not to fake team roles via Task when the user expected a 9router pipeline run.
