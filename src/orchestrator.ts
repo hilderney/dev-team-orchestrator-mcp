@@ -86,6 +86,13 @@ import {
   setArchitecturePhase,
   summarizeTech,
 } from "./architecture-progress.js";
+import {
+  formatFileList,
+  implNotify,
+  implementationSnapshot,
+  readImplementationProgress,
+  setImplementationPhase,
+} from "./implementation-progress.js";
 
 /** Package root (this MCP server repo), resolved from this file. */
 export const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -312,6 +319,10 @@ export class ProgressSession {
   pendingPreReqs: string[] = [];
   preReqIndex = 0;
   preReqTotal = 0;
+  specIndex = 0;
+  specTotal = 0;
+  qaIndex = 0;
+  qaTotal = 0;
   onStatus?: ProgressSink;
   sendNotification?: McpProgressSend;
   progressToken?: string | number;
@@ -333,12 +344,20 @@ export class ProgressSession {
     pendingPreReqs?: string[];
     preReqIndex?: number;
     preReqTotal?: number;
+    specIndex?: number;
+    specTotal?: number;
+    qaIndex?: number;
+    qaTotal?: number;
   }): void {
     if (opts.pendingSpecs) this.pendingSpecs = [...opts.pendingSpecs];
     if (opts.pendingQaSpecs) this.pendingQaSpecs = [...opts.pendingQaSpecs];
     if (opts.pendingPreReqs) this.pendingPreReqs = [...opts.pendingPreReqs];
     if (opts.preReqIndex !== undefined) this.preReqIndex = opts.preReqIndex;
     if (opts.preReqTotal !== undefined) this.preReqTotal = opts.preReqTotal;
+    if (opts.specIndex !== undefined) this.specIndex = opts.specIndex;
+    if (opts.specTotal !== undefined) this.specTotal = opts.specTotal;
+    if (opts.qaIndex !== undefined) this.qaIndex = opts.qaIndex;
+    if (opts.qaTotal !== undefined) this.qaTotal = opts.qaTotal;
   }
 
   remainingHint(): string {
@@ -355,21 +374,27 @@ export class ProgressSession {
           : `pré-reqs ${n}/${n} concluídos`
       );
     }
-    if (this.pendingSpecs.length > 0) {
-      const shown = this.pendingSpecs.slice(0, 5).join(", ");
-      const more =
-        this.pendingSpecs.length > 5
-          ? ` (+${this.pendingSpecs.length - 5})`
-          : "";
-      parts.push(`faltam specs ${shown}${more}`);
+    if (this.pendingSpecs.length > 0 || this.specTotal > 0) {
+      const current = this.pendingSpecs[0] || "";
+      const i = this.specIndex || 1;
+      const n = this.specTotal || this.pendingSpecs.length;
+      const left = this.pendingSpecs.length;
+      if (left > 0) {
+        parts.push(`spec ${i}/${n}: ${current}; faltam ${left}`);
+      } else if (n > 0) {
+        parts.push(`specs ${n}/${n} concluídos`);
+      }
     }
-    if (this.pendingQaSpecs.length > 0) {
-      const shown = this.pendingQaSpecs.slice(0, 5).join(", ");
-      const more =
-        this.pendingQaSpecs.length > 5
-          ? ` (+${this.pendingQaSpecs.length - 5})`
-          : "";
-      parts.push(`QA pendente ${shown}${more}`);
+    if (this.pendingQaSpecs.length > 0 || this.qaTotal > 0) {
+      const current = this.pendingQaSpecs[0] || "";
+      const i = this.qaIndex || 1;
+      const n = this.qaTotal || this.pendingQaSpecs.length;
+      const left = this.pendingQaSpecs.length;
+      if (left > 0) {
+        parts.push(`QA ${i}/${n}: ${current}; faltam ${left}`);
+      } else if (n > 0) {
+        parts.push(`QA ${n}/${n} concluídos`);
+      }
     }
     return parts.length > 0 ? parts.join("; ") : "sem pendências listadas";
   }
@@ -1624,11 +1649,13 @@ async function writePipelineResult(
 ): Promise<void> {
   try {
     const arch = await readArchitectureProgress(appRoot);
+    const impl = await readImplementationProgress(appRoot);
     const merged = {
       ...payload,
       ...metricsSnapshot(),
       sandbox: sandboxConfig().enabled,
       architecture: architectureSnapshot(arch),
+      implementation: implementationSnapshot(impl),
     };
     await writeDoc(
       appRoot,
@@ -2320,12 +2347,15 @@ async function scaffoldPrepareNode(
       const appRoot = appRootOf(state);
       const scaffold = await ensureAppScaffold(appRoot);
       if (scaffold.applied) {
-        notify(
-          "scaffoldPrepare",
-          `Applied vite-vitest-react template (${scaffold.files.length} files)`
-        );
         const install = await npmInstall(appRoot);
         if (!install.ok) {
+          await implNotify(
+            (s, m) => notify(s, m),
+            appRoot,
+            "scaffoldPrepare",
+            `scaffold npm install FAILED`,
+            { phase: "scaffold", scaffold: { applied: true, files: scaffold.files } }
+          );
           const err = new Error(
             `[scaffoldPrepare] npm install failed: ${install.log.slice(0, 500)}`
           );
@@ -2340,13 +2370,36 @@ async function scaffoldPrepareNode(
           );
         }
         await markProjectSetupDone(appRoot);
+        await implNotify(
+          (s, m) => notify(s, m),
+          appRoot,
+          "scaffoldPrepare",
+          `scaffold applied (${scaffold.files.length} files) + npm install OK`,
+          {
+            phase: "scaffold",
+            scaffold: { applied: true, files: scaffold.files },
+            lastWrite: {
+              count: scaffold.files.length,
+              files: scaffold.files,
+            },
+          }
+        );
         return {
           appRoot,
           filesWritten: scaffold.files,
           completedSpecs: ["project-setup"],
         };
       }
-      notify("scaffoldPrepare", "package.json already present; skip scaffold");
+      await implNotify(
+        (s, m) => notify(s, m),
+        appRoot,
+        "scaffoldPrepare",
+        "scaffold skipped — package.json already present",
+        {
+          phase: "scaffold",
+          scaffold: { applied: false, files: [] },
+        }
+      );
       return { appRoot };
     },
     {
@@ -2373,6 +2426,16 @@ async function bootstrapFixNode(
         throw err;
       }
       notify("bootstrapFix", `Attempting bootstrap repair round ${round}`);
+      await implNotify(
+        (s, m) => notify(s, m),
+        appRoot,
+        "bootstrapFix",
+        `bootstrap repair round ${round}/${MAX_BOOTSTRAP_FIX_ROUNDS}`,
+        {
+          phase: "bootstrap",
+          qa: { bootstrapRound: round, lastErrorClass: "bootstrap" },
+        }
+      );
       const scaffold = await ensureAppScaffold(appRoot);
       if (scaffold.applied) {
         notify("bootstrapFix", "scaffold applied");
@@ -2433,10 +2496,31 @@ async function softwareEngineerNode(
     const batch = await pickSpecBatch(appRoot, workPending, 3);
     setBatchSize(batch.length);
     const slug = batch[0];
+    const alreadyDone = (state.completedSpecs ?? []).length;
+    const specTotal = alreadyDone + workPending.length;
+    const specIndex = alreadyDone + 1;
     getProgress().setPending({
       pendingSpecs: workPending,
       pendingQaSpecs: state.pendingQaSpecs ?? [],
+      specIndex,
+      specTotal,
     });
+    await implNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "softwareEngineer",
+      `spec ${specIndex}/${specTotal} em andamento: ${batch.join(", ")}`,
+      {
+        phase: "implement",
+        specs: {
+          total: specTotal,
+          completed: alreadyDone,
+          current: slug,
+          batch,
+          pending: workPending,
+        },
+      }
+    );
     const [readme, requirements, technologies, todo] = await Promise.all([
       readDoc(appRoot, README_PATH),
       readDoc(appRoot, REQUIREMENTS_PATH),
@@ -2526,9 +2610,19 @@ async function softwareEngineerNode(
     const smoke = await runTscSmoke(appRoot, "softwareEngineer");
     if (!smoke.ok) {
       const hint = `workflow=resume projectRoot=${projectRoot} (tsc failed on '${slug}')`;
-      notify(
+      await implNotify(
+        (s, m) => notify(s, m),
+        appRoot,
         "softwareEngineer",
-        `tsc smoke FAILED for '${slug}' — not marking todo done; ${hint}`
+        `tsc smoke FAILED on '${slug}' — not marking todo done`,
+        {
+          phase: "implement",
+          specs: { current: slug, batch },
+          lastWrite: {
+            count: written.count,
+            files: written.filesWritten,
+          },
+        }
       );
       const err = new Error(
         `[softwareEngineer] tsc smoke failed for '${slug}': ${smoke.log.slice(0, 500)}. Resume with ${hint}`
@@ -2545,12 +2639,33 @@ async function softwareEngineerNode(
     }
 
     const remaining = workPending.slice(batch.length);
-    getProgress().setPending({ pendingSpecs: remaining });
-    notify(
+    const completedNow = alreadyDone + batch.length;
+    getProgress().setPending({
+      pendingSpecs: remaining,
+      specIndex: remaining.length > 0 ? completedNow + 1 : specTotal,
+      specTotal,
+    });
+    await implNotify(
+      (s, m) => notify(s, m),
+      appRoot,
       "softwareEngineer",
       remaining.length > 0
-        ? `Completed ${batch.join(",")} (${written.count} files); ${remaining.length} remaining`
-        : `Completed ${batch.join(",")} (${written.count} files); all implementation tasks done`
+        ? `spec(s) ${batch.join(",")} done — wrote ${written.count} files: ${formatFileList(written.filesWritten)}; faltam ${remaining.length}`
+        : `spec(s) ${batch.join(",")} done — wrote ${written.count} files: ${formatFileList(written.filesWritten)}; all implementation tasks done`,
+      {
+        phase: "implement",
+        specs: {
+          total: specTotal,
+          completed: completedNow,
+          current: slug,
+          batch,
+          pending: remaining,
+        },
+        lastWrite: {
+          count: written.count,
+          files: written.filesWritten,
+        },
+      }
     );
 
     return {
@@ -2634,17 +2749,29 @@ async function softwareEngineerFixNode(
 
     const rawContent = String(res.content ?? "");
     const written = await writeParsedFiles(appRoot, rawContent, projectRoot);
+    const round = (state.qaFixRound ?? 0) + 1;
 
-    notify(
+    await implNotify(
+      (s, m) => notify(s, m),
+      appRoot,
       "softwareEngineerFix",
-      `Applied fix for '${slug}' (${written.count} files, round ${(state.qaFixRound ?? 0) + 1})`
+      `fix round ${round}/${MAX_QA_FIX_ROUNDS} for '${slug}' — wrote ${written.count} files: ${formatFileList(written.filesWritten)}`,
+      {
+        phase: "fix",
+        specs: { current: slug },
+        qa: { current: slug, fixRound: round },
+        lastWrite: {
+          count: written.count,
+          files: written.filesWritten,
+        },
+      }
     );
 
     return {
       appRoot,
       code: rawContent,
       filesWritten: written.filesWritten,
-      qaFixRound: (state.qaFixRound ?? 0) + 1,
+      qaFixRound: round,
     };
   },
     {
@@ -2664,10 +2791,34 @@ async function qaEngineerNode(
     const appRoot = appRootOf(state);
     if (pendingQa.length === 0) {
       pendingQa = await listSpecSlugs(appRoot);
-      getProgress().setPending({ pendingQaSpecs: pendingQa });
     }
 
     const slug = pendingQa[0] ?? state.currentSpec ?? "";
+    const prevImpl = await readImplementationProgress(appRoot);
+    const passedBefore = prevImpl?.qa.passed ?? [];
+    const qaTotalAll = Math.max(
+      pendingQa.length + passedBefore.length,
+      pendingQa.length,
+      prevImpl?.specs.total ?? 0
+    );
+    const qaIndex = passedBefore.length + 1;
+    getProgress().setPending({
+      pendingQaSpecs: pendingQa,
+      qaIndex,
+      qaTotal: qaTotalAll || pendingQa.length,
+    });
+    await implNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "qaEngineer",
+      `QA ${qaIndex}/${qaTotalAll || pendingQa.length}: ${slug}`,
+      {
+        phase: "qa",
+        qa: { current: slug },
+        specs: { current: slug },
+      }
+    );
+
     const [readme, todo, technologies, specBody] = await Promise.all([
       readDoc(appRoot, README_PATH),
       readDoc(appRoot, TODO_PATH),
@@ -2722,11 +2873,6 @@ async function qaEngineerNode(
     }
 
     const result = await runProjectTests(appRoot, "qaEngineer");
-    getProgress().emit(
-      "qaEngineer",
-      "notify",
-      `test run ${result.ok ? "PASSED" : "FAILED"} for spec '${slug}'`
-    );
 
     if (!result.ok) {
       const failureClass =
@@ -2734,9 +2880,19 @@ async function qaEngineerNode(
       setErrorClass(failureClass);
 
       if (failureClass === "bootstrap") {
-        notify(
+        await implNotify(
+          (s, m) => notify(s, m),
+          appRoot,
           "qaEngineer",
-          `Bootstrap failure for '${slug}' — routing to bootstrapFix (not feature fix)`
+          `QA FAIL (bootstrap) ${slug} → bootstrapFix`,
+          {
+            phase: "qa",
+            qa: {
+              current: slug,
+              lastErrorClass: "bootstrap",
+              failed: [slug],
+            },
+          }
         );
         return {
           appRoot,
@@ -2758,15 +2914,41 @@ async function qaEngineerNode(
             { notify: (m) => notify("qaEngineer", m) }
           );
         }
+        await implNotify(
+          (s, m) => notify(s, m),
+          appRoot,
+          "qaEngineer",
+          `QA FAIL (${failureClass}) ${slug} — fix rounds exhausted`,
+          {
+            phase: "qa",
+            qa: {
+              current: slug,
+              lastErrorClass: failureClass,
+              failed: [slug],
+              fixRound: round,
+            },
+          }
+        );
         const err = new Error(
           `[qaEngineer] tests still failing after ${MAX_QA_FIX_ROUNDS} fix rounds:\n${result.log}`
         );
         (err as Error & { failureKind?: string }).failureKind = failureClass;
         throw err;
       }
-      notify(
+      await implNotify(
+        (s, m) => notify(s, m),
+        appRoot,
         "qaEngineer",
-        `Tests failed for '${slug}' (${failureClass}); requesting SE fix (round ${round + 1}/${MAX_QA_FIX_ROUNDS})`
+        `QA FAIL (${failureClass}) ${slug} → SE-fix round ${round + 1}/${MAX_QA_FIX_ROUNDS}`,
+        {
+          phase: "qa",
+          qa: {
+            current: slug,
+            lastErrorClass: failureClass,
+            failed: [slug],
+            fixRound: round,
+          },
+        }
       );
       return {
         appRoot,
@@ -2780,12 +2962,33 @@ async function qaEngineerNode(
     }
 
     const remaining = pendingQa.filter((s) => s !== slug);
-    getProgress().setPending({ pendingQaSpecs: remaining });
-    notify(
+    const passed = [...passedBefore.filter((p) => p !== slug), slug];
+    getProgress().setPending({
+      pendingQaSpecs: remaining,
+      qaIndex: remaining.length > 0 ? passed.length + 1 : qaTotalAll,
+      qaTotal: qaTotalAll || pendingQa.length,
+    });
+    await implNotify(
+      (s, m) => notify(s, m),
+      appRoot,
       "qaEngineer",
       remaining.length > 0
-        ? `Tests passed for '${slug}'; ${remaining.length} spec(s) left`
-        : "All tests passed for all specs"
+        ? `QA PASS ${slug}; ${remaining.length} spec(s) left`
+        : `QA PASS ${slug}; all tests passed`,
+      {
+        phase: remaining.length > 0 ? "qa" : "done",
+        qa: {
+          current: remaining[0] ?? "",
+          passed,
+          failed: [],
+          lastErrorClass: null,
+          fixRound: 0,
+        },
+        lastWrite:
+          written.count > 0
+            ? { count: written.count, files: written.filesWritten }
+            : undefined,
+      }
     );
 
     return {
@@ -2863,13 +3066,15 @@ async function orchestratorFinalizeNode(
 
     if (state.workflow === "docs" || state.docsOnly) {
       await setArchitecturePhase(appRoot, "done");
+    } else {
+      await setImplementationPhase(appRoot, "done");
     }
 
     notify(
       "orchestratorFinalize",
       state.workflow === "docs" || state.docsOnly
         ? "Docs pipeline complete; README updated (see .docs/architecture-progress.json)"
-        : `Workflow '${state.workflow || "full"}' complete; README updated`
+        : `Workflow '${state.workflow || "full"}' complete; see .docs/implementation-progress.json`
     );
 
     return {

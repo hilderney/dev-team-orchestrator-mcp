@@ -155,6 +155,7 @@ npm run smoke:reqs
 npm run smoke:files
 npm run smoke:improvements
 npm run smoke:architecture
+npm run smoke:implementation
 npm run smoke:all
 ```
 
@@ -168,6 +169,7 @@ Use `projectRoot` so generated docs land in the app folder, not this MCP package
 - `npm run smoke:files` — FILE sanitize, recursion helper, test preflight, fidelity heuristic
 - `npm run smoke:improvements` — bootstrap/vitest/scaffold/FILE repair/progress close/healthcheck/metrics
 - `npm run smoke:architecture` — architecture progress pack (pré-req hints, JSON artifact, summaries)
+- `npm run smoke:implementation` — implementation progress pack (spec/QA hints, JSON artifact)
 - CI: [`.github/workflows/zteam-smokes.yml`](.github/workflows/zteam-smokes.yml) runs `smoke:all`
 
 Optional live check (needs 9router): run `npm run pipeline:docs -- --project-root samples/smoke-app "tiny idea"` and confirm heartbeats if a stage exceeds 30s.

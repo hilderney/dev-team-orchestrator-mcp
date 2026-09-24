@@ -19,7 +19,8 @@
     "smoke:files": "tsx scripts/smoke-files.mjs",
     "smoke:improvements": "tsx scripts/smoke-improvements.mjs",
     "smoke:architecture": "tsx scripts/smoke-architecture-progress.mjs",
-    "smoke:all": "npm run smoke && npm run smoke:workflows && npm run smoke:reqs && npm run smoke:files && npm run smoke:improvements && npm run smoke:architecture"
+    "smoke:implementation": "tsx scripts/smoke-implementation-progress.mjs",
+    "smoke:all": "npm run smoke && npm run smoke:workflows && npm run smoke:reqs && npm run smoke:files && npm run smoke:improvements && npm run smoke:architecture && npm run smoke:implementation"
   },
   "keywords": ["mcp", "langgraph", "9router"],
   "author": "",

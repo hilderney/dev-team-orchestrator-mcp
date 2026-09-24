@@ -55,10 +55,12 @@ SE marks todo done only after **tsc smoke**; FILE paths/bodies are sanitized; QA
 4. If fidelityWarnings or drift vs userIdea → fix constraints in userIdea / requirements
    (do NOT blindly re-run docs “to correct” — that often worsens drift)
 5. workflow=feature or full to implement
-6. On failure → read .docs/pipeline-result.json (includes architecture snapshot) → workflow=resume
+6. Watch "Implementation:" notifications (spec i/N, QA PASS/FAIL, bootstrap/fix)
+   and .docs/implementation-progress.json
+7. On failure → read .docs/pipeline-result.json (architecture + implementation snapshots) → workflow=resume
 ```
 
-Heartbeats during requirements show `pré-req i/N: …; faltam K` instead of a blank “sem pendências”.
+Heartbeats during requirements show `pré-req i/N: …; faltam K`. During SE/QA: `spec i/N: …` and `QA i/N: …`.
 
 ### Rescue (do not invent workarounds)
 
@@ -78,8 +80,8 @@ Heartbeats during requirements show `pré-req i/N: …; faltam K` instead of a b
 
 ### After the tool returns
 
-1. Report: `workflow`, `workflowReason`, **`appRoot`**, `filesWritten`, `fidelityWarnings`, `resumeHint`, key `notifications` (especially `Architecture:` lines).
-2. Verify under **`appRoot`**: `README.md`, `.docs/architecture-progress.json`, `.docs/requirements.md`, `.docs/todo.md`, and expected `src/` (or say what’s missing).
+1. Report: `workflow`, `workflowReason`, **`appRoot`**, `filesWritten`, `fidelityWarnings`, `resumeHint`, key `notifications` (especially `Architecture:` / `Implementation:` lines).
+2. Verify under **`appRoot`**: `README.md`, `.docs/architecture-progress.json`, `.docs/implementation-progress.json`, `.docs/requirements.md`, `.docs/todo.md`, and expected `src/` (or say what’s missing).
 3. On failure: quote `failureKind` + `resumeHint`; propose the next MCP call (`resume` / `fix` / `docs`), not a Cursor Task rewrite.
 4. Optional sanity: `git status` under the workspace; if old runs left fences/`→ skipped` in `.ts`, mention it (sanitize should prevent new ones).
 
