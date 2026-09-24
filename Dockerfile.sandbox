@@ -1,0 +1,5 @@
+# Optional base image for ZTEAM_SANDBOX=1 pipelines (Node + npm; vitest via npx).
+FROM node:22-bookworm
+WORKDIR /app
+RUN npm install -g vitest@2.1.8 typescript@5.7.2
+CMD ["bash"]

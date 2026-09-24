@@ -6,8 +6,20 @@
   "scripts": {
     "start": "tsx src/orchestrator.ts",
     "pipeline": "tsx scripts/run-pipeline.mjs",
-    "pipeline:docs": "tsx scripts/run-pipeline.mjs --docs-only",
-    "graph": "tsx scripts/print-graph.mjs"
+    "pipeline:docs": "tsx scripts/run-pipeline.mjs --workflow=docs",
+    "pipeline:full": "tsx scripts/run-pipeline.mjs --workflow=full",
+    "pipeline:feature": "tsx scripts/workflows/run.mjs feature",
+    "pipeline:punch": "tsx scripts/workflows/run.mjs punch",
+    "pipeline:fix": "tsx scripts/workflows/run.mjs fix",
+    "pipeline:resume": "tsx scripts/workflows/run.mjs resume",
+    "graph": "tsx scripts/print-graph.mjs",
+    "smoke": "tsx scripts/smoke-c.mjs",
+    "smoke:workflows": "tsx scripts/smoke-workflows.mjs",
+    "smoke:reqs": "tsx scripts/smoke-reqs.mjs",
+    "smoke:files": "tsx scripts/smoke-files.mjs",
+    "smoke:improvements": "tsx scripts/smoke-improvements.mjs",
+    "smoke:architecture": "tsx scripts/smoke-architecture-progress.mjs",
+    "smoke:all": "npm run smoke && npm run smoke:workflows && npm run smoke:reqs && npm run smoke:files && npm run smoke:improvements && npm run smoke:architecture"
   },
   "keywords": ["mcp", "langgraph", "9router"],
   "author": "",

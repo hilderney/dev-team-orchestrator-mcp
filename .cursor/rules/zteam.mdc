@@ -1,0 +1,17 @@
+---
+description: zteam — run MCP LangGraph team (9router) via run_development_pipeline
+alwaysApply: false
+---
+
+# @zteam
+
+When this rule is attached (`@zteam`) or the user says **zteam** / **/zteam**:
+
+1. Call MCP `run_development_pipeline` on **`user-zteam`** (not Cursor Task subagents).
+2. Pass a rich `userIdea` (constraints included); set **`projectRoot`** (prefer `samples/…`).
+3. MCP env: **`WORKSPACE_ROOT`** = Cursor workspace. `projectRoot: "."` against the orchestrator package is rejected.
+4. Greenfield sensível: **`docs` → review requirements → `feature`/`full`**. Mid-failure: **`resume`** (same `projectRoot`).
+5. After the tool: report `appRoot`, `filesWritten`, `fidelityWarnings`, `resumeHint`; read `{appRoot}/.docs/pipeline-result.json` on failure.
+6. Never silently copy sibling projects; never “fix drift” by blindly re-running docs that reinvent the product.
+
+Do not implement team roles yourself with Cursor Task — that bypasses 9router.

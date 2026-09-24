@@ -24,14 +24,14 @@ async function mermaidFor(label, compiled) {
 async function main() {
   const { compiledGraph } = await import("../src/orchestrator.ts");
 
-  // docsOnly is a state flag on the same compiled graph (routes after specs → finalize).
+  // workflow / docsOnly are state flags; router picks entry after START.
   const fullMermaid = await mermaidFor("compiledGraph", compiledGraph);
-  console.log("%% spec-driven pipeline (compiledGraph; docsOnly via state)");
+  console.log("%% spec-driven pipeline (workflowRouter → full|docs|feature|punch|fix)");
   console.log(fullMermaid);
 
   await mkdir(dirname(OUT_PATH), { recursive: true });
   const combined = [
-    "%% spec-driven pipeline (compiledGraph; docsOnly via state)",
+    "%% spec-driven pipeline (workflowRouter → full|docs|feature|punch|fix)",
     fullMermaid.trimEnd(),
     "",
   ].join("\n");

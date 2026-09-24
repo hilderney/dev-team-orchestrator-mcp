@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { access, readdir, writeFile } from "node:fs/promises";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -12,15 +12,33 @@ const DOCS_ONLY_RELS = [
   ".docs/todo.md",
 ];
 
+const WORKFLOW_ALIASES = new Set([
+  "full",
+  "docs",
+  "feature",
+  "punch",
+  "fix",
+  "resume",
+]);
+
 function parseArgs(argv) {
   let docsOnly = false;
   let projectRoot = ".";
+  let workflow = "";
   const ideaParts = [];
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--docs-only") {
       docsOnly = true;
+      continue;
+    }
+    if (a === "--workflow") {
+      workflow = (argv[++i] || "").trim().toLowerCase();
+      continue;
+    }
+    if (a.startsWith("--workflow=")) {
+      workflow = a.slice("--workflow=".length).trim().toLowerCase();
       continue;
     }
     if (a === "--project-root") {
@@ -34,8 +52,15 @@ function parseArgs(argv) {
     ideaParts.push(a);
   }
 
+  if (workflow && !WORKFLOW_ALIASES.has(workflow)) {
+    throw new Error(
+      `Invalid --workflow '${workflow}'. Use: ${[...WORKFLOW_ALIASES].join("|")}`
+    );
+  }
+
   return {
     docsOnly,
+    workflow,
     projectRoot,
     userIdea: ideaParts.join(" ").trim(),
   };
@@ -58,18 +83,34 @@ async function fileExists(abs) {
 }
 
 async function main() {
-  const { docsOnly, projectRoot, userIdea: ideaArg } = parseArgs(
-    process.argv.slice(2)
-  );
+  const {
+    docsOnly,
+    workflow: workflowArg,
+    projectRoot,
+    userIdea: ideaArg,
+  } = parseArgs(process.argv.slice(2));
   const userIdea = ideaArg || DEFAULT_IDEA;
-  const mode = docsOnly ? "docs-only" : "full";
 
   console.error(`[pipeline] importing graphs…`);
-  const { compiledGraph, resolveAppRoot, PACKAGE_ROOT: pkg } = await import(
-    "../src/orchestrator.ts"
-  );
+  const {
+    compiledGraph,
+    resolveAppRoot,
+    resolveGraphRecursionLimit,
+    PACKAGE_ROOT: pkg,
+    createProgressSession,
+    withProgressSession,
+  } = await import("../src/orchestrator.ts");
+  const { resolveExplicitWorkflow } = await import("../src/workflows/index.ts");
+
+  const explicit = resolveExplicitWorkflow({
+    workflow: workflowArg,
+    docsOnly,
+    userIdea,
+  });
+  const mode = explicit || "auto";
 
   const appRoot = resolveAppRoot(projectRoot);
+  const recursionLimit = resolveGraphRecursionLimit();
   const workspace =
     process.env.WORKSPACE_ROOT?.trim() || process.cwd();
 
@@ -77,30 +118,63 @@ async function main() {
   console.error(`[pipeline] WORKSPACE_ROOT/cwd=${workspace}`);
   console.error(`[pipeline] projectRoot=${projectRoot}`);
   console.error(`[pipeline] appRoot=${appRoot}`);
-  console.error(`[pipeline] mode=${mode}`);
+  console.error(`[pipeline] workflow=${mode}`);
+  console.error(`[pipeline] recursionLimit=${recursionLimit}`);
   console.error(
     `[pipeline] userIdea=${userIdea.slice(0, 120)}${userIdea.length > 120 ? "…" : ""}`
   );
   console.error(
-    docsOnly
-      ? "[pipeline] invoking docs graph (SA req → TA → SA specs → finalize)…"
-      : "[pipeline] invoking full graph (… → SE loop → QA/fix → finalize)…"
+    `[pipeline] invoking graph (router → ${mode === "auto" ? "classify" : mode})…`
   );
 
   const started = Date.now();
-  console.error(`[pipeline] start (${mode})`);
+  const session = createProgressSession();
 
   let result;
   try {
-    result = await compiledGraph.invoke({
-      userIdea,
-      projectRoot,
-      docsOnly,
-      notifications: [],
-      pendingSpecs: [],
-      completedSpecs: [],
-      pendingQaSpecs: [],
-      qaFixRound: 0,
+    result = await withProgressSession(session, async () => {
+      session.emit("pipeline", "stage", `start (workflow=${mode})`);
+      const out = await compiledGraph.invoke(
+        {
+          userIdea,
+          projectRoot,
+          workflow: explicit || "",
+          docsOnly: Boolean(docsOnly) || explicit === "docs",
+          workflowReason: "",
+          notifications: [],
+          resume: "",
+          pendingPreReqs: [],
+          completedPreReqs: [],
+          currentPreReq: "",
+          preReqTotal: 0,
+          pendingSpecs: [],
+          completedSpecs: [],
+          pendingQaSpecs: [],
+          qaFixRound: 0,
+          appRoot,
+          filesWritten: [],
+          fidelityWarnings: [],
+          failureKind: "",
+          resumeHint: "",
+        },
+        { recursionLimit }
+      );
+      session.emit(
+        "pipeline",
+        "stage",
+        `done in ${Date.now() - started}ms (workflow=${out.workflow || mode})`
+      );
+      return {
+        ...out,
+        appRoot: out.appRoot || appRoot,
+        recursionLimit,
+        notifications:
+          session.lines.length > 0
+            ? session.lines
+            : Array.isArray(out.notifications)
+              ? out.notifications
+              : [],
+      };
     });
   } catch (err) {
     console.error(
@@ -111,9 +185,12 @@ async function main() {
     const failure = {
       ok: false,
       mode,
+      workflow: explicit || null,
       projectRoot,
       appRoot,
+      recursionLimit,
       error: err instanceof Error ? err.message : String(err),
+      resumeHint: `workflow=resume --project-root ${projectRoot}`,
       userIdea,
     };
     await writeFile(
@@ -121,10 +198,21 @@ async function main() {
       JSON.stringify(failure, null, 2),
       "utf8"
     );
+    try {
+      await writeFile(
+        join(appRoot, ".docs", "pipeline-result.json"),
+        JSON.stringify(failure, null, 2),
+        "utf8"
+      );
+    } catch {
+      /* app may not exist yet */
+    }
     return;
   }
 
-  console.error(`[pipeline] done in ${Date.now() - started}ms (${mode})`);
+  console.error(
+    `[pipeline] done in ${Date.now() - started}ms (workflow=${result.workflow || mode})`
+  );
 
   const outPath = join(PACKAGE_ROOT, "pipeline-result.json");
   await writeFile(outPath, JSON.stringify(result, null, 2), "utf8");
@@ -146,7 +234,7 @@ async function main() {
     console.error(`  MISSING  .docs/specs/`);
   }
 
-  if (!docsOnly && Array.isArray(result.notifications)) {
+  if (Array.isArray(result.notifications)) {
     console.error("[pipeline] notifications:");
     for (const n of result.notifications) {
       console.error(`  ${n}`);
@@ -158,8 +246,12 @@ async function main() {
       {
         ok: true,
         mode,
+        workflow: result.workflow || mode,
+        workflowReason: result.workflowReason || null,
         projectRoot,
         appRoot,
+        recursionLimit,
+        filesWritten: result.filesWritten ?? [],
         outPath,
         stages: Object.keys(result),
         ms: Date.now() - started,

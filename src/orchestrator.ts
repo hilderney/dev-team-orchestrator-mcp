@@ -1,7 +1,16 @@
 import "dotenv/config";
 import { spawn } from "node:child_process";
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  normalize,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 import { StateGraph, Annotation, START, END } from "@langchain/langgraph";
 import { ChatOpenAI } from "@langchain/openai";
@@ -9,6 +18,74 @@ import { HumanMessage, SystemMessage, type BaseMessage } from "@langchain/core/m
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import {
+  WORKFLOW_CATALOG,
+  classifyWorkflow,
+  isWorkflowId,
+  resolveExplicitWorkflow,
+  stripWorkflowTag,
+  workflowCatalogText,
+  type WorkflowId,
+} from "./workflows/index.js";
+import {
+  buildSmoke,
+  ensureAppScaffold,
+  ensureVitestTestScript,
+  markProjectSetupDone,
+  npmInstall,
+  runBootstrapGate,
+  runCanonicalTests,
+  runQaSmokeTests,
+} from "./bootstrap.js";
+import { classifyTestFailure, type TestFailureClass } from "./test-failure.js";
+import {
+  clearMetrics,
+  createMetrics,
+  getMetrics,
+  metricsSnapshot,
+  recordNoFileSections,
+  recordRetry,
+  recordStageTiming,
+  recordToolCallMalformed,
+  setBatchSize,
+  setErrorClass,
+} from "./metrics.js";
+import {
+  healthcheckNineRouter,
+  shouldHealthcheckForWorkflow,
+} from "./healthcheck.js";
+import {
+  coercePathForContent,
+  extractWriteFileToolCalls,
+  repairFileContract,
+  stripAgentNotesFromCode,
+  toolCallsToFileSections,
+  writeFileToolDefinition,
+  isCodeOrTestPath,
+} from "./file-contract.js";
+import {
+  CircuitBreakerError,
+  readPipelineState,
+  stageBudgetMs,
+  updatePipelineStage,
+} from "./pipeline-state.js";
+import { applyHitlDecision, hitlEnabled, pausePipelineForHuman } from "./hitl.js";
+import {
+  assertExpectedWorkspace,
+  assertPathInsideWorkspace,
+  sandboxConfig,
+} from "./sandbox.js";
+import { pickSpecBatch } from "./spec-batch.js";
+import {
+  archNotify,
+  architectureSnapshot,
+  extractSectionTitle,
+  formatSlugList,
+  listSpecSlugsFromTodo,
+  readArchitectureProgress,
+  setArchitecturePhase,
+  summarizeTech,
+} from "./architecture-progress.js";
 
 /** Package root (this MCP server repo), resolved from this file. */
 export const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -20,6 +97,10 @@ const TECHNOLOGIES_PATH = ".docs/technologies.md";
 const TODO_PATH = ".docs/todo.md";
 const SPECS_DIR = ".docs/specs";
 const README_PATH = "README.md";
+const PIPELINE_RESULT_PATH = ".docs/pipeline-result.json";
+const DEFAULT_GRAPH_RECURSION_LIMIT = 120;
+const SPEC_SPLIT_CHARS = 4000;
+const SE_INVOKE_ATTEMPTS = 6;
 
 function getWorkspaceRoot(): string {
   const fromEnv = process.env.WORKSPACE_ROOT?.trim();
@@ -31,13 +112,53 @@ export function resolveAppRoot(projectRoot = "."): string {
   return resolve(getWorkspaceRoot(), projectRoot || ".");
 }
 
+/** LangGraph recursionLimit: env GRAPH_RECURSION_LIMIT or estimate from pending specs. */
+export function resolveGraphRecursionLimit(pendingSpecsEstimate = 0): number {
+  const fromEnv = Number.parseInt(process.env.GRAPH_RECURSION_LIMIT ?? "", 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  if (pendingSpecsEstimate > 0) {
+    return Math.max(100, 10 + 4 * pendingSpecsEstimate);
+  }
+  return DEFAULT_GRAPH_RECURSION_LIMIT;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 function errorText(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
+  if (err == null) return String(err);
+  if (err instanceof Error) {
+    return err.message || err.name || "Error";
+  }
+  if (typeof err === "object" && err !== null && "message" in err) {
+    const msg = (err as { message: unknown }).message;
+    if (typeof msg === "string" && msg.trim()) return msg;
+  }
+  try {
+    return String(err);
+  } catch {
+    return "unknown error";
+  }
+}
+
+/** Fail early if writing would overwrite this MCP package (agents-review U2). */
+export function assertSafeAppRoot(
+  appRoot: string,
+  projectRoot = "."
+): void {
+  const app = resolve(appRoot);
+  const pkg = resolve(PACKAGE_ROOT);
+  const rel = (projectRoot || ".").trim() || ".";
+  if (app === pkg && (rel === "." || rel === "./")) {
+    throw new Error(
+      [
+        "Refusing to write into the orchestrator package root.",
+        "Set WORKSPACE_ROOT to your app folder and/or pass projectRoot",
+        '(e.g. "samples/my-app"), not projectRoot="." against the MCP cwd.',
+      ].join(" ")
+    );
+  }
 }
 
 function parseMaxTokens(envValue: string | undefined, fallback: number): number {
@@ -55,6 +176,77 @@ function stripOuterMarkdownFence(text: string): string {
   const match = trimmed.match(/^```(?:markdown|md)?\r?\n([\s\S]*?)\r?\n```$/i);
   return match ? match[1].trimEnd() : trimmed;
 }
+
+/** Strip language fences and prose skip lines from a FILE body. */
+export function sanitizeFileBody(content: string): string {
+  let text = content.trim();
+  // Whole-body fence (any language), optional trailing prose after closing ```
+  const whole = text.match(
+    /^```(?:[\w.+-]*)\r?\n([\s\S]*?)\r?\n```(?:\s*[\s\S]*)?$/
+  );
+  if (whole) {
+    text = whole[1];
+  } else {
+    text = stripOuterMarkdownFence(text);
+  }
+  const lines = text.split(/\r?\n/).filter((line) => {
+    const t = line.trim();
+    if (/^[→\-]\s*skipped/i.test(t)) return false;
+    if (/^->\s*skipped/i.test(t)) return false;
+    if (/^skipped:\s*/i.test(t)) return false;
+    return true;
+  });
+  text = lines.join("\n").replace(/\s+$/, "");
+  return stripAgentNotesFromCode(text);
+}
+
+/**
+ * Normalize LLM FILE paths: reject .. / absolute; strip duplicated projectRoot prefix.
+ * Returns path relative to appRoot using forward slashes.
+ */
+export function sanitizeFilePath(
+  appRoot: string,
+  projectRoot: string,
+  rawPath: string
+): string {
+  let p = (rawPath || "").trim().replace(/\\/g, "/");
+  if (!p) {
+    throw new Error("FILE path is empty");
+  }
+  if (isAbsolute(p) || /^[a-zA-Z]:\//.test(p)) {
+    throw new Error(`FILE path must be relative (got absolute: ${rawPath})`);
+  }
+  if (p.split("/").some((seg) => seg === "..")) {
+    throw new Error(`FILE path must not contain '..' (got: ${rawPath})`);
+  }
+
+  const proj = (projectRoot || ".").trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  const projBase = basename(proj === "." ? "" : proj);
+  // Strip duplicated projectRoot prefix once (e.g. samples/pacman/src/x → src/x)
+  if (proj && proj !== "." && (p === proj || p.startsWith(proj + "/"))) {
+    p = p.slice(proj.length).replace(/^\//, "");
+  } else if (projBase && (p === projBase || p.startsWith(projBase + "/"))) {
+    p = p.slice(projBase.length).replace(/^\//, "");
+  }
+
+  p = p.replace(/^\.\//, "").replace(/^\/+/, "");
+  if (!p) {
+    throw new Error(`FILE path empty after stripping projectRoot (${rawPath})`);
+  }
+
+  const abs = resolve(appRoot, ...p.split("/"));
+  const app = resolve(appRoot);
+  const rel = relative(app, abs);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error(`FILE path escapes appRoot: ${rawPath}`);
+  }
+  return rel.split(sep).join("/");
+}
+
+export type WriteParsedResult = {
+  count: number;
+  filesWritten: string[];
+};
 
 async function pathExists(abs: string): Promise<boolean> {
   try {
@@ -79,14 +271,295 @@ async function readDoc(appRoot: string, relPath: string): Promise<string> {
   }
 }
 
-function notify(
+const HEARTBEAT_MS = parseMaxTokens(process.env.PROGRESS_HEARTBEAT_MS, 30_000);
+const PARTIAL_PREVIEW_MIN_CHARS = 80;
+const PARTIAL_PREVIEW_MAX_CHARS = 240;
+
+type ProgressKind =
+  | "notify"
+  | "heartbeat"
+  | "stage"
+  | "partial"
+  | "retry"
+  | "error"
+  | "warn";
+
+type ProgressSink = (line: string) => void | Promise<void>;
+
+type McpProgressSend = (notification: {
+  method: string;
+  params: Record<string, unknown>;
+}) => Promise<void>;
+
+function progressKindToLevel(
+  kind: ProgressKind
+): "debug" | "info" | "warning" | "error" {
+  if (kind === "heartbeat" || kind === "partial") return "debug";
+  if (kind === "retry" || kind === "warn") return "warning";
+  if (kind === "error") return "error";
+  return "info";
+}
+
+/** Live progress for one pipeline run (MCP + CLI). */
+export class ProgressSession {
+  readonly lines: string[] = [];
+  private cursor = 0;
+  private progressStep = 0;
+  private partialPreviewSent = false;
+  private closed = false;
+  pendingSpecs: string[] = [];
+  pendingQaSpecs: string[] = [];
+  pendingPreReqs: string[] = [];
+  preReqIndex = 0;
+  preReqTotal = 0;
+  onStatus?: ProgressSink;
+  sendNotification?: McpProgressSend;
+  progressToken?: string | number;
+  traceId?: string;
+
+  /** Stop progress notifications (P1-2). Safe to call multiple times. */
+  close(): void {
+    this.closed = true;
+    this.progressToken = undefined;
+  }
+
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  setPending(opts: {
+    pendingSpecs?: string[];
+    pendingQaSpecs?: string[];
+    pendingPreReqs?: string[];
+    preReqIndex?: number;
+    preReqTotal?: number;
+  }): void {
+    if (opts.pendingSpecs) this.pendingSpecs = [...opts.pendingSpecs];
+    if (opts.pendingQaSpecs) this.pendingQaSpecs = [...opts.pendingQaSpecs];
+    if (opts.pendingPreReqs) this.pendingPreReqs = [...opts.pendingPreReqs];
+    if (opts.preReqIndex !== undefined) this.preReqIndex = opts.preReqIndex;
+    if (opts.preReqTotal !== undefined) this.preReqTotal = opts.preReqTotal;
+  }
+
+  remainingHint(): string {
+    const parts: string[] = [];
+    if (this.pendingPreReqs.length > 0 || this.preReqTotal > 0) {
+      const current = this.pendingPreReqs[0] || "";
+      const i = this.preReqIndex || 1;
+      const n = this.preReqTotal || this.pendingPreReqs.length;
+      const title = current.slice(0, 50) || "(pré-req)";
+      const left = this.pendingPreReqs.length;
+      parts.push(
+        left > 0
+          ? `pré-req ${i}/${n}: ${title}; faltam ${left}`
+          : `pré-reqs ${n}/${n} concluídos`
+      );
+    }
+    if (this.pendingSpecs.length > 0) {
+      const shown = this.pendingSpecs.slice(0, 5).join(", ");
+      const more =
+        this.pendingSpecs.length > 5
+          ? ` (+${this.pendingSpecs.length - 5})`
+          : "";
+      parts.push(`faltam specs ${shown}${more}`);
+    }
+    if (this.pendingQaSpecs.length > 0) {
+      const shown = this.pendingQaSpecs.slice(0, 5).join(", ");
+      const more =
+        this.pendingQaSpecs.length > 5
+          ? ` (+${this.pendingQaSpecs.length - 5})`
+          : "";
+      parts.push(`QA pendente ${shown}${more}`);
+    }
+    return parts.length > 0 ? parts.join("; ") : "sem pendências listadas";
+  }
+
+  emit(stage: string, kind: ProgressKind, message: string): string {
+    const tid = this.traceId ? ` trace=${this.traceId.slice(0, 8)}` : "";
+    const line = `[${stage}] ${kind}: ${message}${tid}`;
+    this.lines.push(line);
+    const level = progressKindToLevel(kind);
+    if (level === "error") console.error(line);
+    else if (level === "warning") console.warn(line);
+    else console.info(line);
+    void this.forward(line, level, kind);
+    return line;
+  }
+
+  /** Lines emitted since last takeDelta (for state.notifications). */
+  takeDelta(): string[] {
+    const out = this.lines.slice(this.cursor);
+    this.cursor = this.lines.length;
+    return out;
+  }
+
+  resetPartialPreview(): void {
+    this.partialPreviewSent = false;
+  }
+
+  maybeEmitPartial(stage: string, partial: string): void {
+    if (this.partialPreviewSent) return;
+    if (partial.trim().length < PARTIAL_PREVIEW_MIN_CHARS) return;
+    this.partialPreviewSent = true;
+    this.emit(stage, "partial", interestingPartialPreview(partial));
+  }
+
+  private async forward(
+    line: string,
+    level: "debug" | "info" | "warning" | "error",
+    kind: ProgressKind
+  ): Promise<void> {
+    try {
+      await this.onStatus?.(line);
+    } catch {
+      /* ignore sink errors */
+    }
+    if (this.closed || !this.sendNotification) return;
+    try {
+      await this.sendNotification({
+        method: "notifications/message",
+        params: {
+          level,
+          logger: "zteam",
+          data: line,
+        },
+      });
+    } catch {
+      /* client may not support logging */
+    }
+    // Never send huge TAP / test dumps as progress; skip heartbeat spam volume
+    if (this.progressToken === undefined) return;
+    if (kind === "heartbeat" && line.length > 400) return;
+    if (line.length > 2000) return;
+    this.progressStep += 1;
+    try {
+      await this.sendNotification({
+        method: "notifications/progress",
+        params: {
+          progressToken: this.progressToken,
+          progress: this.progressStep,
+          message: line.slice(0, 500),
+        },
+      });
+    } catch {
+      /* client may not have requested progress */
+    }
+  }
+}
+
+let activeProgress: ProgressSession | null = null;
+
+function getProgress(): ProgressSession {
+  if (!activeProgress) {
+    activeProgress = new ProgressSession();
+  }
+  return activeProgress;
+}
+
+export function createProgressSession(opts?: {
+  onStatus?: ProgressSink;
+  sendNotification?: McpProgressSend;
+  progressToken?: string | number;
+}): ProgressSession {
+  const session = new ProgressSession();
+  if (opts?.onStatus) session.onStatus = opts.onStatus;
+  if (opts?.sendNotification) session.sendNotification = opts.sendNotification;
+  if (opts?.progressToken !== undefined) {
+    session.progressToken = opts.progressToken;
+  }
+  return session;
+}
+
+export async function withProgressSession<T>(
+  session: ProgressSession,
+  fn: () => Promise<T>
+): Promise<T> {
+  const prev = activeProgress;
+  activeProgress = session;
+  try {
+    return await fn();
+  } finally {
+    activeProgress = prev;
+  }
+}
+
+function interestingPartialPreview(text: string): string {
+  const fileMatch = text.match(/===FILE:\s*([^\r\n=]+?)===/i);
+  if (fileMatch) {
+    return `recebido ===FILE: ${fileMatch[1].trim()}=== (+${text.length} chars)`;
+  }
+  const section = text.match(/===(SUMMARY|REQUIREMENTS|TECH|TODO|SPEC:[^=]+)===/i);
+  if (section) {
+    return `recebido ===${section[1]}=== (+${text.length} chars)`;
+  }
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= PARTIAL_PREVIEW_MAX_CHARS) return oneLine;
+  return `${oneLine.slice(0, PARTIAL_PREVIEW_MAX_CHARS)}…`;
+}
+
+function chunkToText(chunk: unknown): string {
+  if (!chunk || typeof chunk !== "object") return "";
+  const content = (chunk as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && "text" in part) {
+          return String((part as { text: unknown }).text ?? "");
+        }
+        return "";
+      })
+      .join("");
+  }
+  return content == null ? "" : String(content);
+}
+
+function notify(stage: string, message: string): void {
+  getProgress().emit(stage, "notify", message);
+}
+
+/**
+ * Run work with a 30s silence heartbeat; optional partial text for preview.
+ */
+async function withHeartbeat<T>(
   stage: string,
-  message: string,
-  prev: string[] = []
-): string[] {
-  const line = `[${stage}] notify: ${message}`;
-  console.error(line);
-  return [...prev, line];
+  waitingFor: string,
+  fn: (reportPartial: (text: string) => void) => Promise<T>
+): Promise<T> {
+  const progress = getProgress();
+  progress.resetPartialPreview();
+  const started = Date.now();
+  let partial = "";
+
+  const tick = (): void => {
+    const secs = Math.round((Date.now() - started) / 1000);
+    progress.emit(
+      stage,
+      "heartbeat",
+      `ainda aguardando ${waitingFor} (${secs}s); ${progress.remainingHint()}`
+    );
+    if (partial.trim()) {
+      progress.maybeEmitPartial(stage, partial);
+    }
+  };
+
+  const timer = setInterval(tick, HEARTBEAT_MS);
+  const lateWarn = setTimeout(() => {
+    progress.emit(
+      stage,
+      "warn",
+      `heartbeat atrasado >2x intervalo aguardando ${waitingFor}; ${progress.remainingHint()}`
+    );
+  }, HEARTBEAT_MS * 2);
+  try {
+    return await fn((text) => {
+      partial = text;
+    });
+  } finally {
+    clearInterval(timer);
+    clearTimeout(lateWarn);
+  }
 }
 
 /** Parse ===SUMMARY=== / ===REQUIREMENTS=== sections; null if either is missing. */
@@ -105,8 +578,106 @@ function parseSummaryAndRequirements(
   return { summary, requirements };
 }
 
+const MAX_RESUME_WORDS = 512;
+
+export function countWords(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) return 0;
+  return trimmed.split(/\s+/).filter(Boolean).length;
+}
+
+/** Truncate resume to at most maxWords (keeps leading content). */
+export function clampResumeWords(
+  text: string,
+  maxWords = MAX_RESUME_WORDS
+): string {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return words.join(" ");
+  return words.slice(0, maxWords).join(" ");
+}
+
+/**
+ * Parse bootstrap LLM output: ===RESUME=== + ===PRE_REQUIREMENTS=== (numbered lines).
+ */
+export function parseResumeAndPreRequirements(
+  raw: string
+): { resume: string; preRequirements: string[] } | null {
+  const text = stripOuterMarkdownFence(raw);
+  const resumeMatch = text.match(
+    /===RESUME===\s*([\s\S]*?)\s*===PRE_REQUIREMENTS===/i
+  );
+  const preMatch = text.match(/===PRE_REQUIREMENTS===\s*([\s\S]*)$/i);
+  if (!resumeMatch || !preMatch) return null;
+  const resume = clampResumeWords(resumeMatch[1].trim());
+  const preRequirements = parseNumberedList(preMatch[1]);
+  if (!resume || preRequirements.length === 0) return null;
+  return { resume, preRequirements };
+}
+
+/** Extract `1. item` / `1) item` lines from a block. */
+export function parseNumberedList(block: string): string[] {
+  const items: string[] = [];
+  for (const line of block.split(/\r?\n/)) {
+    const m = line.trim().match(/^\d+[.)]\s*(.+)$/);
+    if (m?.[1]?.trim()) items.push(m[1].trim());
+  }
+  return items;
+}
+
+export function buildBootstrapReadme(
+  resume: string,
+  preRequirements: string[]
+): string {
+  const list = preRequirements
+    .map((item, i) => `${i + 1}. ${item}`)
+    .join("\n");
+  return [
+    `# Project`,
+    "",
+    "## Resume",
+    "",
+    clampResumeWords(resume),
+    "",
+    "## Pré Requirements",
+    "",
+    list,
+    "",
+  ].join("\n");
+}
+
+export function buildCleanReadme(resume: string): string {
+  return [
+    `# Project`,
+    "",
+    "## Resume",
+    "",
+    clampResumeWords(resume),
+    "",
+    "## Documentation",
+    "",
+    `- [Requirements](${REQUIREMENTS_PATH}) — functional and non-functional requirements`,
+    "",
+    "Prefer these documents over chat state when implementing or testing.",
+    "",
+  ].join("\n");
+}
+
+function assertParsedResumeAndPreRequirements(
+  text: string,
+  stage: string
+): void {
+  assertUsableLlmText(text, stage);
+  if (!parseResumeAndPreRequirements(text)) {
+    throw new LlmContentError(
+      stage,
+      "parse_failed",
+      "expected ===RESUME=== and ===PRE_REQUIREMENTS=== with numbered items"
+    );
+  }
+}
+
 /** Parse ===FILE: path=== sections from an LLM response. */
-function parseFileSections(raw: string): { path: string; content: string }[] {
+export function parseFileSections(raw: string): { path: string; content: string }[] {
   const files: { path: string; content: string }[] = [];
   const re = /===FILE:\s*([^\r\n=]+?)===\s*\r?\n([\s\S]*?)(?=\r?\n===FILE:|$)/gi;
   let match: RegExpExecArray | null;
@@ -118,12 +689,37 @@ function parseFileSections(raw: string): { path: string; content: string }[] {
   return files;
 }
 
-async function writeParsedFiles(appRoot: string, raw: string): Promise<number> {
+async function writeParsedFiles(
+  appRoot: string,
+  raw: string,
+  projectRoot = "."
+): Promise<WriteParsedResult> {
   const files = parseFileSections(raw);
+  const filesWritten: string[] = [];
+  const workspace = getWorkspaceRoot();
+  assertPathInsideWorkspace(workspace, appRoot);
+
   for (const file of files) {
-    await writeDoc(appRoot, file.path, file.content);
+    let rel = sanitizeFilePath(appRoot, projectRoot, file.path);
+    let body = sanitizeFileBody(file.content);
+    if (!body.trim()) {
+      throw new Error(`===FILE: ${file.path}=== has empty body after sanitize`);
+    }
+    if (isCodeOrTestPath(rel)) {
+      body = stripAgentNotesFromCode(body);
+      const coerced = coercePathForContent(rel, body);
+      if (coerced !== rel) {
+        notify(
+          "writeParsedFiles",
+          `coerced ${rel} → ${coerced} (JSX requires tsx/jsx)`
+        );
+        rel = coerced;
+      }
+    }
+    await writeDoc(appRoot, rel, body);
+    filesWritten.push(rel);
   }
-  return files.length;
+  return { count: filesWritten.length, filesWritten };
 }
 
 type TodoItem = { slug: string; title: string; done: boolean };
@@ -218,47 +814,244 @@ function upsertReadmeSection(
   return `${readme.trimEnd()}\n\n${section}`;
 }
 
-async function runProjectTests(
-  appRoot: string
-): Promise<{ ok: boolean; log: string }> {
-  const pkgPath = join(appRoot, "package.json");
-  const hasPkg = await pathExists(pkgPath);
-  const command = hasPkg ? "npm" : "node";
-  const args = hasPkg ? ["test"] : ["--test"];
+/** Ensure package.json has scripts.test (vitest) before npm test (P0-2). */
+export async function ensureTestScript(
+  appRoot: string,
+  stage = "qaEngineer"
+): Promise<{ injected: boolean; command: string }> {
+  const result = await ensureVitestTestScript(appRoot);
+  if (result.injected) {
+    notify(stage, `Injected scripts.test="vitest run" (was missing)`);
+  }
+  return result;
+}
 
-  return new Promise((resolvePromise) => {
-    const child = spawn(command, args, {
-      cwd: appRoot,
-      shell: true,
-      env: process.env,
-    });
-    let log = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      log += chunk.toString();
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      log += chunk.toString();
-    });
-    child.on("error", (err) => {
-      resolvePromise({ ok: false, log: log + errorText(err) });
-    });
-    child.on("close", (code) => {
-      resolvePromise({ ok: code === 0, log: log.trim() || `(exit ${code})` });
+async function runTscSmoke(
+  appRoot: string,
+  stage: string
+): Promise<{ ok: boolean; log: string }> {
+  if (!(await pathExists(join(appRoot, "tsconfig.json")))) {
+    return { ok: true, log: "no tsconfig; smoke skipped" };
+  }
+  return withHeartbeat(stage, "tsc --noEmit smoke", async () => {
+    return new Promise((resolvePromise) => {
+      const child = spawn("npx", ["tsc", "--noEmit"], {
+        cwd: appRoot,
+        shell: true,
+        env: process.env,
+      });
+      let log = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        log += chunk.toString();
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        log += chunk.toString();
+      });
+      child.on("error", (err) => {
+        resolvePromise({ ok: false, log: log + errorText(err) });
+      });
+      child.on("close", (code) => {
+        resolvePromise({
+          ok: code === 0,
+          log: log.trim() || `(exit ${code})`,
+        });
+      });
     });
   });
 }
 
+async function runProjectTests(
+  appRoot: string,
+  stage = "qaEngineer"
+): Promise<{ ok: boolean; log: string; errorClass?: TestFailureClass }> {
+  const gate = await runBootstrapGate(appRoot, {
+    notify: (msg) => notify(stage, msg),
+  });
+  if (!gate.ok) {
+    setErrorClass("bootstrap");
+    return {
+      ok: false,
+      log: gate.message,
+      errorClass: "bootstrap",
+    };
+  }
+
+  const smoke = await runQaSmokeTests(appRoot);
+  if (!smoke.skipped && !smoke.ok) {
+    const cls = classifyTestFailure(smoke.log);
+    setErrorClass(cls);
+    return {
+      ok: false,
+      log: `QA smoke failed:\n${smoke.log}`,
+      errorClass: cls,
+    };
+  }
+
+  return withHeartbeat(stage, "npx vitest run", async () => {
+    const result = await runCanonicalTests(appRoot);
+    const errorClass = result.ok
+      ? undefined
+      : classifyTestFailure(result.log);
+    if (errorClass) setErrorClass(errorClass);
+    return {
+      ok: result.ok,
+      log: result.log,
+      errorClass,
+    };
+  });
+}
+
+type LlmContentKind =
+  | "empty"
+  | "no_file_sections"
+  | "empty_file_body"
+  | "parse_failed";
+
+/** Invalid / empty model output — retryable (unlike hard logic errors). */
+class LlmContentError extends Error {
+  readonly name = "LlmContentError";
+  constructor(
+    public readonly stage: string,
+    public readonly kind: LlmContentKind,
+    detail?: string
+  ) {
+    super(
+      detail ? `[${stage}] ${kind}: ${detail}` : `[${stage}] ${kind}`
+    );
+  }
+}
+
+/** All invoke attempts failed; docs stages may fall back using lastContent. */
+class LlmRetriesExhaustedError extends Error {
+  readonly name = "LlmRetriesExhaustedError";
+  constructor(
+    public readonly stage: string,
+    public readonly kind: string,
+    public readonly lastContent: string,
+    cause: unknown
+  ) {
+    super(`[${stage}] retries exhausted (${kind}): ${errorText(cause)}`);
+  }
+}
+
 function assertUsableLlmText(text: string, stage: string): void {
   if (!text.trim()) {
-    throw new Error(`[${stage}] empty LLM response`);
+    throw new LlmContentError(stage, "empty", "empty LLM response");
   }
 }
 
 function assertHasFileSections(text: string, stage: string): void {
   assertUsableLlmText(text, stage);
-  if (parseFileSections(text).length === 0) {
-    throw new Error(`[${stage}] no ===FILE:=== sections in response`);
+  let files = parseFileSections(text);
+  if (files.length === 0) {
+    const repaired = repairFileContract(text);
+    files = parseFileSections(repaired);
   }
+  if (files.length === 0) {
+    recordNoFileSections();
+    throw new LlmContentError(
+      stage,
+      "no_file_sections",
+      "no ===FILE:=== sections in response"
+    );
+  }
+  for (const file of files) {
+    if (!sanitizeFileBody(file.content).trim()) {
+      throw new LlmContentError(
+        stage,
+        "empty_file_body",
+        `===FILE: ${file.path}=== has empty body`
+      );
+    }
+  }
+}
+
+/** QA may return SUMMARY-only (run tests) or FILE sections (write tests). */
+function assertQaResponse(text: string, stage: string): void {
+  assertUsableLlmText(text, stage);
+  const files = parseFileSections(text);
+  if (files.length > 0) {
+    for (const file of files) {
+      if (!sanitizeFileBody(file.content).trim()) {
+        throw new LlmContentError(
+          stage,
+          "empty_file_body",
+          `===FILE: ${file.path}=== has empty body`
+        );
+      }
+    }
+    return;
+  }
+  if (!/===SUMMARY===/i.test(text)) {
+    throw new LlmContentError(
+      stage,
+      "no_file_sections",
+      "expected ===FILE:=== and/or ===SUMMARY==="
+    );
+  }
+}
+
+function assertParsedSummaryAndRequirements(text: string, stage: string): void {
+  assertUsableLlmText(text, stage);
+  if (!parseSummaryAndRequirements(text)) {
+    throw new LlmContentError(
+      stage,
+      "parse_failed",
+      "expected ===SUMMARY=== and ===REQUIREMENTS==="
+    );
+  }
+}
+
+function assertParsedTechSummaryAndBody(text: string, stage: string): void {
+  assertUsableLlmText(text, stage);
+  if (!parseTechSummaryAndBody(text)) {
+    throw new LlmContentError(
+      stage,
+      "parse_failed",
+      "expected ===SUMMARY=== and ===TECH==="
+    );
+  }
+}
+
+function assertParsedTodoAndSpecs(text: string, stage: string): void {
+  assertUsableLlmText(text, stage);
+  if (!parseTodoAndSpecs(text)) {
+    throw new LlmContentError(
+      stage,
+      "parse_failed",
+      "expected ===TODO=== and at least one ===SPEC: slug==="
+    );
+  }
+}
+
+function implementCoreStub(): {
+  todo: string;
+  specs: { slug: string; content: string }[];
+} {
+  return {
+    todo: "- [ ] implement-core: Implement core deliverable from requirements\n",
+    specs: [
+      {
+        slug: "implement-core",
+        content: [
+          "# implement-core",
+          "",
+          "## Goal",
+          "Implement the core deliverable described in requirements and technologies.",
+          "",
+          "## Acceptance criteria",
+          "- Primary deliverable exists under the project root",
+          "- Matches stack and folder layout in technologies.md",
+          "",
+          "## Files to touch",
+          "- As defined in technologies.md",
+          "",
+          "## Out of scope",
+          "- Unrelated refactors",
+        ].join("\n"),
+      },
+    ],
+  };
 }
 
 /** True for transient network / HTTP failures (9router handles model failover). */
@@ -281,6 +1074,27 @@ function isRetryableNetworkError(err: unknown): boolean {
     return true;
   }
   return false;
+}
+
+/** Network/HTTP or invalid LLM content (empty, bad markers, empty FILE bodies). */
+function isRetryableError(err: unknown): boolean {
+  if (err instanceof LlmContentError) return true;
+  if (isRetryableNetworkError(err)) return true;
+  const msg = errorText(err);
+  if (
+    /empty LLM response|no ===FILE:===|empty_file_body|parse_failed|\bempty\b/i.test(
+      msg
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function contentKindOf(err: unknown): string {
+  if (err instanceof LlmContentError) return err.kind;
+  if (err instanceof LlmRetriesExhaustedError) return err.kind;
+  return "error";
 }
 
 // ============================================================
@@ -312,64 +1126,333 @@ const MAX_TOKENS_TECHNOLOGY_ARCHITECT = parseMaxTokens(
 );
 const MAX_TOKENS_SOFTWARE_ENGINEER = parseMaxTokens(
   process.env.MAX_TOKENS_SOFTWARE_ENGINEER,
-  3500
+  8000
 );
 const MAX_TOKENS_QA_ENGINEER = parseMaxTokens(
   process.env.MAX_TOKENS_QA_ENGINEER,
   2000
 );
 const MAX_QA_FIX_ROUNDS = parseMaxQaFixRounds();
+const MAX_BOOTSTRAP_FIX_ROUNDS = parseMaxTokens(
+  process.env.MAX_BOOTSTRAP_FIX_ROUNDS,
+  1
+);
+const LLM_LATENCY_FALLBACK_MS = parseMaxTokens(
+  process.env.ZTEAM_LLM_FALLBACK_MS,
+  90_000
+);
+const USE_WRITE_FILE_TOOL = process.env.ZTEAM_WRITE_FILE_TOOL !== "0";
 
-function makeLLM(model: string, maxTokens: number): ChatOpenAI {
+function makeLLM(
+  model: string,
+  maxTokens: number,
+  opts?: { fallback?: boolean }
+): ChatOpenAI {
+  const fallbackModel =
+    process.env.MODEL_FALLBACK ||
+    process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK ||
+    "";
+  const useModel =
+    opts?.fallback && fallbackModel ? fallbackModel : model;
+  const traceId = getMetrics().traceId;
   return new ChatOpenAI({
-    model,
+    model: useModel,
     configuration: {
       baseURL: NINEROUTER_BASE,
       apiKey: NINEROUTER_KEY,
+      defaultHeaders: {
+        "X-Request-Id": traceId,
+        "X-Zteam-Trace-Id": traceId,
+      },
     },
     temperature: 0.2,
     maxTokens,
   });
 }
 
+async function streamLlmContent(
+  llm: ChatOpenAI,
+  messages: BaseMessage[],
+  stage: string
+): Promise<string> {
+  return withHeartbeat(stage, "resposta do LLM", async (reportPartial) => {
+    let content = "";
+    const started = Date.now();
+    try {
+      const stream = await llm.stream(messages);
+      for await (const chunk of stream) {
+        content += chunkToText(chunk);
+        reportPartial(content);
+      }
+      if (!content.trim()) {
+        const res = await llm.invoke(messages);
+        content = String(res.content ?? "");
+        reportPartial(content);
+      }
+    } catch (streamErr) {
+      getProgress().emit(
+        stage,
+        "retry",
+        `stream falhou (${errorText(streamErr)}); tentando invoke`
+      );
+      recordRetry("stream_fail");
+      try {
+        const res = await llm.invoke(messages);
+        content = String(res?.content ?? "");
+        reportPartial(content);
+      } catch (invokeErr) {
+        throw new Error(
+          `[${stage}] stream and invoke failed: ${errorText(streamErr)} | ${errorText(invokeErr)}`
+        );
+      }
+    }
+    const elapsed = Date.now() - started;
+    if (elapsed > LLM_LATENCY_FALLBACK_MS) {
+      getProgress().emit(
+        stage,
+        "warn",
+        `LLM latency ${elapsed}ms > ${LLM_LATENCY_FALLBACK_MS}ms — consider MODEL_*_FALLBACK`
+      );
+    }
+    return content;
+  });
+}
+
 async function invokeWithRetry(
   llm: ChatOpenAI,
   messages: BaseMessage[],
-  opts: { stage: string; attempts?: number; validate?: (content: string) => void }
+  opts: {
+    stage: string;
+    attempts?: number;
+    validate?: (content: string) => void;
+    /** Stronger re-prompt for SE/fix FILE-only contract */
+    fileOnlyReprompt?: boolean;
+    useWriteFileTool?: boolean;
+    modelName?: string;
+    maxTokens?: number;
+  }
 ): Promise<{ content: unknown }> {
   const attempts = opts.attempts ?? 3;
   let lastError: unknown;
+  let lastContent = "";
+  const baseMessages = messages;
+  const progress = getProgress();
+  let activeLlm = llm;
+  let usedFallback = false;
 
   for (let i = 1; i <= attempts; i++) {
+    const attemptMessages =
+      i === 1 || !(lastError instanceof LlmContentError)
+        ? baseMessages
+        : [
+            ...baseMessages,
+            new HumanMessage(
+              opts.fileOnlyReprompt &&
+                (lastError.kind === "no_file_sections" ||
+                  lastError.kind === "empty" ||
+                  lastError.kind === "empty_file_body")
+                ? [
+                    `Invalid (${lastError.kind}). emit ONLY FILE sections.`,
+                    "Format: ===FILE: relative/path===",
+                    "<contents>",
+                    "No essays. No markdown fences. No project-folder prefix.",
+                    "Or call write_file(path, content) once per file.",
+                  ].join(" ")
+                : [
+                    `Your previous reply was invalid (${lastError.kind}).`,
+                    "Reply again using EXACTLY the required section markers.",
+                    "Do not leave sections empty. No outer code fence.",
+                  ].join(" ")
+            ),
+          ];
+
     try {
-      const res = await llm.invoke(messages);
-      const content = String(res.content ?? "");
+      let content = "";
+      if (opts.useWriteFileTool && USE_WRITE_FILE_TOOL) {
+        try {
+          const bound = activeLlm.bindTools([writeFileToolDefinition()]);
+          const res = await withHeartbeat(
+            opts.stage,
+            "tool write_file",
+            async (reportPartial) => {
+              const msg = await bound.invoke(attemptMessages);
+              reportPartial(String(msg.content ?? ""));
+              return msg;
+            }
+          );
+          const extracted = extractWriteFileToolCalls(res);
+          if (extracted.malformed > 0) recordToolCallMalformed();
+          if (extracted.files.length > 0) {
+            content = toolCallsToFileSections(extracted.files);
+          } else {
+            content = String((res as { content?: unknown }).content ?? "");
+          }
+        } catch (toolErr) {
+          progress.emit(
+            opts.stage,
+            "retry",
+            `tool calling falhou (${errorText(toolErr)}); texto FILE`
+          );
+          recordRetry("tool_fallback");
+          content = await streamLlmContent(
+            activeLlm,
+            attemptMessages,
+            opts.stage
+          );
+        }
+      } else {
+        content = await streamLlmContent(
+          activeLlm,
+          attemptMessages,
+          opts.stage
+        );
+      }
+
+      if (opts.fileOnlyReprompt || opts.useWriteFileTool) {
+        const repaired = repairFileContract(content);
+        if (repaired !== content && parseFileSections(repaired).length > 0) {
+          content = repaired;
+          progress.emit(opts.stage, "notify", "format repair applied (no LLM)");
+        }
+      }
+
+      lastContent = content;
       opts.validate?.(content);
-      return res;
+      return { content };
     } catch (err) {
       lastError = err;
-      if (i >= attempts || !isRetryableNetworkError(err)) {
+      if (err instanceof LlmContentError) {
+        recordRetry(err.kind);
+        if (
+          !usedFallback &&
+          (err.kind === "no_file_sections" || err.kind === "empty") &&
+          (process.env.MODEL_FALLBACK ||
+            process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK)
+        ) {
+          usedFallback = true;
+          activeLlm = makeLLM(
+            opts.modelName || MODEL_SOFTWARE_ENGINEER,
+            opts.maxTokens ?? MAX_TOKENS_SOFTWARE_ENGINEER,
+            { fallback: true }
+          );
+          progress.emit(
+            opts.stage,
+            "retry",
+            "Trying model 2/N (local fallback after contract failure)"
+          );
+          recordRetry("model_fallback");
+        }
+      }
+      const retryable = isRetryableError(err);
+      if (i >= attempts || !retryable) {
+        if (retryable && err instanceof LlmContentError) {
+          throw new LlmRetriesExhaustedError(
+            opts.stage,
+            err.kind,
+            lastContent,
+            err
+          );
+        }
         throw err;
       }
-      const delayMs = 1000 * 2 ** (i - 1);
-      console.error(`[${opts.stage}] retry ${i}: ${errorText(err)} (waiting ${delayMs}ms)`);
+      const overload = isRetryableNetworkError(err);
+      const delayMs = overload
+        ? Math.min(30_000, 2000 * 2 ** (i - 1))
+        : 1000 * 2 ** (i - 1);
+      progress.emit(
+        opts.stage,
+        "retry",
+        `${i}/${attempts}: ${errorText(err)} (waiting ${delayMs}ms)`
+      );
       await sleep(delayMs);
     }
   }
 
-  throw lastError;
+  throw new LlmRetriesExhaustedError(
+    opts.stage,
+    contentKindOf(lastError),
+    lastContent,
+    lastError
+  );
 }
 
-async function timedStage<T>(name: string, fn: () => Promise<T>): Promise<T> {
+async function timedStage<T>(
+  name: string,
+  fn: () => Promise<T>,
+  meta?: {
+    pendingSpecs?: string[];
+    pendingQaSpecs?: string[];
+    detail?: string;
+    appRoot?: string;
+    workflow?: string;
+  }
+): Promise<T> {
+  const progress = getProgress();
+  if (meta?.pendingSpecs || meta?.pendingQaSpecs) {
+    progress.setPending({
+      pendingSpecs: meta.pendingSpecs,
+      pendingQaSpecs: meta.pendingQaSpecs,
+    });
+  }
   const started = Date.now();
-  console.error(`[${name}] start`);
+  const budget = stageBudgetMs(name);
+  const detail = meta?.detail ? `; ${meta.detail}` : "";
+  progress.emit(
+    name,
+    "stage",
+    `start${detail}; ${progress.remainingHint()}`
+  );
+
+  if (meta?.appRoot) {
+    try {
+      await updatePipelineStage(meta.appRoot, {
+        stage: name,
+        workflow: meta.workflow,
+        pendingSpecs: meta.pendingSpecs,
+        pendingQaSpecs: meta.pendingQaSpecs,
+        traceId: getMetrics().traceId,
+      });
+    } catch {
+      /* best-effort checkpoint */
+    }
+  }
+
+  let budgetTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const result = await fn();
-    console.error(`[${name}] done in ${Date.now() - started}ms`);
+    const result = await Promise.race([
+      fn(),
+      new Promise<never>((_, reject) => {
+        budgetTimer = setTimeout(() => {
+          reject(
+            new CircuitBreakerError(
+              name,
+              `wall-clock budget ${budget}ms exceeded`
+            )
+          );
+        }, budget);
+      }),
+    ]);
+    const ms = Date.now() - started;
+    recordStageTiming(name, ms, true);
+    progress.emit(name, "stage", `done in ${ms}ms`);
+    if (result && typeof result === "object") {
+      return {
+        ...(result as Record<string, unknown>),
+        notifications: progress.takeDelta(),
+      } as T;
+    }
     return result;
   } catch (err) {
-    console.error(`[${name}] failed after ${Date.now() - started}ms: ${errorText(err)}`);
+    const ms = Date.now() - started;
+    recordStageTiming(name, ms, false);
+    progress.emit(
+      name,
+      "stage",
+      `failed after ${ms}ms: ${errorText(err)}`
+    );
     throw err;
+  } finally {
+    if (budgetTimer) clearTimeout(budgetTimer);
   }
 }
 
@@ -379,11 +1462,27 @@ async function timedStage<T>(name: string, fn: () => Promise<T>): Promise<T> {
 const OrchestratorState = Annotation.Root({
   userIdea: Annotation<string>(),
   projectRoot: Annotation<string>(),
+  /** Named route: full | docs | feature | punch | fix */
+  workflow: Annotation<string>(),
+  /** @deprecated Prefer workflow === "docs"; kept for compatibility */
   docsOnly: Annotation<boolean>(),
+  workflowReason: Annotation<string>(),
   notifications: Annotation<string[]>({
     reducer: (left, right) => [...(left ?? []), ...(right ?? [])],
     default: () => [],
   }),
+  /** Project resume (≤512 words) from bootstrap */
+  resume: Annotation<string>(),
+  pendingPreReqs: Annotation<string[]>({
+    reducer: (_left, right) => right ?? [],
+    default: () => [],
+  }),
+  completedPreReqs: Annotation<string[]>({
+    reducer: (left, right) => [...(left ?? []), ...(right ?? [])],
+    default: () => [],
+  }),
+  currentPreReq: Annotation<string>(),
+  preReqTotal: Annotation<number>(),
   requirements: Annotation<string>(),
   techDesign: Annotation<string>(),
   todo: Annotation<string>(),
@@ -402,87 +1501,516 @@ const OrchestratorState = Annotation.Root({
   currentSpec: Annotation<string>(),
   qaFailureLog: Annotation<string>(),
   qaFixRound: Annotation<number>(),
+  bootstrapFixRound: Annotation<number>(),
+  qaFailureClass: Annotation<string>(),
   testsPassed: Annotation<boolean>(),
+  traceId: Annotation<string>(),
   code: Annotation<string>(),
   tests: Annotation<string>(),
+  /** Absolute app root resolved for this run */
+  appRoot: Annotation<string>(),
+  filesWritten: Annotation<string[]>({
+    reducer: (left, right) => [...(left ?? []), ...(right ?? [])],
+    default: () => [],
+  }),
+  fidelityWarnings: Annotation<string[]>({
+    reducer: (left, right) => [...(left ?? []), ...(right ?? [])],
+    default: () => [],
+  }),
+  failureKind: Annotation<string>(),
+  resumeHint: Annotation<string>(),
 });
 
 type OrchestratorStateType = typeof OrchestratorState.State;
 
 function appRootOf(state: OrchestratorStateType): string {
-  return resolveAppRoot(state.projectRoot || ".");
+  const appRoot = resolveAppRoot(state.projectRoot || ".");
+  assertSafeAppRoot(appRoot, state.projectRoot || ".");
+  assertExpectedWorkspace(getWorkspaceRoot());
+  assertPathInsideWorkspace(getWorkspaceRoot(), appRoot);
+  return appRoot;
 }
 
-async function systemArchitectRequirementsNode(
+/** Heuristic fidelity checks: userIdea claims vs requirements text. */
+export function findFidelityViolations(
+  userIdea: string,
+  requirements: string
+): string[] {
+  const idea = userIdea.toLowerCase();
+  const req = requirements.toLowerCase();
+  const violations: string[] = [];
+
+  const infiniteLives =
+    /\b(vidas?\s+infinit|infinite\s+lives?|unlimited\s+lives?|death\s*counter|contador\s+de\s+mortes)\b/i.test(
+      idea
+    );
+  if (infiniteLives) {
+    if (/\b(3\s+lives|três\s+vidas|3\s+vidas|lives?\s*[:=]?\s*3)\b/i.test(req)) {
+      violations.push("requirements mention finite/3 lives but userIdea asks infinite lives");
+    }
+    if (/\bgame\s*over\b/i.test(req) && !/\binfinite|unlimited|death\s*count/i.test(req)) {
+      violations.push("requirements emphasize game-over without aligning to infinite lives / death counter");
+    }
+  }
+
+  if (/\btypescript\b/i.test(idea) && /\b(plain\s+js|javascript\s+only|es2020\s+js)\b/i.test(req)) {
+    violations.push("userIdea asks TypeScript but requirements drift to plain JS");
+  }
+  if (
+    /\b(hooks?\s+de\s+som|sound\s+hooks?|no\s+audio|sem\s+som|document(?:ed)?\s+hooks)\b/i.test(
+      idea
+    ) &&
+    /\b(sprite\s+sheet|web\s*audio\s+api|full\s+soundtrack)\b/i.test(req) &&
+    !/\bhook/i.test(req)
+  ) {
+    violations.push("userIdea wants sound hooks only; requirements invent fuller audio");
+  }
+  return violations;
+}
+
+async function splitOversizedSpec(
+  appRoot: string,
+  slug: string,
+  specBody: string
+): Promise<{ pending: string[]; message: string }> {
+  const a = `${slug}-a`;
+  const b = `${slug}-b`;
+  const mid = Math.floor(specBody.length / 2);
+  const splitAt = specBody.lastIndexOf("\n## ", mid > 0 ? mid : specBody.length);
+  const cut = splitAt > 80 ? splitAt : mid;
+  const partA = specBody.slice(0, cut).trim() || `# ${a}\n\nPartial implementation of ${slug} (part A).\n`;
+  const partB =
+    specBody.slice(cut).trim() ||
+    `# ${b}\n\nPartial implementation of ${slug} (part B).\n`;
+
+  await writeDoc(
+    appRoot,
+    specPath(a),
+    [`# ${a}`, "", `Split from oversized spec \`${slug}\`.`, "", partA].join("\n") +
+      "\n"
+  );
+  await writeDoc(
+    appRoot,
+    specPath(b),
+    [`# ${b}`, "", `Split from oversized spec \`${slug}\`.`, "", partB].join("\n") +
+      "\n"
+  );
+
+  let todo = await readDoc(appRoot, TODO_PATH);
+  if (!todo.startsWith("[Document missing:")) {
+    todo = todo.replace(
+      new RegExp(`^(-\\s*\\[)[ xX](\\]\\s*${slug}\\s*:.*)`, "gim"),
+      "$1x$2 (superseded by split)"
+    );
+  } else {
+    todo = "";
+  }
+  const extra = [
+    `- [ ] ${a}: ${slug} part A (auto-split)`,
+    `- [ ] ${b}: ${slug} part B (auto-split)`,
+    "",
+  ].join("\n");
+  await writeDoc(appRoot, TODO_PATH, (todo.trimEnd() + "\n" + extra).trimEnd() + "\n");
+
+  return {
+    pending: [a, b],
+    message: `Auto-split oversized spec '${slug}' → '${a}' + '${b}'`,
+  };
+}
+
+async function writePipelineResult(
+  appRoot: string,
+  payload: Record<string, unknown>
+): Promise<void> {
+  try {
+    const arch = await readArchitectureProgress(appRoot);
+    const merged = {
+      ...payload,
+      ...metricsSnapshot(),
+      sandbox: sandboxConfig().enabled,
+      architecture: architectureSnapshot(arch),
+    };
+    await writeDoc(
+      appRoot,
+      PIPELINE_RESULT_PATH,
+      JSON.stringify(merged, null, 2) + "\n"
+    );
+  } catch {
+    /* best-effort */
+  }
+}
+
+async function orchestratorBootstrapReadmeNode(
   state: OrchestratorStateType
 ): Promise<Partial<OrchestratorStateType>> {
-  return timedStage("systemArchitectRequirements", async () => {
+  return timedStage("orchestratorBootstrapReadme", async () => {
     const appRoot = appRootOf(state);
     await mkdir(appRoot, { recursive: true });
 
     const llm = makeLLM(MODEL_SYSTEM_ARCHITECT, MAX_TOKENS_SYSTEM_ARCHITECT);
-    const res = await invokeWithRetry(
-      llm,
-      [
+    const messages = [
+      new SystemMessage(
+        [
+          "You are the Orchestrator preparing the project charter.",
+          "Reply using EXACTLY this structure (no outer code fence):",
+          "===RESUME===",
+          `A project resume in plain language, maximum ${MAX_RESUME_WORDS} words.`,
+          "Describe what the product is and who it serves. No tech stack, no code.",
+          "===PRE_REQUIREMENTS===",
+          "A numbered list (1. 2. 3. …) of pré-requirements: user needs and functionalities",
+          "from the idea only. Each item one short line. No technology, libraries, or code.",
+          "Stay faithful to the user idea — do not invent features that contradict it",
+          "(e.g. do not add limited lives if the user asked for infinite lives).",
+        ].join(" ")
+      ),
+      new HumanMessage(
+        [
+          `Project root (relative): ${state.projectRoot || "."}`,
+          "",
+          "## User idea",
+          state.userIdea,
+        ].join("\n")
+      ),
+    ];
+
+    let resume: string;
+    let preRequirements: string[];
+    try {
+      const res = await invokeWithRetry(llm, messages, {
+        stage: "orchestratorBootstrapReadme",
+        validate: (c) =>
+          assertParsedResumeAndPreRequirements(c, "orchestratorBootstrapReadme"),
+      });
+      const parsed = parseResumeAndPreRequirements(String(res.content ?? ""));
+      if (!parsed) {
+        throw new LlmContentError(
+          "orchestratorBootstrapReadme",
+          "parse_failed",
+          "parse null after validate"
+        );
+      }
+      resume = parsed.resume;
+      preRequirements = parsed.preRequirements;
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
+      }
+      notify(
+        "orchestratorBootstrapReadme",
+        `Fallback charter after retries (${contentKindOf(err)}): ${errorText(err)}`
+      );
+      resume = clampResumeWords(
+        `This project implements: ${state.userIdea}`.trim()
+      );
+      preRequirements = [
+        "Core deliverable described in the user idea",
+        "Essential user-facing behaviors from the request",
+        "Documented constraints stated by the user",
+      ];
+    }
+
+    await writeDoc(
+      appRoot,
+      README_PATH,
+      buildBootstrapReadme(resume, preRequirements)
+    );
+    await writeDoc(
+      appRoot,
+      REQUIREMENTS_PATH,
+      "# Requirements\n\n_Sections are filled one pré-requirement at a time._\n"
+    );
+
+    const preview = preRequirements
+      .slice(0, 5)
+      .map((p, i) => `${i + 1}. ${p.slice(0, 80)}`)
+      .join(" | ");
+    const more =
+      preRequirements.length > 5
+        ? ` (+${preRequirements.length - 5})`
+        : "";
+    getProgress().setPending({
+      pendingPreReqs: preRequirements,
+      preReqIndex: 1,
+      preReqTotal: preRequirements.length,
+    });
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "orchestratorBootstrapReadme",
+      `charter pronto — ${preRequirements.length} pré-reqs: ${preview}${more}`,
+      {
+        phase: "requirements",
+        traceId: getMetrics().traceId,
+        preReqs: {
+          total: preRequirements.length,
+          completed: 0,
+          current: preRequirements[0] ?? "",
+          titles: [],
+        },
+      }
+    );
+
+    return {
+      resume,
+      pendingPreReqs: preRequirements,
+      completedPreReqs: [],
+      preReqTotal: preRequirements.length,
+      currentPreReq: preRequirements[0] ?? "",
+      requirements: "",
+    };
+  });
+}
+
+async function systemArchitectReqItemNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  const pending = [...(state.pendingPreReqs ?? [])];
+  const item = pending[0] ?? state.currentPreReq ?? "";
+  const index =
+    (state.preReqTotal ?? pending.length) - pending.length + 1;
+  const total = state.preReqTotal ?? pending.length;
+
+  return timedStage(
+    "systemArchitectReqItem",
+    async () => {
+      const appRoot = appRootOf(state);
+      if (!item.trim()) {
+        notify("systemArchitectReqItem", "No pending pré-req; skipping");
+        return {};
+      }
+
+      getProgress().setPending({
+        pendingPreReqs: pending,
+        preReqIndex: index,
+        preReqTotal: total,
+      });
+      await archNotify(
+        (s, m) => notify(s, m),
+        appRoot,
+        "systemArchitectReqItem",
+        `pré-req ${index}/${total} em andamento: ${item.slice(0, 120)}`,
+        {
+          phase: "requirements",
+          preReqs: {
+            total,
+            completed: Math.max(0, index - 1),
+            current: item,
+            titles: [],
+          },
+        }
+      );
+
+      const existingReqs = await readDoc(appRoot, REQUIREMENTS_PATH);
+      const resume =
+        state.resume ||
+        "See README Resume — expand only the current pré-requirement.";
+
+      const llm = makeLLM(MODEL_SYSTEM_ARCHITECT, MAX_TOKENS_SYSTEM_ARCHITECT);
+      const messages = [
         new SystemMessage(
           [
             "You are a System Architect.",
-            "Reply using EXACTLY this structure (no outer code fence):",
-            "===SUMMARY===",
-            "One short paragraph (2–4 sentences) summarizing what the system does.",
-            "===REQUIREMENTS===",
-            "A full Markdown requirements document covering: business vision,",
-            "functional requirements, non-functional requirements, and high-level architecture.",
-            "Under ===REQUIREMENTS===: Markdown only — no application code, shell commands,",
-            "JSON, tool calls, or instructions to create files.",
+            "Expand ONE pré-requirement into requirements Markdown.",
+            "Reply with ONLY the section body (no outer code fence), starting with:",
+            `## ${index}. <short title>`,
+            "Then cover: goal, functional requirements, non-functional notes,",
+            "acceptance criteria for this pré-req only.",
+            "FIDELITY (critical): Stay strictly aligned with the original user idea",
+            "and the Resume. Do NOT invent contradicting rules (lives, game-over,",
+            "stack, audio, etc.). No application code, shell, JSON, or tool calls.",
+            "No technology choices — those come later.",
           ].join(" ")
         ),
         new HumanMessage(
           [
-            `Project root (relative): ${state.projectRoot || "."}`,
-            "",
+            "## Original user idea (source of truth)",
             state.userIdea,
+            "",
+            "## Resume",
+            resume,
+            "",
+            `## Current pré-requirement (${index}/${total})`,
+            item,
+            "",
+            "## Existing .docs/requirements.md (do not repeat; append only)",
+            existingReqs,
           ].join("\n")
         ),
-      ],
+      ];
+
+      let section: string;
+      try {
+        const res = await invokeWithRetry(llm, messages, {
+          stage: "systemArchitectReqItem",
+          validate: (c) => {
+            assertUsableLlmText(c, "systemArchitectReqItem");
+            if (!/^##\s+/m.test(c.trim())) {
+              throw new LlmContentError(
+                "systemArchitectReqItem",
+                "parse_failed",
+                "expected a ## heading section"
+              );
+            }
+          },
+        });
+        section = stripOuterMarkdownFence(String(res.content ?? "")).trim();
+      } catch (err) {
+        if (
+          !(err instanceof LlmRetriesExhaustedError) &&
+          !(err instanceof LlmContentError)
+        ) {
+          throw err;
+        }
+        notify(
+          "systemArchitectReqItem",
+          `Fallback section after retries (${contentKindOf(err)})`
+        );
+        section = [
+          `## ${index}. ${item.slice(0, 80)}`,
+          "",
+          "### Goal",
+          item,
+          "",
+          "### Functional requirements",
+          `- Deliver behavior described in pré-requirement ${index}, consistent with the user idea.`,
+          "",
+          "### Acceptance criteria",
+          "- Matches the user idea and Resume; no contradictory rules.",
+        ].join("\n");
+      }
+
+      if (!section.startsWith("##")) {
+        section = `## ${index}. ${item.slice(0, 80)}\n\n${section}`;
+      }
+
+      const base = (await readDoc(appRoot, REQUIREMENTS_PATH)).trimEnd();
+      const next =
+        (base.startsWith("[Document missing:")
+          ? "# Requirements"
+          : base) +
+        "\n\n" +
+        section +
+        "\n";
+      await writeDoc(appRoot, REQUIREMENTS_PATH, next);
+
+      const sectionTitle = extractSectionTitle(section);
+      await archNotify(
+        (s, m) => notify(s, m),
+        appRoot,
+        "systemArchitectReqItem",
+        `pré-req ${index}/${total} escrito: ${sectionTitle || item.slice(0, 80)}`,
+        {
+          phase: "requirements",
+          preReqs: {
+            total,
+            completed: Math.max(0, index - 1),
+            current: item,
+          },
+        }
+      );
+
+      return {
+        currentPreReq: item,
+        requirements: next,
+      };
+    },
+    {
+      detail: `pré-req ${index}/${total}: ${item.slice(0, 60)}`,
+    }
+  );
+}
+
+async function orchestratorAfterPreReqNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("orchestratorAfterPreReq", async () => {
+    const appRoot = appRootOf(state);
+    const pending = [...(state.pendingPreReqs ?? [])];
+    const doneItem = pending[0] ?? state.currentPreReq ?? "";
+    const remaining = pending.slice(1);
+    const total = state.preReqTotal ?? pending.length;
+    const completedCount = (state.completedPreReqs ?? []).length + 1;
+
+    const reqs = await readDoc(appRoot, REQUIREMENTS_PATH);
+    const allHeadings = [...reqs.matchAll(/^##\s+(.+)$/gm)].map((m) =>
+      m[1].trim()
+    );
+    const title = allHeadings[allHeadings.length - 1] || doneItem.slice(0, 100);
+
+    getProgress().setPending({
+      pendingPreReqs: remaining,
+      preReqIndex: remaining.length > 0 ? completedCount + 1 : total,
+      preReqTotal: total,
+    });
+
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "orchestratorAfterPreReq",
+      `pré-req ${completedCount}/${total} feito: ${title.slice(0, 100)}${
+        remaining.length ? ` — faltam ${remaining.length}` : " — todos feitos"
+      }`,
       {
-        stage: "systemArchitectRequirements",
-        validate: (c) => assertUsableLlmText(c, "systemArchitectRequirements"),
+        phase: "requirements",
+        preReqs: {
+          total,
+          completed: completedCount,
+          current: remaining[0] ?? "",
+          titles: allHeadings,
+        },
       }
     );
 
-    const raw = String(res.content ?? "");
-    const parsed = parseSummaryAndRequirements(raw);
-    const requirements = parsed
-      ? stripOuterMarkdownFence(parsed.requirements)
-      : stripOuterMarkdownFence(raw);
-    const summary = parsed
-      ? parsed.summary
-      : `This project implements: ${state.userIdea}`.trim();
+    return {
+      pendingPreReqs: remaining,
+      completedPreReqs: doneItem ? [doneItem] : [],
+      currentPreReq: remaining[0] ?? "",
+    };
+  });
+}
 
-    await writeDoc(appRoot, REQUIREMENTS_PATH, requirements);
+async function orchestratorCleanReadmeNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("orchestratorCleanReadme", async () => {
+    const appRoot = appRootOf(state);
+    const resume =
+      state.resume?.trim() ||
+      clampResumeWords(`This project implements: ${state.userIdea}`);
+    const reqs = await readDoc(appRoot, REQUIREMENTS_PATH);
 
-    const readme = [
-      `# Project`,
-      "",
-      summary.trim(),
-      "",
-      "## Documentation",
-      "",
-      `- [Requirements](${REQUIREMENTS_PATH}) — business vision, functional/NFR, high-level architecture`,
-      "",
-      "Prefer these documents over chat state when implementing or testing.",
-      "",
-    ].join("\n");
-    await writeDoc(appRoot, README_PATH, readme);
+    await writeDoc(appRoot, README_PATH, buildCleanReadme(resume));
 
-    const notifications = notify(
-      "systemArchitectRequirements",
-      `Wrote ${README_PATH} and ${REQUIREMENTS_PATH} under ${state.projectRoot || "."}`,
-      []
+    const n = (state.completedPreReqs ?? []).length || state.preReqTotal || 0;
+    getProgress().setPending({
+      pendingPreReqs: [],
+      preReqIndex: n,
+      preReqTotal: n,
+    });
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "orchestratorCleanReadme",
+      `requirements phase DONE (${n} pré-reqs) → fidelity`,
+      {
+        phase: "fidelity",
+        preReqs: {
+          total: state.preReqTotal ?? n,
+          completed: n,
+          current: "",
+          titles: [],
+        },
+      }
     );
 
-    return { requirements, notifications };
+    return {
+      resume,
+      requirements: reqs.startsWith("[Document missing:") ? "" : reqs,
+      pendingPreReqs: [],
+    };
   });
 }
 
@@ -497,47 +2025,103 @@ async function technologyArchitectNode(
     ]);
 
     const llm = makeLLM(MODEL_TECHNOLOGY_ARCHITECT, MAX_TOKENS_TECHNOLOGY_ARCHITECT);
-    const res = await invokeWithRetry(
-      llm,
-      [
-        new SystemMessage(
-          [
-            "You are a Technology Architect.",
-            "Treat README.md as the source of truth for project goals.",
-            "Reply using EXACTLY this structure (no outer code fence):",
-            "===SUMMARY===",
-            "2–4 sentences summarizing key technology decisions (for the README).",
-            "===TECH===",
-            "A Markdown technology design document with EXACTLY these level-2 headings (in order):",
-            "## Technology decisions",
-            "## Folder architecture",
-            "## Stacks",
-            "## Schemas / API exposure",
-            "## Security",
-            "## Development standards",
-            "Under Folder architecture: define the project folder layout agents must create and use",
-            "(including .docs/, specs, source layout).",
-            "Under Development standards: require clean code, semantic naming, and human-readable code.",
-            "No thinking aloud, no shell commands, no tool calls.",
-          ].join(" ")
-        ),
-        new HumanMessage(
-          [
-            "## README.md",
-            readmeFromDisk,
-            "",
-            "## .docs/requirements.md",
-            requirementsFromDisk,
-          ].join("\n")
-        ),
-      ],
-      {
-        stage: "technologyArchitect",
-        validate: (c) => assertUsableLlmText(c, "technologyArchitect"),
-      }
-    );
+    const messages = [
+      new SystemMessage(
+        [
+          "You are a Technology Architect.",
+          "Treat README.md as the source of truth for project goals.",
+          "Reply using EXACTLY this structure (no outer code fence):",
+          "===SUMMARY===",
+          "2–4 sentences summarizing key technology decisions (for the README).",
+          "===TECH===",
+          "A Markdown technology design document with EXACTLY these level-2 headings (in order):",
+          "## Technology decisions",
+          "## Folder architecture",
+          "## Stacks",
+          "## Schemas / API exposure",
+          "## Security",
+          "## Development standards",
+          "Under Folder architecture: define the project folder layout agents must create and use",
+          "(including .docs/, specs, source layout).",
+          "Under Development standards: require clean code, semantic naming, and human-readable code.",
+          "No thinking aloud, no shell commands, no tool calls.",
+        ].join(" ")
+      ),
+      new HumanMessage(
+        [
+          "## README.md",
+          readmeFromDisk,
+          "",
+          "## .docs/requirements.md",
+          requirementsFromDisk,
+        ].join("\n")
+      ),
+    ];
 
-    const raw = String(res.content ?? "");
+    let raw: string;
+    try {
+      const res = await invokeWithRetry(llm, messages, {
+        stage: "technologyArchitect",
+        validate: (c) =>
+          assertParsedTechSummaryAndBody(c, "technologyArchitect"),
+      });
+      raw = String(res.content ?? "");
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
+      }
+      const last =
+        err instanceof LlmRetriesExhaustedError ? err.lastContent : "";
+      notify(
+        "technologyArchitect",
+        `Fallback after content retries failed (${contentKindOf(err)}): ${errorText(err)}`
+      );
+      if (last.trim() && parseTechSummaryAndBody(last)) {
+        raw = last;
+      } else if (last.trim()) {
+        raw = [
+          "===SUMMARY===",
+          "Technology decisions (stack, folder layout, standards) are documented below.",
+          "===TECH===",
+          stripOuterMarkdownFence(last),
+        ].join("\n");
+      } else {
+        raw = [
+          "===SUMMARY===",
+          "Technology decisions (stack, folder layout, standards) are documented below.",
+          "===TECH===",
+          [
+            "## Technology decisions",
+            "",
+            "- TBD after model recovery",
+            "",
+            "## Folder architecture",
+            "",
+            "- `.docs/` for requirements, technologies, todo, specs",
+            "",
+            "## Stacks",
+            "",
+            "- TBD",
+            "",
+            "## Schemas / API exposure",
+            "",
+            "- TBD",
+            "",
+            "## Security",
+            "",
+            "- TBD",
+            "",
+            "## Development standards",
+            "",
+            "- Clean code, semantic naming, human-readable code",
+          ].join("\n"),
+        ].join("\n");
+      }
+    }
+
     const parsed = parseTechSummaryAndBody(raw);
     const techDesign = parsed
       ? stripOuterMarkdownFence(parsed.tech)
@@ -574,13 +2158,23 @@ async function technologyArchitectNode(
     }
     await writeDoc(appRoot, README_PATH, readme);
 
-    const notifications = notify(
+    const techInfo = summarizeTech(techSummary, techDesign);
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
       "technologyArchitect",
-      `Wrote ${TECHNOLOGIES_PATH} and updated ${README_PATH}`,
-      []
+      `tech: ${techInfo.summary}${
+        techInfo.headingsPresent.length
+          ? ` | headings: ${techInfo.headingsPresent.join(", ")}`
+          : ""
+      }`,
+      {
+        phase: "technology",
+        technology: techInfo,
+      }
     );
 
-    return { techDesign, notifications };
+    return { techDesign };
   });
 }
 
@@ -596,76 +2190,70 @@ async function systemArchitectSpecsNode(
     ]);
 
     const llm = makeLLM(MODEL_SYSTEM_ARCHITECT, MAX_TOKENS_SYSTEM_ARCHITECT);
-    const res = await invokeWithRetry(
-      llm,
-      [
-        new SystemMessage(
-          [
-            "You are a System Architect doing spec-driven planning.",
-            "Break requirements into small deliverable tasks.",
-            "Reply using EXACTLY this structure (no outer code fence):",
-            "===TODO===",
-            "A Markdown checklist. Each line MUST be:",
-            "- [ ] slug: Short title",
-            "where slug is lowercase kebab-case (letters, digits, hyphens) and matches the spec file name.",
-            "===SPEC: slug===",
-            "One Markdown spec per todo item (same slug), suitable for spec-driven development:",
-            "goal, acceptance criteria, files to touch, out of scope.",
-            "Emit one ===SPEC: slug=== block per todo line. Keep specs concise.",
-            "No application source code, no shell commands.",
-          ].join(" ")
-        ),
-        new HumanMessage(
-          [
-            "## README.md",
-            readme,
-            "",
-            "## .docs/requirements.md",
-            requirements,
-            "",
-            "## .docs/technologies.md",
-            technologies,
-          ].join("\n")
-        ),
-      ],
-      {
-        stage: "systemArchitectSpecs",
-        validate: (c) => assertUsableLlmText(c, "systemArchitectSpecs"),
-      }
-    );
-
-    const raw = String(res.content ?? "");
-    const parsed = parseTodoAndSpecs(raw);
+    const messages = [
+      new SystemMessage(
+        [
+          "You are a System Architect doing spec-driven planning.",
+          "Break requirements into small deliverable tasks.",
+          "Reply using EXACTLY this structure (no outer code fence):",
+          "===TODO===",
+          "A Markdown checklist. Each line MUST be:",
+          "- [ ] slug: Short title",
+          "where slug is lowercase kebab-case (letters, digits, hyphens) and matches the spec file name.",
+          "===SPEC: slug===",
+          "One Markdown spec per todo item (same slug), suitable for spec-driven development:",
+          "goal, acceptance criteria, files to touch, out of scope.",
+          "Emit one ===SPEC: slug=== block per todo line. Keep specs concise.",
+          "No application source code, no shell commands.",
+        ].join(" ")
+      ),
+      new HumanMessage(
+        [
+          "## README.md",
+          readme,
+          "",
+          "## .docs/requirements.md",
+          requirements,
+          "",
+          "## .docs/technologies.md",
+          technologies,
+        ].join("\n")
+      ),
+    ];
 
     let todoMd: string;
     let specs: { slug: string; content: string }[];
-    if (parsed) {
+
+    try {
+      const res = await invokeWithRetry(llm, messages, {
+        stage: "systemArchitectSpecs",
+        validate: (c) => assertParsedTodoAndSpecs(c, "systemArchitectSpecs"),
+      });
+      const raw = String(res.content ?? "");
+      const parsed = parseTodoAndSpecs(raw);
+      if (!parsed) {
+        throw new LlmContentError(
+          "systemArchitectSpecs",
+          "parse_failed",
+          "parse returned null after validate"
+        );
+      }
       todoMd = parsed.todo;
       specs = parsed.specs;
-    } else {
-      // Fallback: single catch-all task so the pipeline can continue
-      todoMd = "- [ ] implement-core: Implement core deliverable from requirements\n";
-      specs = [
-        {
-          slug: "implement-core",
-          content: [
-            "# implement-core",
-            "",
-            "## Goal",
-            "Implement the core deliverable described in requirements and technologies.",
-            "",
-            "## Acceptance criteria",
-            "- Primary deliverable exists under the project root",
-            "- Matches stack and folder layout in technologies.md",
-            "",
-            "## Files to touch",
-            "- As defined in technologies.md",
-            "",
-            "## Out of scope",
-            "- Unrelated refactors",
-          ].join("\n"),
-        },
-      ];
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
+      }
+      notify(
+        "systemArchitectSpecs",
+        `Using implement-core stub after content retries failed (${contentKindOf(err)}): ${errorText(err)}`
+      );
+      const stub = implementCoreStub();
+      todoMd = stub.todo;
+      specs = stub.specs;
     }
 
     await writeDoc(appRoot, TODO_PATH, todoMd.endsWith("\n") ? todoMd : todoMd + "\n");
@@ -678,6 +2266,12 @@ async function systemArchitectSpecsNode(
       .map((t) => t.slug);
     const pendingSpecs =
       pendingFromTodo.length > 0 ? pendingFromTodo : specs.map((s) => s.slug);
+
+    getProgress().setPending({
+      pendingSpecs,
+      pendingQaSpecs: [...pendingSpecs],
+      pendingPreReqs: [],
+    });
 
     let readmeUpdated = await readDoc(appRoot, README_PATH);
     readmeUpdated = upsertReadmeSection(
@@ -692,10 +2286,20 @@ async function systemArchitectSpecsNode(
     );
     await writeDoc(appRoot, README_PATH, readmeUpdated);
 
-    const notifications = notify(
+    const slugs =
+      pendingSpecs.length > 0
+        ? pendingSpecs
+        : listSpecSlugsFromTodo(todoMd);
+    const docsOnly = state.workflow === "docs" || state.docsOnly;
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
       "systemArchitectSpecs",
-      `Wrote ${TODO_PATH} and ${specs.length} spec(s) under ${SPECS_DIR}/`,
-      []
+      `specs ready: ${slugs.length} tasks — ${formatSlugList(slugs)}`,
+      {
+        phase: docsOnly ? "done" : "specs",
+        specs: { count: slugs.length, slugs },
+      }
     );
 
     return {
@@ -703,105 +2307,285 @@ async function systemArchitectSpecsNode(
       pendingSpecs,
       pendingQaSpecs: [...pendingSpecs],
       completedSpecs: [],
-      notifications,
     };
   });
+}
+
+async function scaffoldPrepareNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage(
+    "scaffoldPrepare",
+    async () => {
+      const appRoot = appRootOf(state);
+      const scaffold = await ensureAppScaffold(appRoot);
+      if (scaffold.applied) {
+        notify(
+          "scaffoldPrepare",
+          `Applied vite-vitest-react template (${scaffold.files.length} files)`
+        );
+        const install = await npmInstall(appRoot);
+        if (!install.ok) {
+          const err = new Error(
+            `[scaffoldPrepare] npm install failed: ${install.log.slice(0, 500)}`
+          );
+          (err as Error & { failureKind?: string }).failureKind = "bootstrap";
+          throw err;
+        }
+        const build = await buildSmoke(appRoot);
+        if (!build.ok) {
+          notify(
+            "scaffoldPrepare",
+            `build smoke warning: ${build.log.slice(0, 300)}`
+          );
+        }
+        await markProjectSetupDone(appRoot);
+        return {
+          appRoot,
+          filesWritten: scaffold.files,
+          completedSpecs: ["project-setup"],
+        };
+      }
+      notify("scaffoldPrepare", "package.json already present; skip scaffold");
+      return { appRoot };
+    },
+    {
+      appRoot: resolveAppRoot(state.projectRoot || "."),
+      workflow: state.workflow,
+      detail: "scaffold greenfield",
+    }
+  );
+}
+
+async function bootstrapFixNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage(
+    "bootstrapFix",
+    async () => {
+      const appRoot = appRootOf(state);
+      const round = (state.bootstrapFixRound ?? 0) + 1;
+      if (round > MAX_BOOTSTRAP_FIX_ROUNDS) {
+        const err = new Error(
+          `[bootstrapFix] bootstrap still failing after ${MAX_BOOTSTRAP_FIX_ROUNDS} round(s):\n${state.qaFailureLog || ""}`
+        );
+        (err as Error & { failureKind?: string }).failureKind = "bootstrap";
+        throw err;
+      }
+      notify("bootstrapFix", `Attempting bootstrap repair round ${round}`);
+      const scaffold = await ensureAppScaffold(appRoot);
+      if (scaffold.applied) {
+        notify("bootstrapFix", "scaffold applied");
+      }
+      await ensureTestScript(appRoot, "bootstrapFix");
+      const install = await npmInstall(appRoot);
+      if (!install.ok) {
+        const err = new Error(
+          `[bootstrapFix] npm install failed: ${install.log.slice(0, 800)}`
+        );
+        (err as Error & { failureKind?: string }).failureKind = "bootstrap";
+        throw err;
+      }
+      return {
+        appRoot,
+        bootstrapFixRound: round,
+        qaFailureClass: "",
+        qaFailureLog: "",
+        testsPassed: false,
+      };
+    },
+    {
+      appRoot: resolveAppRoot(state.projectRoot || "."),
+      workflow: state.workflow,
+    }
+  );
 }
 
 async function softwareEngineerNode(
   state: OrchestratorStateType
 ): Promise<Partial<OrchestratorStateType>> {
-  return timedStage("softwareEngineer", async () => {
+  const pending = [...(state.pendingSpecs ?? [])];
+  return timedStage(
+    "softwareEngineer",
+    async () => {
     const appRoot = appRootOf(state);
-    const pending = [...(state.pendingSpecs ?? [])];
+    const projectRoot = state.projectRoot || ".";
     if (pending.length === 0) {
-      const notifications = notify(
-        "softwareEngineer",
-        "No pending specs; nothing to implement",
-        []
-      );
-      return { notifications };
+      notify("softwareEngineer", "No pending specs; nothing to implement");
+      return { appRoot };
     }
 
-    const slug = pending[0];
-    const [readme, requirements, technologies, todo, specBody] = await Promise.all([
+    let workPending = pending;
+    if (workPending[0] === "project-setup") {
+      if (await pathExists(join(appRoot, "package.json"))) {
+        await markTodoDone(appRoot, "project-setup");
+        workPending = workPending.slice(1);
+        if (workPending.length === 0) {
+          return {
+            appRoot,
+            pendingSpecs: [],
+            completedSpecs: ["project-setup"],
+          };
+        }
+      }
+    }
+
+    const batch = await pickSpecBatch(appRoot, workPending, 3);
+    setBatchSize(batch.length);
+    const slug = batch[0];
+    getProgress().setPending({
+      pendingSpecs: workPending,
+      pendingQaSpecs: state.pendingQaSpecs ?? [],
+    });
+    const [readme, requirements, technologies, todo] = await Promise.all([
       readDoc(appRoot, README_PATH),
       readDoc(appRoot, REQUIREMENTS_PATH),
       readDoc(appRoot, TECHNOLOGIES_PATH),
       readDoc(appRoot, TODO_PATH),
-      readDoc(appRoot, specPath(slug)),
     ]);
+    const specBodies = await Promise.all(
+      batch.map(
+        async (s) =>
+          `## Spec: ${s}\n${await readDoc(appRoot, specPath(s))}`
+      )
+    );
+    const specBody = await readDoc(appRoot, specPath(slug));
 
     const llm = makeLLM(MODEL_SOFTWARE_ENGINEER, MAX_TOKENS_SOFTWARE_ENGINEER);
-    const res = await invokeWithRetry(
-      llm,
-      [
-        new SystemMessage(
-          [
-            "You are a Software Engineer.",
-            "Implement ONLY the current spec. Follow README, technologies.md folder layout, and the spec.",
-            "Write clean, semantic, human-readable, production-quality code.",
-            "Do not write essays outside ===FILE=== blocks.",
-            "Output one or more files using EXACTLY this format (no outer wrapper):",
-            "===FILE: relative/path/from/project/root===",
-            "<file contents>",
-            "Paths are relative to the project root (not the MCP package root).",
-          ].join(" ")
-        ),
-        new HumanMessage(
-          [
-            `## Current spec: ${slug}`,
-            specBody,
-            "",
-            "## README.md",
-            readme,
-            "",
-            "## .docs/todo.md",
-            todo,
-            "",
-            "## .docs/requirements.md",
-            requirements,
-            "",
-            "## .docs/technologies.md",
-            technologies,
-          ].join("\n")
-        ),
-      ],
-      {
-        stage: "softwareEngineer",
-        validate: (c) => assertHasFileSections(c, "softwareEngineer"),
+    let rawContent = "";
+    try {
+      const res = await invokeWithRetry(
+        llm,
+        [
+          new SystemMessage(
+            [
+              "You are a Software Engineer.",
+              "Implement ONLY the current spec(s). Follow README, technologies.md folder layout, and the spec.",
+              "Write clean, semantic, human-readable, production-quality code.",
+              "Prefer calling write_file(path, content) for each file.",
+              "Fallback: ===FILE: relative/path=== then contents.",
+              "Paths relative to project root. No markdown fences. Use .tsx when file has JSX.",
+            ].join(" ")
+          ),
+          new HumanMessage(
+            [
+              `## Current spec batch (${batch.join(", ")})`,
+              ...specBodies,
+              "",
+              "## README.md",
+              readme,
+              "",
+              "## .docs/todo.md",
+              todo,
+              "",
+              "## .docs/requirements.md",
+              requirements,
+              "",
+              "## .docs/technologies.md",
+              technologies,
+            ].join("\n")
+          ),
+        ],
+        {
+          stage: "softwareEngineer",
+          attempts: SE_INVOKE_ATTEMPTS,
+          fileOnlyReprompt: true,
+          useWriteFileTool: true,
+          modelName: MODEL_SOFTWARE_ENGINEER,
+          maxTokens: MAX_TOKENS_SOFTWARE_ENGINEER,
+          validate: (c) => assertHasFileSections(c, "softwareEngineer"),
+        }
+      );
+      rawContent = String(res.content ?? "");
+    } catch (err) {
+      const kind = contentKindOf(err);
+      const oversized =
+        !specBody.startsWith("[Document missing:") &&
+        specBody.length > SPEC_SPLIT_CHARS;
+      if (
+        oversized &&
+        (kind === "no_file_sections" ||
+          kind === "empty" ||
+          err instanceof LlmRetriesExhaustedError)
+      ) {
+        const split = await splitOversizedSpec(appRoot, slug, specBody);
+        notify("softwareEngineer", split.message);
+        const remaining = [...split.pending, ...workPending.slice(batch.length)];
+        return {
+          appRoot,
+          currentSpec: slug,
+          pendingSpecs: remaining,
+          failureKind: "spec_split",
+          resumeHint: `workflow=resume after implementing split specs ${split.pending.join(",")}`,
+        };
       }
-    );
+      throw err;
+    }
 
-    const rawContent = String(res.content ?? "");
-    await writeParsedFiles(appRoot, rawContent);
-    await markTodoDone(appRoot, slug);
+    const written = await writeParsedFiles(appRoot, rawContent, projectRoot);
+    const smoke = await runTscSmoke(appRoot, "softwareEngineer");
+    if (!smoke.ok) {
+      const hint = `workflow=resume projectRoot=${projectRoot} (tsc failed on '${slug}')`;
+      notify(
+        "softwareEngineer",
+        `tsc smoke FAILED for '${slug}' — not marking todo done; ${hint}`
+      );
+      const err = new Error(
+        `[softwareEngineer] tsc smoke failed for '${slug}': ${smoke.log.slice(0, 500)}. Resume with ${hint}`
+      );
+      (err as Error & { failureKind?: string; resumeHint?: string }).failureKind =
+        "tsc_smoke";
+      (err as Error & { failureKind?: string; resumeHint?: string }).resumeHint =
+        hint;
+      throw err;
+    }
 
-    const remaining = pending.slice(1);
-    const notifications = notify(
+    for (const s of batch) {
+      await markTodoDone(appRoot, s);
+    }
+
+    const remaining = workPending.slice(batch.length);
+    getProgress().setPending({ pendingSpecs: remaining });
+    notify(
       "softwareEngineer",
       remaining.length > 0
-        ? `Completed spec '${slug}'; ${remaining.length} remaining`
-        : `Completed spec '${slug}'; all implementation tasks done`,
-      []
+        ? `Completed ${batch.join(",")} (${written.count} files); ${remaining.length} remaining`
+        : `Completed ${batch.join(",")} (${written.count} files); all implementation tasks done`
     );
 
     return {
+      appRoot,
       code: rawContent,
+      filesWritten: written.filesWritten,
       currentSpec: slug,
       pendingSpecs: remaining,
-      completedSpecs: [slug],
-      notifications,
+      completedSpecs: batch,
+      failureKind: "",
+      resumeHint: "",
     };
-  });
+  },
+    {
+      pendingSpecs: pending,
+      pendingQaSpecs: state.pendingQaSpecs ?? [],
+      detail:
+        pending.length > 0
+          ? `implementando '${pending[0]}'`
+          : "sem specs pendentes",
+      appRoot: resolveAppRoot(state.projectRoot || "."),
+      workflow: state.workflow,
+    }
+  );
 }
 
 async function softwareEngineerFixNode(
   state: OrchestratorStateType
 ): Promise<Partial<OrchestratorStateType>> {
-  return timedStage("softwareEngineerFix", async () => {
+  const slug = state.currentSpec || (state.pendingQaSpecs ?? [])[0] || "";
+  return timedStage(
+    "softwareEngineerFix",
+    async () => {
     const appRoot = appRootOf(state);
-    const slug = state.currentSpec || (state.pendingQaSpecs ?? [])[0] || "";
+    const projectRoot = state.projectRoot || ".";
     const [readme, technologies, specBody] = await Promise.all([
       readDoc(appRoot, README_PATH),
       readDoc(appRoot, TECHNOLOGIES_PATH),
@@ -815,8 +2599,10 @@ async function softwareEngineerFixNode(
         new SystemMessage(
           [
             "You are a Software Engineer fixing failing tests.",
-            "Apply the minimal fix. Output ONLY ===FILE: path=== sections for files you change.",
-            "Paths are relative to the project root.",
+            "Apply the minimal fix. Prefer write_file(path, content).",
+            "Fallback: Output ONLY ===FILE: path=== sections for files you change.",
+            "Paths are relative to the project root. Do not prefix with the project folder name.",
+            "No markdown fences around file bodies. Use .tsx for JSX.",
           ].join(" ")
         ),
         new HumanMessage(
@@ -837,35 +2623,48 @@ async function softwareEngineerFixNode(
       ],
       {
         stage: "softwareEngineerFix",
+        attempts: SE_INVOKE_ATTEMPTS,
+        fileOnlyReprompt: true,
+        useWriteFileTool: true,
+        modelName: MODEL_SOFTWARE_ENGINEER,
+        maxTokens: MAX_TOKENS_SOFTWARE_ENGINEER,
         validate: (c) => assertHasFileSections(c, "softwareEngineerFix"),
       }
     );
 
     const rawContent = String(res.content ?? "");
-    await writeParsedFiles(appRoot, rawContent);
+    const written = await writeParsedFiles(appRoot, rawContent, projectRoot);
 
-    const notifications = notify(
+    notify(
       "softwareEngineerFix",
-      `Applied fix for '${slug}' (round ${(state.qaFixRound ?? 0) + 1})`,
-      []
+      `Applied fix for '${slug}' (${written.count} files, round ${(state.qaFixRound ?? 0) + 1})`
     );
 
     return {
+      appRoot,
       code: rawContent,
+      filesWritten: written.filesWritten,
       qaFixRound: (state.qaFixRound ?? 0) + 1,
-      notifications,
     };
-  });
+  },
+    {
+      pendingQaSpecs: state.pendingQaSpecs ?? [],
+      detail: `corrigindo '${slug || "(unknown)"}'`,
+    }
+  );
 }
 
 async function qaEngineerNode(
   state: OrchestratorStateType
 ): Promise<Partial<OrchestratorStateType>> {
-  return timedStage("qaEngineer", async () => {
+  let pendingQa = [...(state.pendingQaSpecs ?? [])];
+  return timedStage(
+    "qaEngineer",
+    async () => {
     const appRoot = appRootOf(state);
-    let pendingQa = [...(state.pendingQaSpecs ?? [])];
     if (pendingQa.length === 0) {
       pendingQa = await listSpecSlugs(appRoot);
+      getProgress().setPending({ pendingQaSpecs: pendingQa });
     }
 
     const slug = pendingQa[0] ?? state.currentSpec ?? "";
@@ -883,12 +2682,12 @@ async function qaEngineerNode(
         new SystemMessage(
           [
             "You are a QA Engineer. Be concise.",
-            "Create or update automated tests for the CURRENT spec only.",
-            "Prefer node:test (or the project's existing test runner from technologies.md).",
-            "Output:",
-            "1) Optional short checklist (max ~10 bullets).",
-            "2) One or more ===FILE: relative/path=== test files.",
-            "FORBIDDEN: re-implementing the app, huge frameworks, essays.",
+            "Validate or create tests for the CURRENT spec only.",
+            "Prefer vitest (npx vitest run) matching technologies.md / package.json scripts.test.",
+            "Output ONE of:",
+            "A) ===SUMMARY=== short notes (no new files) when existing tests suffice — then the runner will execute tests; OR",
+            "B) ===SUMMARY=== optional notes PLUS one or more ===FILE: relative/path=== test files when you must create/update tests.",
+            "Test files with JSX must use .tsx. FORBIDDEN: re-implementing the app, essays, FILE-only without markers.",
           ].join(" ")
         ),
         new HumanMessage(
@@ -909,58 +2708,105 @@ async function qaEngineerNode(
       ],
       {
         stage: "qaEngineer",
-        validate: (c) => assertUsableLlmText(c, "qaEngineer"),
+        validate: (c) => assertQaResponse(c, "qaEngineer"),
       }
     );
 
     const tests = String(res.content ?? "");
-    await writeParsedFiles(appRoot, tests);
+    const projectRoot = state.projectRoot || ".";
+    let written: WriteParsedResult = { count: 0, filesWritten: [] };
+    if (parseFileSections(tests).length > 0) {
+      written = await writeParsedFiles(appRoot, tests, projectRoot);
+    } else {
+      notify("qaEngineer", `SUMMARY-only for '${slug}' — running existing tests`);
+    }
 
-    const result = await runProjectTests(appRoot);
-    console.error(
-      `[qaEngineer] test run ${result.ok ? "PASSED" : "FAILED"} for spec '${slug}'`
+    const result = await runProjectTests(appRoot, "qaEngineer");
+    getProgress().emit(
+      "qaEngineer",
+      "notify",
+      `test run ${result.ok ? "PASSED" : "FAILED"} for spec '${slug}'`
     );
 
     if (!result.ok) {
+      const failureClass =
+        result.errorClass || classifyTestFailure(result.log);
+      setErrorClass(failureClass);
+
+      if (failureClass === "bootstrap") {
+        notify(
+          "qaEngineer",
+          `Bootstrap failure for '${slug}' — routing to bootstrapFix (not feature fix)`
+        );
+        return {
+          appRoot,
+          tests,
+          filesWritten: written.filesWritten,
+          currentSpec: slug,
+          qaFailureLog: result.log.slice(0, 4000),
+          qaFailureClass: "bootstrap",
+          testsPassed: false,
+        };
+      }
+
       const round = state.qaFixRound ?? 0;
       if (round >= MAX_QA_FIX_ROUNDS) {
-        throw new Error(
+        if (hitlEnabled()) {
+          await pausePipelineForHuman(
+            appRoot,
+            `QA exhausted after ${MAX_QA_FIX_ROUNDS} feature fix rounds`,
+            { notify: (m) => notify("qaEngineer", m) }
+          );
+        }
+        const err = new Error(
           `[qaEngineer] tests still failing after ${MAX_QA_FIX_ROUNDS} fix rounds:\n${result.log}`
         );
+        (err as Error & { failureKind?: string }).failureKind = failureClass;
+        throw err;
       }
-      const notifications = notify(
+      notify(
         "qaEngineer",
-        `Tests failed for '${slug}'; requesting SE fix (round ${round + 1}/${MAX_QA_FIX_ROUNDS})`,
-        []
+        `Tests failed for '${slug}' (${failureClass}); requesting SE fix (round ${round + 1}/${MAX_QA_FIX_ROUNDS})`
       );
       return {
+        appRoot,
         tests,
+        filesWritten: written.filesWritten,
         currentSpec: slug,
-        qaFailureLog: result.log,
+        qaFailureLog: result.log.slice(0, 4000),
+        qaFailureClass: failureClass,
         testsPassed: false,
-        notifications,
       };
     }
 
     const remaining = pendingQa.filter((s) => s !== slug);
-    const notifications = notify(
+    getProgress().setPending({ pendingQaSpecs: remaining });
+    notify(
       "qaEngineer",
       remaining.length > 0
         ? `Tests passed for '${slug}'; ${remaining.length} spec(s) left`
-        : "All tests passed for all specs",
-      []
+        : "All tests passed for all specs"
     );
 
     return {
+      appRoot,
       tests,
+      filesWritten: written.filesWritten,
       currentSpec: slug,
       pendingQaSpecs: remaining,
       qaFailureLog: "",
       qaFixRound: 0,
       testsPassed: remaining.length === 0,
-      notifications,
     };
-  });
+  },
+    {
+      pendingQaSpecs: pendingQa,
+      detail:
+        pendingQa.length > 0
+          ? `testando '${pendingQa[0] ?? state.currentSpec ?? "?"}'`
+          : "listando specs",
+    }
+  );
 }
 
 async function orchestratorFinalizeNode(
@@ -970,17 +2816,24 @@ async function orchestratorFinalizeNode(
     const appRoot = appRootOf(state);
     let readme = await readDoc(appRoot, README_PATH);
 
-    const statusLines = state.docsOnly
+    const statusLines =
+      state.workflow === "docs" || state.docsOnly
       ? [
-          "Pipeline mode: **docs-only** (requirements, technologies, todo, specs).",
+          `Pipeline mode: **docs** (workflow=${state.workflow || "docs"}).`,
           "Implementation and QA were skipped.",
         ]
       : [
-          "Pipeline mode: **full**.",
+          `Pipeline mode: **${state.workflow || "full"}**.`,
           state.testsPassed
             ? "All automated tests passed."
             : "Pipeline finished (see notifications for details).",
         ];
+
+    if ((state.fidelityWarnings ?? []).length > 0) {
+      statusLines.push(
+        `Fidelity warnings: ${(state.fidelityWarnings ?? []).join("; ")}`
+      );
+    }
 
     readme = upsertReadmeSection(
       readme,
@@ -989,28 +2842,353 @@ async function orchestratorFinalizeNode(
     );
     await writeDoc(appRoot, README_PATH, readme);
 
-    const notifications = notify(
+    const pending = (state.pendingSpecs ?? []).length;
+    const resumeHint =
+      state.resumeHint ||
+      (pending > 0
+        ? `workflow=resume — ${pending} pending spec(s)`
+        : "");
+
+    await writePipelineResult(appRoot, {
+      ok: true,
+      workflow: state.workflow || "full",
+      appRoot,
+      projectRoot: state.projectRoot || ".",
+      filesWritten: state.filesWritten ?? [],
+      fidelityWarnings: state.fidelityWarnings ?? [],
+      failureKind: state.failureKind || null,
+      resumeHint: resumeHint || null,
+      testsPassed: state.testsPassed ?? null,
+    });
+
+    if (state.workflow === "docs" || state.docsOnly) {
+      await setArchitecturePhase(appRoot, "done");
+    }
+
+    notify(
       "orchestratorFinalize",
-      state.docsOnly
-        ? "Docs pipeline complete; README updated"
-        : "Full pipeline complete; README updated",
-      []
+      state.workflow === "docs" || state.docsOnly
+        ? "Docs pipeline complete; README updated (see .docs/architecture-progress.json)"
+        : `Workflow '${state.workflow || "full"}' complete; README updated`
     );
 
-    return { notifications };
+    return {
+      appRoot,
+      resumeHint,
+    };
   });
 }
 
+async function fidelityCriticRequirementsNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("fidelityCriticRequirements", async () => {
+    const appRoot = appRootOf(state);
+    const requirements = await readDoc(appRoot, REQUIREMENTS_PATH);
+    const reqText = requirements.startsWith("[Document missing:")
+      ? ""
+      : requirements;
+    let violations = findFidelityViolations(state.userIdea || "", reqText);
+
+    if (violations.length === 0) {
+      await archNotify(
+        (s, m) => notify(s, m),
+        appRoot,
+        "fidelityCriticRequirements",
+        "fidelity PASS",
+        {
+          phase: "fidelity",
+          fidelity: { ok: true, warnings: [] },
+        }
+      );
+      return { appRoot, fidelityWarnings: [] };
+    }
+
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "fidelityCriticRequirements",
+      `fidelity WARN: ${violations.slice(0, 3).join("; ")}${
+        violations.length > 3 ? ` (+${violations.length - 3})` : ""
+      } — appending Constraints`,
+      {
+        phase: "fidelity",
+        fidelity: { ok: false, warnings: violations },
+      }
+    );
+
+    const constraints = [
+      "",
+      "## Constraints (userIdea — fidelity)",
+      "",
+      "The following must not be contradicted:",
+      "",
+      state.userIdea,
+      "",
+      "Detected issues (auto):",
+      ...violations.map((v) => `- ${v}`),
+      "",
+    ].join("\n");
+
+    await writeDoc(
+      appRoot,
+      REQUIREMENTS_PATH,
+      (reqText.trimEnd() + "\n" + constraints).trimEnd() + "\n"
+    );
+
+    const after = await readDoc(appRoot, REQUIREMENTS_PATH);
+    violations = findFidelityViolations(state.userIdea || "", after);
+    if (violations.length > 0) {
+      notify(
+        "fidelityCriticRequirements",
+        `Still warning after Constraints append: ${violations.join("; ")}`
+      );
+    }
+
+    return {
+      appRoot,
+      requirements: after,
+      fidelityWarnings: violations.length > 0 ? violations : [
+        "Constraints section appended after fidelity reject",
+      ],
+    };
+  });
+}
+
+async function resumePrepareNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage(
+    "resumePrepare",
+    async () => {
+      const appRoot = appRootOf(state);
+      const todo = await readDoc(appRoot, TODO_PATH);
+      const items = todo.startsWith("[Document missing:")
+        ? []
+        : parseTodoChecklist(todo);
+      const pending: string[] = [];
+      for (const item of items) {
+        if (item.done) continue;
+        const exists = await pathExists(join(appRoot, specPath(item.slug)));
+        if (exists) pending.push(item.slug);
+      }
+
+      if (pending.length === 0) {
+        notify(
+          "resumePrepare",
+          "No pending [ ] specs with existing .spec.md — nothing to resume"
+        );
+        return {
+          appRoot,
+          pendingSpecs: [],
+          pendingQaSpecs: [],
+          resumeHint: "nothing pending",
+        };
+      }
+
+      getProgress().setPending({
+        pendingSpecs: pending,
+        pendingQaSpecs: pending,
+      });
+      notify(
+        "resumePrepare",
+        `Resuming ${pending.length} pending spec(s): ${pending.join(", ")}`
+      );
+
+      return {
+        appRoot,
+        pendingSpecs: pending,
+        pendingQaSpecs: [...pending],
+        currentSpec: pending[0] ?? "",
+        completedSpecs: [],
+        qaFixRound: 0,
+        todo: todo.startsWith("[Document missing:") ? "" : todo,
+      };
+    },
+    { detail: "retomando todos pendentes" }
+  );
+}
+
+async function workflowRouterNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("workflowRouter", async () => {
+    const appRoot = appRootOf(state);
+    await mkdir(appRoot, { recursive: true });
+
+    const explicit = resolveExplicitWorkflow({
+      workflow: state.workflow,
+      docsOnly: state.docsOnly,
+      userIdea: state.userIdea,
+    });
+
+    const { workflow, reason } = await classifyWorkflow({
+      userIdea: state.userIdea || "",
+      appRoot,
+      explicit,
+    });
+
+    const cleanedIdea = stripWorkflowTag(state.userIdea || "") || state.userIdea;
+    const meta = WORKFLOW_CATALOG[workflow];
+
+    notify(
+      "workflowRouter",
+      `rota=${workflow} — ${reason}; ${meta.route}`
+    );
+
+    return {
+      workflow,
+      workflowReason: reason,
+      docsOnly: workflow === "docs",
+      userIdea: cleanedIdea,
+    };
+  });
+}
+
+async function punchPrepareNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage(
+    "punchPrepare",
+    async () => {
+      const appRoot = appRootOf(state);
+      const slug = "punch";
+      const body = [
+        "# punch",
+        "",
+        "## Goal",
+        state.userIdea,
+        "",
+        "## Acceptance criteria",
+        "- The requested UI/copy/tweak change is applied",
+        "- No unrelated refactors",
+        "",
+        "## Files to touch",
+        "- Minimal set under project root (see technologies.md layout)",
+        "",
+        "## Out of scope",
+        "- New features unrelated to this tweak",
+      ].join("\n");
+
+      await writeDoc(appRoot, specPath(slug), body + "\n");
+
+      let todo = await readDoc(appRoot, TODO_PATH);
+      if (todo.startsWith("[Document missing:")) {
+        todo = `- [ ] ${slug}: Punch — ${state.userIdea.slice(0, 80)}\n`;
+      } else if (!parseTodoChecklist(todo).some((t) => t.slug === slug)) {
+        todo =
+          todo.trimEnd() +
+          `\n- [ ] ${slug}: Punch — ${state.userIdea.slice(0, 80)}\n`;
+      }
+      await writeDoc(appRoot, TODO_PATH, todo.endsWith("\n") ? todo : todo + "\n");
+
+      getProgress().setPending({
+        pendingSpecs: [slug],
+        pendingQaSpecs: [slug],
+      });
+      notify("punchPrepare", `Prepared spec '${slug}' from user idea`);
+
+      return {
+        pendingSpecs: [slug],
+        pendingQaSpecs: [slug],
+        currentSpec: slug,
+        todo,
+      };
+    },
+    { detail: "preparando spec pontual" }
+  );
+}
+
+async function fixPrepareNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage(
+    "fixPrepare",
+    async () => {
+      const appRoot = appRootOf(state);
+      const existing = await listSpecSlugs(appRoot);
+      const slug = existing[0] || "fix";
+
+      if (existing.length === 0) {
+        const body = [
+          "# fix",
+          "",
+          "## Goal",
+          "Fix the reported bug / failing behavior.",
+          "",
+          "## Bug report",
+          state.userIdea,
+          "",
+          "## Acceptance criteria",
+          "- Reported issue is resolved",
+          "- Existing tests pass (add coverage if missing)",
+        ].join("\n");
+        await writeDoc(appRoot, specPath(slug), body + "\n");
+      }
+
+      const failureLog = [
+        "User-reported issue (fix workflow):",
+        state.userIdea,
+        "",
+        "(No prior automated failure log — SE should inspect and fix.)",
+      ].join("\n");
+
+      getProgress().setPending({
+        pendingQaSpecs: existing.length > 0 ? existing : [slug],
+      });
+      notify(
+        "fixPrepare",
+        `Prepared fix for '${slug}' (${existing.length} existing spec(s))`
+      );
+
+      return {
+        currentSpec: slug,
+        pendingQaSpecs: existing.length > 0 ? existing : [slug],
+        qaFailureLog: failureLog,
+        qaFixRound: 0,
+        testsPassed: false,
+      };
+    },
+    { detail: "preparando correção" }
+  );
+}
+
+function routeAfterPreReq(state: OrchestratorStateType): string {
+  return (state.pendingPreReqs ?? []).length > 0
+    ? "systemArchitectReqItem"
+    : "orchestratorCleanReadme";
+}
+
+function routeFromWorkflow(state: OrchestratorStateType): string {
+  const id = (state.workflow || "full") as WorkflowId;
+  if (isWorkflowId(id)) {
+    return WORKFLOW_CATALOG[id].entry;
+  }
+  return WORKFLOW_CATALOG.full.entry;
+}
+
 function routeAfterSpecs(state: OrchestratorStateType): string {
-  return state.docsOnly ? "orchestratorFinalize" : "softwareEngineer";
+  if (state.workflow === "docs" || state.docsOnly) {
+    return "orchestratorFinalize";
+  }
+  return "scaffoldPrepare";
 }
 
 function routeAfterSoftwareEngineer(state: OrchestratorStateType): string {
   return (state.pendingSpecs ?? []).length > 0 ? "softwareEngineer" : "qaEngineer";
 }
 
+function routeAfterResumePrepare(state: OrchestratorStateType): string {
+  return (state.pendingSpecs ?? []).length > 0
+    ? "scaffoldPrepare"
+    : "orchestratorFinalize";
+}
+
 function routeAfterQa(state: OrchestratorStateType): string {
   if (state.testsPassed === false && (state.qaFailureLog ?? "").length > 0) {
+    if (state.qaFailureClass === "bootstrap") {
+      return "bootstrapFix";
+    }
     return "softwareEngineerFix";
   }
   if ((state.pendingQaSpecs ?? []).length > 0) {
@@ -1020,18 +3198,49 @@ function routeAfterQa(state: OrchestratorStateType): string {
 }
 
 const fullGraph = new StateGraph(OrchestratorState)
-  .addNode("systemArchitectRequirements", systemArchitectRequirementsNode)
+  .addNode("workflowRouter", workflowRouterNode)
+  .addNode("punchPrepare", punchPrepareNode)
+  .addNode("fixPrepare", fixPrepareNode)
+  .addNode("resumePrepare", resumePrepareNode)
+  .addNode("orchestratorBootstrapReadme", orchestratorBootstrapReadmeNode)
+  .addNode("systemArchitectReqItem", systemArchitectReqItemNode)
+  .addNode("orchestratorAfterPreReq", orchestratorAfterPreReqNode)
+  .addNode("orchestratorCleanReadme", orchestratorCleanReadmeNode)
+  .addNode("fidelityCriticRequirements", fidelityCriticRequirementsNode)
   .addNode("technologyArchitect", technologyArchitectNode)
   .addNode("systemArchitectSpecs", systemArchitectSpecsNode)
+  .addNode("scaffoldPrepare", scaffoldPrepareNode)
+  .addNode("bootstrapFix", bootstrapFixNode)
   .addNode("softwareEngineer", softwareEngineerNode)
   .addNode("softwareEngineerFix", softwareEngineerFixNode)
   .addNode("qaEngineer", qaEngineerNode)
   .addNode("orchestratorFinalize", orchestratorFinalizeNode)
-  .addEdge(START, "systemArchitectRequirements")
-  .addEdge("systemArchitectRequirements", "technologyArchitect")
+  .addEdge(START, "workflowRouter")
+  .addConditionalEdges("workflowRouter", routeFromWorkflow, {
+    orchestratorBootstrapReadme: "orchestratorBootstrapReadme",
+    systemArchitectSpecs: "systemArchitectSpecs",
+    punchPrepare: "punchPrepare",
+    fixPrepare: "fixPrepare",
+    resumePrepare: "resumePrepare",
+  })
+  .addEdge("orchestratorBootstrapReadme", "systemArchitectReqItem")
+  .addEdge("systemArchitectReqItem", "orchestratorAfterPreReq")
+  .addConditionalEdges("orchestratorAfterPreReq", routeAfterPreReq, {
+    systemArchitectReqItem: "systemArchitectReqItem",
+    orchestratorCleanReadme: "orchestratorCleanReadme",
+  })
+  .addEdge("orchestratorCleanReadme", "fidelityCriticRequirements")
+  .addEdge("fidelityCriticRequirements", "technologyArchitect")
   .addEdge("technologyArchitect", "systemArchitectSpecs")
   .addConditionalEdges("systemArchitectSpecs", routeAfterSpecs, {
-    softwareEngineer: "softwareEngineer",
+    scaffoldPrepare: "scaffoldPrepare",
+    orchestratorFinalize: "orchestratorFinalize",
+  })
+  .addEdge("scaffoldPrepare", "softwareEngineer")
+  .addEdge("punchPrepare", "softwareEngineer")
+  .addEdge("fixPrepare", "softwareEngineerFix")
+  .addConditionalEdges("resumePrepare", routeAfterResumePrepare, {
+    scaffoldPrepare: "scaffoldPrepare",
     orchestratorFinalize: "orchestratorFinalize",
   })
   .addConditionalEdges("softwareEngineer", routeAfterSoftwareEngineer, {
@@ -1040,38 +3249,49 @@ const fullGraph = new StateGraph(OrchestratorState)
   })
   .addConditionalEdges("qaEngineer", routeAfterQa, {
     softwareEngineerFix: "softwareEngineerFix",
+    bootstrapFix: "bootstrapFix",
     qaEngineer: "qaEngineer",
     orchestratorFinalize: "orchestratorFinalize",
   })
   .addEdge("softwareEngineerFix", "qaEngineer")
+  .addEdge("bootstrapFix", "qaEngineer")
   .addEdge("orchestratorFinalize", END);
 
-/** Same graph; docsOnly is passed via state (routes to finalize after specs). */
+/** Compiled graph; workflow (or docsOnly alias) selects the route after workflowRouter. */
 export const compiledGraph = fullGraph.compile();
 export const compiledDocsGraph = compiledGraph;
 
 // ============================================================
 // 3. MCP server
 // ============================================================
-const server = new McpServer({
-  name: "dev-team-orchestrator",
-  version: "1.0.0",
-});
+const server = new McpServer(
+  {
+    name: "zteam",
+    version: "1.0.0",
+  },
+  {
+    capabilities: {
+      logging: {},
+    },
+  }
+);
 
 server.tool(
   "run_development_pipeline",
   [
     "Runs a spec-driven LangGraph development pipeline under a project root.",
-    "Flow: System Architect (requirements) → Technology Architect → System Architect (todo + specs)",
-    "→ Software Engineer (one spec at a time) → QA (tests + run; SE fix loop) → Orchestrator finalize.",
-    "Set docsOnly=true to stop after todo/specs + finalize (no SE/QA).",
+    "START → workflowRouter picks a route (or use workflow override), then:",
+    "full/docs: bootstrap → SA pré-reqs → clean README → fidelity → TA → specs → (SE/QA if full);",
+    "feature: specs → SE* → QA*; punch: prepare → SE → QA; fix: prepare → SE fix → QA;",
+    "resume: pending [ ] todos with existing specs → SE* → QA*.",
+    `Workflows: ${workflowCatalogText()}.`,
+    "Set workflow to full|docs|feature|punch|fix|resume to force a route; omit to auto-classify.",
+    "docsOnly=true is an alias for workflow=docs (deprecated).",
     "Set projectRoot to a relative folder (default '.') treated as the app root for all writes.",
-    "Docs: README.md, .docs/requirements.md, .docs/technologies.md, .docs/todo.md, .docs/specs/*.spec.md.",
-    "Models via 9router (NINEROUTER_BASE); 9router handles model failover — this tool only retries network/5xx.",
-    `systemArchitect → ${MODEL_SYSTEM_ARCHITECT};`,
-    `technologyArchitect → ${MODEL_TECHNOLOGY_ARCHITECT};`,
-    `softwareEngineer → ${MODEL_SOFTWARE_ENGINEER};`,
-    `qaEngineer → ${MODEL_QA_ENGINEER}.`,
+    "FILE writes are sanitized (no .., strip projectRoot prefix, strip markdown fences).",
+    "SE retries up to 6 attempts; tsc smoke before markTodoDone; QA may use ===SUMMARY=== only.",
+    "GRAPH_RECURSION_LIMIT (default 120) passed to LangGraph invoke.",
+    "On failure, check .docs/pipeline-result.json and resumeHint (prefer workflow=resume).",
     "Do not use Cursor Task subagents for this work.",
   ].join(" "),
   {
@@ -1083,45 +3303,222 @@ server.tool(
       .describe(
         "Relative project folder under WORKSPACE_ROOT/cwd treated as app root (default '.')"
       ),
+    workflow: z
+      .enum(["full", "docs", "feature", "punch", "fix", "resume"])
+      .optional()
+      .describe(
+        "Force a workflow route; omit to auto-classify from idea + existing docs"
+      ),
     docsOnly: z
       .boolean()
       .optional()
       .default(false)
       .describe(
-        "If true, run docs-only pipeline through todo+specs (skip SE/QA)"
+        "Deprecated alias for workflow=docs (planning only, skip SE/QA)"
       ),
   },
-  async ({ userIdea, projectRoot, docsOnly }) => {
-    const mode = docsOnly ? "docs-only" : "full";
+  async ({ userIdea, projectRoot, workflow, docsOnly }, extra) => {
     const root = projectRoot || ".";
     const started = Date.now();
-    console.error(`[pipeline] MCP start (${mode}) projectRoot=${root}`);
-    try {
-      const result = await compiledGraph.invoke({
-        userIdea,
-        projectRoot: root,
-        docsOnly: Boolean(docsOnly),
-        notifications: [],
-        pendingSpecs: [],
-        completedSpecs: [],
-        pendingQaSpecs: [],
-        qaFixRound: 0,
-      });
-      console.error(`[pipeline] MCP done in ${Date.now() - started}ms (${mode})`);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (err) {
-      console.error(
-        `[pipeline] MCP failed after ${Date.now() - started}ms (${mode}): ${errorText(err)}`
+    const appRoot = resolveAppRoot(root);
+    const recursionLimit = resolveGraphRecursionLimit();
+    const metrics = createMetrics();
+    const explicit = resolveExplicitWorkflow({
+      workflow,
+      docsOnly,
+      userIdea,
+    });
+    const mode = explicit || "auto";
+    const session = createProgressSession({
+      sendNotification: (notification) =>
+        extra.sendNotification(
+          notification as Parameters<typeof extra.sendNotification>[0]
+        ),
+      progressToken: extra._meta?.progressToken,
+    });
+    session.traceId = metrics.traceId;
+
+    return withProgressSession(session, async () => {
+      session.emit(
+        "pipeline",
+        "stage",
+        `MCP start (workflow=${mode}) projectRoot=${root} appRoot=${appRoot} recursionLimit=${recursionLimit} trace=${metrics.traceId}`
       );
-      throw err;
-    }
+      try {
+        assertSafeAppRoot(appRoot, root);
+        assertExpectedWorkspace(getWorkspaceRoot());
+        assertPathInsideWorkspace(getWorkspaceRoot(), appRoot);
+
+        if (shouldHealthcheckForWorkflow(explicit || "full")) {
+          const health = await healthcheckNineRouter();
+          session.emit(
+            "pipeline",
+            health.ok ? "notify" : "error",
+            health.message
+          );
+          if (!health.ok) {
+            const err = new Error(health.message);
+            (err as Error & { failureKind?: string }).failureKind =
+              "healthcheck";
+            throw err;
+          }
+        }
+
+        const result = await compiledGraph.invoke(
+          {
+            userIdea,
+            projectRoot: root,
+            workflow: explicit || "",
+            docsOnly: Boolean(docsOnly) || explicit === "docs",
+            workflowReason: "",
+            notifications: [],
+            resume: "",
+            pendingPreReqs: [],
+            completedPreReqs: [],
+            currentPreReq: "",
+            preReqTotal: 0,
+            pendingSpecs: [],
+            completedSpecs: [],
+            pendingQaSpecs: [],
+            qaFixRound: 0,
+            bootstrapFixRound: 0,
+            qaFailureClass: "",
+            traceId: metrics.traceId,
+            appRoot,
+            filesWritten: [],
+            fidelityWarnings: [],
+            failureKind: "",
+            resumeHint: "",
+          },
+          { recursionLimit }
+        );
+        session.emit(
+          "pipeline",
+          "stage",
+          `MCP done in ${Date.now() - started}ms (workflow=${result.workflow || mode})`
+        );
+        const live = session.lines;
+        const merged = {
+          ...result,
+          appRoot: result.appRoot || appRoot,
+          filesWritten: result.filesWritten ?? [],
+          recursionLimit,
+          ...metricsSnapshot(),
+          notifications:
+            live.length > 0
+              ? live
+              : Array.isArray(result.notifications)
+                ? result.notifications
+                : [],
+        };
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(merged, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        const hint =
+          (err as { resumeHint?: string }).resumeHint ||
+          `workflow=resume projectRoot=${root}`;
+        const failureKind =
+          (err as { failureKind?: string }).failureKind || "pipeline_error";
+        setErrorClass(failureKind);
+        session.emit(
+          "pipeline",
+          "error",
+          `MCP failed after ${Date.now() - started}ms (${mode}): ${errorText(err)}`
+        );
+        await writePipelineResult(appRoot, {
+          ok: false,
+          workflow: mode,
+          appRoot,
+          projectRoot: root,
+          failureKind,
+          resumeHint: hint,
+          error: errorText(err),
+          ms: Date.now() - started,
+        });
+        // Structured error — keep MCP usable (do not disconnect)
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  ok: false,
+                  failureKind,
+                  error: errorText(err),
+                  appRoot,
+                  resumeHint: hint,
+                  ...metricsSnapshot(),
+                  notifications: session.lines,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+          isError: true,
+        };
+      } finally {
+        session.close();
+        clearMetrics();
+      }
+    });
+  }
+);
+
+server.tool(
+  "get_pipeline_state",
+  "Read .docs/pipeline-state.json for a projectRoot (debug / resume).",
+  {
+    projectRoot: z
+      .string()
+      .optional()
+      .default(".")
+      .describe("Relative project folder under WORKSPACE_ROOT"),
+  },
+  async ({ projectRoot }) => {
+    const appRoot = resolveAppRoot(projectRoot || ".");
+    assertSafeAppRoot(appRoot, projectRoot || ".");
+    const state = await readPipelineState(appRoot);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            state || { ok: false, message: "no pipeline-state.json" },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "approve_gate",
+  "Human-in-the-loop: resume, abort, or redirect a paused pipeline (ZTEAM_HITL=1).",
+  {
+    projectRoot: z.string().optional().default("."),
+    decision: z.enum(["resume", "abort", "redirect"]),
+    redirectHint: z.string().optional(),
+  },
+  async ({ projectRoot, decision, redirectHint }) => {
+    const appRoot = resolveAppRoot(projectRoot || ".");
+    const result = await applyHitlDecision(appRoot, decision, redirectHint);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ appRoot, ...result }, null, 2),
+        },
+      ],
+    };
   }
 );
 
@@ -1146,4 +3543,77 @@ if (isMainModule()) {
     console.error("Failed to start MCP server:", err);
     process.exit(1);
   });
+}
+
+/**
+ * Section C smoke: content-retry classification + heartbeat emission.
+ * Call via `npm run smoke` (sets a short PROGRESS_HEARTBEAT_MS before import).
+ */
+export async function runSectionCSmoke(): Promise<{
+  ok: true;
+  heartbeats: number;
+  lines: string[];
+}> {
+  try {
+    assertUsableLlmText("", "smoke");
+    throw new Error("expected empty text to throw");
+  } catch (err) {
+    if (!(err instanceof LlmContentError) || !isRetryableError(err)) {
+      throw new Error(`empty text should be retryable LlmContentError: ${errorText(err)}`);
+    }
+  }
+
+  try {
+    assertHasFileSections("hello without files", "smoke");
+    throw new Error("expected missing FILE sections to throw");
+  } catch (err) {
+    if (
+      !(err instanceof LlmContentError) ||
+      err.kind !== "no_file_sections" ||
+      !isRetryableError(err)
+    ) {
+      throw new Error(
+        `missing FILE sections should be retryable: ${errorText(err)}`
+      );
+    }
+  }
+
+  try {
+    assertHasFileSections("===FILE: a.ts===\n\n", "smoke");
+    throw new Error("expected empty FILE body to throw");
+  } catch (err) {
+    if (
+      !(err instanceof LlmContentError) ||
+      err.kind !== "empty_file_body" ||
+      !isRetryableError(err)
+    ) {
+      throw new Error(`empty FILE body should be retryable: ${errorText(err)}`);
+    }
+  }
+
+  const interval = HEARTBEAT_MS;
+  if (interval > 5_000) {
+    throw new Error(
+      `PROGRESS_HEARTBEAT_MS too high for smoke (${interval}); use <= 5000 (smoke script sets 400)`
+    );
+  }
+
+  const session = createProgressSession();
+  await withProgressSession(session, async () => {
+    await withHeartbeat("smoke", "sleep de teste", async () => {
+      await sleep(interval * 2 + 150);
+    });
+  });
+
+  const heartbeats = session.lines.filter((l) => l.includes("heartbeat:"));
+  if (heartbeats.length < 1) {
+    throw new Error(
+      `expected >=1 heartbeat after ~${interval * 2}ms; lines:\n${session.lines.join("\n")}`
+    );
+  }
+
+  console.error(
+    `[smoke] OK — retryable content errors + ${heartbeats.length} heartbeat(s) (interval=${interval}ms)`
+  );
+  return { ok: true, heartbeats: heartbeats.length, lines: [...session.lines] };
 }

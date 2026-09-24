@@ -1,24 +1,51 @@
-%% spec-driven pipeline (compiledGraph; docsOnly via state)
+%% spec-driven pipeline (workflowRouter → full|docs|feature|punch|fix)
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 graph TD;
 	__start__([<p>__start__</p>]):::first
-	systemArchitectRequirements(systemArchitectRequirements)
+	workflowRouter(workflowRouter)
+	punchPrepare(punchPrepare)
+	fixPrepare(fixPrepare)
+	resumePrepare(resumePrepare)
+	orchestratorBootstrapReadme(orchestratorBootstrapReadme)
+	systemArchitectReqItem(systemArchitectReqItem)
+	orchestratorAfterPreReq(orchestratorAfterPreReq)
+	orchestratorCleanReadme(orchestratorCleanReadme)
+	fidelityCriticRequirements(fidelityCriticRequirements)
 	technologyArchitect(technologyArchitect)
 	systemArchitectSpecs(systemArchitectSpecs)
+	scaffoldPrepare(scaffoldPrepare)
+	bootstrapFix(bootstrapFix)
 	softwareEngineer(softwareEngineer)
 	softwareEngineerFix(softwareEngineerFix)
 	qaEngineer(qaEngineer)
 	orchestratorFinalize(orchestratorFinalize)
 	__end__([<p>__end__</p>]):::last
-	__start__ --> systemArchitectRequirements;
+	__start__ --> workflowRouter;
+	bootstrapFix --> qaEngineer;
+	fidelityCriticRequirements --> technologyArchitect;
+	fixPrepare --> softwareEngineerFix;
+	orchestratorBootstrapReadme --> systemArchitectReqItem;
+	orchestratorCleanReadme --> fidelityCriticRequirements;
 	orchestratorFinalize --> __end__;
+	punchPrepare --> softwareEngineer;
+	scaffoldPrepare --> softwareEngineer;
 	softwareEngineerFix --> qaEngineer;
-	systemArchitectRequirements --> technologyArchitect;
+	systemArchitectReqItem --> orchestratorAfterPreReq;
 	technologyArchitect --> systemArchitectSpecs;
-	systemArchitectSpecs -.-> softwareEngineer;
+	workflowRouter -.-> orchestratorBootstrapReadme;
+	workflowRouter -.-> systemArchitectSpecs;
+	workflowRouter -.-> punchPrepare;
+	workflowRouter -.-> fixPrepare;
+	workflowRouter -.-> resumePrepare;
+	orchestratorAfterPreReq -.-> systemArchitectReqItem;
+	orchestratorAfterPreReq -.-> orchestratorCleanReadme;
+	systemArchitectSpecs -.-> scaffoldPrepare;
 	systemArchitectSpecs -.-> orchestratorFinalize;
+	resumePrepare -.-> scaffoldPrepare;
+	resumePrepare -.-> orchestratorFinalize;
 	softwareEngineer -.-> qaEngineer;
 	qaEngineer -.-> softwareEngineerFix;
+	qaEngineer -.-> bootstrapFix;
 	qaEngineer -.-> orchestratorFinalize;
 	softwareEngineer -.-> softwareEngineer;
 	qaEngineer -.-> qaEngineer;

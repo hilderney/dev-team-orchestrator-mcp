@@ -5,3 +5,4 @@ pipeline-result.json
 pipeline-run.log
 *.log
 .DS_Store
+.docs/todo.md
