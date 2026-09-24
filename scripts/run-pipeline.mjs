@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { access, readdir, writeFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -24,13 +24,19 @@ const WORKFLOW_ALIASES = new Set([
 function parseArgs(argv) {
   let docsOnly = false;
   let projectRoot = ".";
+  let workspaceRoot = "";
   let workflow = "";
+  let skipConfigGate = false;
   const ideaParts = [];
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--docs-only") {
       docsOnly = true;
+      continue;
+    }
+    if (a === "--skip-config-gate") {
+      skipConfigGate = true;
       continue;
     }
     if (a === "--workflow") {
@@ -49,6 +55,14 @@ function parseArgs(argv) {
       projectRoot = a.slice("--project-root=".length) || ".";
       continue;
     }
+    if (a === "--workspace-root") {
+      workspaceRoot = argv[++i] || "";
+      continue;
+    }
+    if (a.startsWith("--workspace-root=")) {
+      workspaceRoot = a.slice("--workspace-root=".length) || "";
+      continue;
+    }
     ideaParts.push(a);
   }
 
@@ -62,6 +76,8 @@ function parseArgs(argv) {
     docsOnly,
     workflow,
     projectRoot,
+    workspaceRoot,
+    skipConfigGate,
     userIdea: ideaParts.join(" ").trim(),
   };
 }
@@ -87,6 +103,8 @@ async function main() {
     docsOnly,
     workflow: workflowArg,
     projectRoot,
+    workspaceRoot: workspaceArg,
+    skipConfigGate,
     userIdea: ideaArg,
   } = parseArgs(process.argv.slice(2));
   const userIdea = ideaArg || DEFAULT_IDEA;
@@ -95,12 +113,21 @@ async function main() {
   const {
     compiledGraph,
     resolveAppRoot,
+    resolveWorkspaceRoot,
     resolveGraphRecursionLimit,
     PACKAGE_ROOT: pkg,
     createProgressSession,
     withProgressSession,
   } = await import("../src/orchestrator.ts");
   const { resolveExplicitWorkflow } = await import("../src/workflows/index.ts");
+  const {
+    loadTeamConfig,
+    hasAnyTeamConfig,
+    needsConfigPayload,
+    diagnoseWorkspace,
+    ensureZteamBootstrapRoots,
+  } = await import("../src/zteam-config.ts");
+  const { withRunContext } = await import("../src/run-context.ts");
 
   const explicit = resolveExplicitWorkflow({
     workflow: workflowArg,
@@ -109,13 +136,20 @@ async function main() {
   });
   const mode = explicit || "auto";
 
-  const appRoot = resolveAppRoot(projectRoot);
+  const ws = resolveWorkspaceRoot(workspaceArg || undefined);
+  const appRoot = resolveAppRoot(projectRoot, ws.root);
   const recursionLimit = resolveGraphRecursionLimit();
-  const workspace =
-    process.env.WORKSPACE_ROOT?.trim() || process.cwd();
+
+  // Before config gate / any LLM
+  const boot = await ensureZteamBootstrapRoots(ws.root, appRoot);
+  console.error(
+    `[pipeline] .zteam bootstrap skill=${boot.workspace.skill.status} readme=${boot.workspace.readme.status}`
+  );
+
+  const teamConfig = await loadTeamConfig(ws.root, appRoot);
 
   console.error(`[pipeline] PACKAGE_ROOT=${pkg ?? PACKAGE_ROOT}`);
-  console.error(`[pipeline] WORKSPACE_ROOT/cwd=${workspace}`);
+  console.error(`[pipeline] workspaceRoot=${ws.root} (source=${ws.source})`);
   console.error(`[pipeline] projectRoot=${projectRoot}`);
   console.error(`[pipeline] appRoot=${appRoot}`);
   console.error(`[pipeline] workflow=${mode}`);
@@ -123,6 +157,19 @@ async function main() {
   console.error(
     `[pipeline] userIdea=${userIdea.slice(0, 120)}${userIdea.length > 120 ? "…" : ""}`
   );
+
+  if (!skipConfigGate && !hasAnyTeamConfig(teamConfig)) {
+    const payload = needsConfigPayload({
+      workspaceRoot: ws.root,
+      appRoot,
+      workspace: diagnoseWorkspace(ws.root, ws.source),
+    });
+    console.error(`[pipeline] needsConfig — write .zteam/config.json or pass --skip-config-gate`);
+    console.log(JSON.stringify(payload, null, 2));
+    process.exitCode = 2;
+    return;
+  }
+
   console.error(
     `[pipeline] invoking graph (router → ${mode === "auto" ? "classify" : mode})…`
   );
@@ -132,50 +179,59 @@ async function main() {
 
   let result;
   try {
-    result = await withProgressSession(session, async () => {
-      session.emit("pipeline", "stage", `start (workflow=${mode})`);
-      const out = await compiledGraph.invoke(
-        {
-          userIdea,
-          projectRoot,
-          workflow: explicit || "",
-          docsOnly: Boolean(docsOnly) || explicit === "docs",
-          workflowReason: "",
-          notifications: [],
-          resume: "",
-          pendingPreReqs: [],
-          completedPreReqs: [],
-          currentPreReq: "",
-          preReqTotal: 0,
-          pendingSpecs: [],
-          completedSpecs: [],
-          pendingQaSpecs: [],
-          qaFixRound: 0,
-          appRoot,
-          filesWritten: [],
-          fidelityWarnings: [],
-          failureKind: "",
-          resumeHint: "",
-        },
-        { recursionLimit }
-      );
-      session.emit(
-        "pipeline",
-        "stage",
-        `done in ${Date.now() - started}ms (workflow=${out.workflow || mode})`
-      );
-      return {
-        ...out,
-        appRoot: out.appRoot || appRoot,
-        recursionLimit,
-        notifications:
-          session.lines.length > 0
-            ? session.lines
-            : Array.isArray(out.notifications)
-              ? out.notifications
-              : [],
-      };
-    });
+    result = await withRunContext(
+      {
+        workspaceRoot: ws.root,
+        workspaceSource: ws.source,
+        teamConfig,
+      },
+      () =>
+        withProgressSession(session, async () => {
+          session.emit("pipeline", "stage", `start (workflow=${mode})`);
+          const out = await compiledGraph.invoke(
+            {
+              userIdea,
+              projectRoot,
+              workflow: explicit || "",
+              docsOnly: Boolean(docsOnly) || explicit === "docs",
+              workflowReason: "",
+              notifications: [],
+              resume: "",
+              pendingPreReqs: [],
+              completedPreReqs: [],
+              currentPreReq: "",
+              preReqTotal: 0,
+              pendingSpecs: [],
+              completedSpecs: [],
+              pendingQaSpecs: [],
+              qaFixRound: 0,
+              appRoot,
+              filesWritten: [],
+              fidelityWarnings: [],
+              failureKind: "",
+              resumeHint: "",
+            },
+            { recursionLimit }
+          );
+          session.emit(
+            "pipeline",
+            "stage",
+            `done in ${Date.now() - started}ms (workflow=${out.workflow || mode})`
+          );
+          return {
+            ...out,
+            appRoot: out.appRoot || appRoot,
+            workspaceRoot: ws.root,
+            recursionLimit,
+            notifications:
+              session.lines.length > 0
+                ? session.lines
+                : Array.isArray(out.notifications)
+                  ? out.notifications
+                  : [],
+          };
+        })
+    );
   } catch (err) {
     console.error(
       `[pipeline] FAILED after ${Date.now() - started}ms:`,
@@ -187,6 +243,7 @@ async function main() {
       mode,
       workflow: explicit || null,
       projectRoot,
+      workspaceRoot: ws.root,
       appRoot,
       recursionLimit,
       error: err instanceof Error ? err.message : String(err),
@@ -249,7 +306,8 @@ async function main() {
         workflow: result.workflow || mode,
         workflowReason: result.workflowReason || null,
         projectRoot,
-        appRoot,
+        workspaceRoot: ws.root,
+        appRoot: resolve(appRoot),
         recursionLimit,
         filesWritten: result.filesWritten ?? [],
         outPath,

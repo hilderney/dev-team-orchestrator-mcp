@@ -14,7 +14,7 @@ MCP also exposes `get_pipeline_state` and `approve_gate` (HITL when `ZTEAM_HITL=
 
 ## Setup
 
-1. `cp .env.example .env` and fill in `NINEROUTER_BASE` / `NINEROUTER_KEY` (optional `MODEL_*`, `WORKSPACE_ROOT`, `GRAPH_RECURSION_LIMIT`, `MAX_QA_FIX_ROUNDS`, `PROGRESS_HEARTBEAT_MS`).
+1. `cp .env.example .env` and fill in `NINEROUTER_BASE` / `NINEROUTER_KEY` (optional `MODEL_*`, `GRAPH_RECURSION_LIMIT`, `MAX_QA_FIX_ROUNDS`, `PROGRESS_HEARTBEAT_MS`).
 2. `npm install`
 3. Register the MCP server in Cursor (`~/.cursor/mcp.json`) under the key **`zteam`**:
 
@@ -34,7 +34,36 @@ MCP also exposes `get_pipeline_state` and `approve_gate` (HITL when `ZTEAM_HITL=
 }
 ```
 
+**Do not** set a sticky `WORKSPACE_ROOT` in `mcp.json` — the skill passes `workspaceRoot` = the Cursor-open folder on every call (avoids writing into the wrong repo). Credentials stay in env; workspace is per-call.
+
 Cursor exposes the tool namespace as **`user-zteam`**. Restart MCP after changing the key.
+
+### Team models — `.zteam/config.json`
+
+Models resolve as: `{app}/.zteam/config.json` → `{workspace}/.zteam/config.json` → env `MODEL_*` → built-in defaults.
+
+Example:
+
+```json
+{
+  "version": 1,
+  "models": {
+    "systemArchitect": "9RSA-system-architect-free",
+    "technologyArchitect": "9RTA-technology-architect-free",
+    "softwareEngineer": "9RSE-software-engineer-free",
+    "qaEngineer": "9RQA-qa-free",
+    "fallback": ""
+  },
+  "maxTokens": {
+    "systemArchitect": 1600,
+    "technologyArchitect": 2500,
+    "softwareEngineer": 8000,
+    "qaEngineer": 2000
+  }
+}
+```
+
+MCP tools: `get_zteam_config`, `write_zteam_config`. Pipeline returns `failureKind=needsConfig` until at least one config file exists (CLI: `--skip-config-gate` for smoke).
 
 ## Cursor — `@zteam` / `/zteam`
 
@@ -54,7 +83,9 @@ Examples:
 /zteam punch — make the submit button blue in samples/my-app
 ```
 
-Pass `projectRoot` when you can. Optional `workflow`: `full` | `docs` | `feature` | `punch` | `fix` | `resume` (omit = auto-router).
+Always pass `workspaceRoot` (absolute Cursor open folder) and `projectRoot` when you can. Optional `workflow`: `full` | `docs` | `feature` | `punch` | `fix` | `resume` (omit = auto-router).
+
+Skill subcommands: **`@zteam/config`**, **`@zteam/documentation`**, **`@zteam/tests`** — see [`.zteam/README.MD`](.zteam/README.MD).
 
 Also see the always-on routing rule for stage/env details. Rescue mid-failure with `workflow=resume` (see skill).
 
@@ -122,7 +153,7 @@ flowchart TD
   finalize --> endNode
 ```
 
-Hard guard: refuses to write when `projectRoot` is `.` and `appRoot` equals the orchestrator package (set `WORKSPACE_ROOT` and/or a dedicated `projectRoot`). `GRAPH_RECURSION_LIMIT` default **120**.
+Hard guard: refuses to write when `projectRoot` is `.` and `appRoot` equals the orchestrator package (pass `workspaceRoot` and/or a dedicated `projectRoot`). `GRAPH_RECURSION_LIMIT` default **120**.
 
 ## Resilience (empty / invalid LLM)
 
@@ -143,9 +174,9 @@ While the pipeline runs (MCP tool or CLI):
 ## CLI
 
 ```bash
-npm run pipeline:docs -- --project-root samples/my-app "idea…"
-npm run pipeline -- --workflow punch --project-root samples/my-app "só muda a cor do botão"
-npm run pipeline -- --project-root samples/my-app "idea…"   # auto-classify
+npm run pipeline:docs -- --workspace-root C:/path/to/open/folder --project-root samples/my-app "idea…"
+npm run pipeline -- --workflow punch --workspace-root C:/path/to/open/folder --project-root samples/my-app "só muda a cor do botão"
+npm run pipeline -- --project-root samples/my-app "idea…"   # workspace from env/cwd; prefer --workspace-root
 npm run pipeline:feature -- --project-root samples/my-app "add CSV export"
 npm run pipeline:resume -- --project-root samples/my-app "resume pending"
 npm run graph
@@ -156,10 +187,11 @@ npm run smoke:files
 npm run smoke:improvements
 npm run smoke:architecture
 npm run smoke:implementation
+npm run smoke:zteam-config
 npm run smoke:all
 ```
 
-Use `projectRoot` so generated docs land in the app folder, not this MCP package.
+Use `--workspace-root` + `projectRoot` so generated docs land in the app folder, not this MCP package.
 
 ### Smoke
 
@@ -170,6 +202,7 @@ Use `projectRoot` so generated docs land in the app folder, not this MCP package
 - `npm run smoke:improvements` — bootstrap/vitest/scaffold/FILE repair/progress close/healthcheck/metrics
 - `npm run smoke:architecture` — architecture progress pack (pré-req hints, JSON artifact, summaries)
 - `npm run smoke:implementation` — implementation progress pack (spec/QA hints, JSON artifact)
+- `npm run smoke:zteam-config` — workspaceRoot override, `.zteam` merge, needsConfig, gitignore
 - CI: [`.github/workflows/zteam-smokes.yml`](.github/workflows/zteam-smokes.yml) runs `smoke:all`
 
 Optional live check (needs 9router): run `npm run pipeline:docs -- --project-root samples/smoke-app "tiny idea"` and confirm heartbeats if a stage exceeds 30s.

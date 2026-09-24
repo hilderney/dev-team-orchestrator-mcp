@@ -15,7 +15,11 @@ Prefer the project skill **`zteam`** (`/zteam` or `@zteam`) for the short trigge
 
 ## Spec-driven pipeline
 
-The MCP tool runs LangGraph. Pass optional `projectRoot` (default `"."`) — that folder is treated as the **app root** for all writes (resolved under `WORKSPACE_ROOT` or `cwd`). Prefer setting `projectRoot` (e.g. `samples/my-app`) so the MCP package README is not overwritten. Writes into the orchestrator package root with `projectRoot: "."` are rejected — set `WORKSPACE_ROOT` and/or a dedicated `projectRoot`.
+The MCP tool runs LangGraph. **Always pass `workspaceRoot`** = absolute path of the Cursor-open folder (skill contract). Optional `projectRoot` (default `"."`) is resolved under that workspace. Prefer `projectRoot` like `samples/my-app` so the MCP package README is not overwritten. Writes into the orchestrator package root with `projectRoot: "."` are rejected.
+
+Team models come from `.zteam/config.json` (app override → workspace default → env `MODEL_*`). If missing, the pipeline returns `failureKind=needsConfig` — use `@zteam/config` / `get_zteam_config` / `write_zteam_config`. Prefer **not** setting sticky `WORKSPACE_ROOT` in `mcp.json` (wrong-repo footgun).
+
+**Subcommands (skill):** `@zteam/config` (setup), `@zteam/documentation` (`workflow=docs`), `@zteam/tests` (QA-focused). See [`.zteam/README.MD`](../../.zteam/README.MD).
 
 **Requirements (full/docs):** iterative — bootstrap Resume + Pré Requirements → SA expands one pré-req at a time → clean README → then TA as usual.
 

@@ -1,0 +1,183 @@
+/**
+ * Smoke: zteam config merge, needsConfig, gitignore, workspaceRoot override.
+ * No live LLM.
+ */
+process.env.NINEROUTER_KEY ??= "smoke-dummy-key";
+
+import "dotenv/config";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+const {
+  resolveWorkspaceRoot,
+  resolveAppRoot,
+} = await import("../src/orchestrator.ts");
+const {
+  loadTeamConfig,
+  writeTeamConfig,
+  ensureGitignoreIgnoresZteam,
+  hasAnyTeamConfig,
+  DEFAULT_MODELS,
+} = await import("../src/zteam-config.ts");
+const { withRunContext } = await import("../src/run-context.ts");
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+
+const prevWs = process.env.WORKSPACE_ROOT;
+const base = await mkdtemp(join(tmpdir(), "zteam-config-"));
+
+try {
+  // --- resolveWorkspaceRoot: arg wins over env ---
+  {
+    process.env.WORKSPACE_ROOT = join(base, "env-ws");
+    await mkdir(process.env.WORKSPACE_ROOT, { recursive: true });
+    const argWs = join(base, "arg-ws");
+    await mkdir(argWs, { recursive: true });
+    const r = resolveWorkspaceRoot(argWs);
+    assert(r.root === resolve(argWs), `arg wins: ${r.root}`);
+    assert(r.source === "arg", `source arg got ${r.source}`);
+  }
+
+  // --- relative workspaceRoot rejected ---
+  {
+    let threw = false;
+    try {
+      resolveWorkspaceRoot("relative/path");
+    } catch (e) {
+      threw = /absolute/i.test(String(e.message || e));
+    }
+    assert(threw, "relative workspaceRoot must throw");
+  }
+
+  // --- ALS override ---
+  {
+    const alsWs = join(base, "als-ws");
+    await mkdir(alsWs, { recursive: true });
+    process.env.WORKSPACE_ROOT = join(base, "env-ws");
+    await withRunContext(
+      { workspaceRoot: alsWs, workspaceSource: "arg" },
+      () => {
+        const r = resolveWorkspaceRoot();
+        assert(r.root === resolve(alsWs), `ALS wins: ${r.root}`);
+        const app = resolveAppRoot("samples/foo");
+        assert(
+          app === resolve(alsWs, "samples/foo"),
+          `app under ALS: ${app}`
+        );
+      }
+    );
+  }
+
+  // --- needsConfig when no files ---
+  {
+    const ws = join(base, "empty-ws");
+    const app = join(ws, "app");
+    await mkdir(app, { recursive: true });
+    const cfg = await loadTeamConfig(ws, app);
+    assert(!hasAnyTeamConfig(cfg), "no config files");
+    assert(cfg.models.systemArchitect === DEFAULT_MODELS.systemArchitect, "env/default models");
+  }
+
+  // --- write + merge: app overrides workspace ---
+  {
+    const ws = join(base, "merge-ws");
+    const app = join(ws, "my-app");
+    await mkdir(app, { recursive: true });
+    await writeTeamConfig(ws, {
+      models: {
+        systemArchitect: "ws-sa",
+        technologyArchitect: "ws-ta",
+        softwareEngineer: "ws-se",
+        qaEngineer: "ws-qa",
+        fallback: "",
+      },
+    });
+    await writeTeamConfig(app, {
+      models: {
+        systemArchitect: "app-sa",
+        technologyArchitect: "ws-ta",
+        softwareEngineer: "ws-se",
+        qaEngineer: "ws-qa",
+        fallback: "app-fb",
+      },
+      maxTokens: { softwareEngineer: 9999 },
+    });
+    const cfg = await loadTeamConfig(ws, app);
+    assert(cfg.exists.workspace && cfg.exists.app, "both exist");
+    assert(cfg.models.systemArchitect === "app-sa", "app overrides SA");
+    assert(cfg.models.technologyArchitect === "ws-ta", "workspace TA kept");
+    assert(cfg.models.fallback === "app-fb", "app fallback");
+    assert(cfg.maxTokens.softwareEngineer === 9999, "app maxTokens");
+    const readme = await readFile(join(ws, ".zteam", "README.MD"), "utf8");
+    assert(readme.includes("@zteam/config"), "README documents @zteam/config");
+    assert(
+      readme.includes("@zteam/documentation"),
+      "README documents @zteam/documentation"
+    );
+    assert(readme.includes("@zteam/tests"), "README documents @zteam/tests");
+    const skillText = await readFile(
+      join(ws, ".zteam", "skills", "SKILL.md"),
+      "utf8"
+    );
+    assert(
+      skillText.includes("@zteam/config") || skillText.includes("zteam"),
+      "skill copied under .zteam/skills/"
+    );
+  }
+
+  // --- gitignore helper ---
+  {
+    const dir = join(base, "gi");
+    await mkdir(dir, { recursive: true });
+    const no = await ensureGitignoreIgnoresZteam(dir, { createIfMissing: false });
+    assert(no.status === "no_gitignore", "no gitignore");
+    const created = await ensureGitignoreIgnoresZteam(dir, {
+      createIfMissing: true,
+    });
+    assert(created.status === "created", "created gitignore");
+    const text = await readFile(join(dir, ".gitignore"), "utf8");
+    assert(text.includes(".zteam/config.json"), "has .zteam/config.json");
+    const again = await ensureGitignoreIgnoresZteam(dir);
+    assert(again.status === "already", "already ignored");
+
+    const dir2 = join(base, "gi2");
+    await mkdir(dir2, { recursive: true });
+    await writeFile(join(dir2, ".gitignore"), "node_modules/\n", "utf8");
+    const added = await ensureGitignoreIgnoresZteam(dir2);
+    assert(added.status === "added", "appended");
+    const t2 = await readFile(join(dir2, ".gitignore"), "utf8");
+    assert(
+      t2.includes("node_modules/") && t2.includes(".zteam/config.json"),
+      "both lines"
+    );
+  }
+
+  // --- Zod rejects empty model on write ---
+  {
+    const dir = join(base, "bad");
+    await mkdir(dir, { recursive: true });
+    let threw = false;
+    try {
+      await writeTeamConfig(dir, {
+        models: {
+          systemArchitect: "  ",
+          technologyArchitect: "ok",
+          softwareEngineer: "ok",
+          qaEngineer: "ok",
+        },
+      });
+    } catch {
+      threw = true;
+    }
+    assert(threw, "empty model rejected");
+  }
+
+  console.log("smoke:zteam-config OK");
+} finally {
+  if (prevWs === undefined) delete process.env.WORKSPACE_ROOT;
+  else process.env.WORKSPACE_ROOT = prevWs;
+  await rm(base, { recursive: true, force: true });
+}

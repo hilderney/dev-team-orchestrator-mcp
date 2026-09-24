@@ -5,13 +5,21 @@ alwaysApply: false
 
 # @zteam
 
-When this rule is attached (`@zteam`) or the user says **zteam** / **/zteam**:
+When this rule is attached (`@zteam`) or the user says **zteam** / **/zteam** / **@zteam/…**:
 
-1. Call MCP `run_development_pipeline` on **`user-zteam`** (not Cursor Task subagents).
-2. Pass a rich `userIdea` (constraints included); set **`projectRoot`** (prefer `samples/…`).
-3. MCP env: **`WORKSPACE_ROOT`** = Cursor workspace. `projectRoot: "."` against the orchestrator package is rejected.
-4. Greenfield sensível: **`docs` → review requirements → `feature`/`full`**. Mid-failure: **`resume`** (same `projectRoot`).
-5. After the tool: report `appRoot`, `filesWritten`, `fidelityWarnings`, `resumeHint`; read `{appRoot}/.docs/pipeline-result.json` on failure.
-6. Never silently copy sibling projects; never “fix drift” by blindly re-running docs that reinvent the product.
+## Subcommands
 
-Do not implement team roles yourself with Cursor Task — that bypasses 9router.
+| Trigger | Do this |
+|---------|---------|
+| **`@zteam/config`** | `get_zteam_config` → questions → `write_zteam_config` only (models source of truth). See `.zteam/README.MD`. |
+| **`@zteam/documentation`** | `run_development_pipeline` with `workflow: "docs"`. |
+| **`@zteam/tests`** | QA-focused pipeline (`fix` / `feature` / `resume` as appropriate). |
+| **`@zteam`** (plain) | Full/auto pipeline as usual. |
+
+## Always
+
+1. Call MCP on **`user-zteam`** (not Cursor Task subagents).
+2. Pass **`workspaceRoot`** = absolute Cursor-open folder (not sticky `mcp.json` `WORKSPACE_ROOT`).
+3. Pass rich `userIdea` + **`projectRoot`** (prefer `samples/…`).
+4. If `needsConfig`, run the config flow (or tell user `@zteam/config`) then re-run.
+5. Report `workspaceRoot`, `appRoot`, `filesWritten`, `resumeHint`; never silently copy sibling projects.

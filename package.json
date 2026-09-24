@@ -20,7 +20,9 @@
     "smoke:improvements": "tsx scripts/smoke-improvements.mjs",
     "smoke:architecture": "tsx scripts/smoke-architecture-progress.mjs",
     "smoke:implementation": "tsx scripts/smoke-implementation-progress.mjs",
-    "smoke:all": "npm run smoke && npm run smoke:workflows && npm run smoke:reqs && npm run smoke:files && npm run smoke:improvements && npm run smoke:architecture && npm run smoke:implementation"
+    "smoke:zteam-config": "tsx scripts/smoke-zteam-config.mjs",
+    "zteam:bootstrap": "tsx scripts/copy-zteam-skill.mjs",
+    "smoke:all": "npm run smoke && npm run smoke:workflows && npm run smoke:reqs && npm run smoke:files && npm run smoke:improvements && npm run smoke:architecture && npm run smoke:implementation && npm run smoke:zteam-config"
   },
   "keywords": ["mcp", "langgraph", "9router"],
   "author": "",

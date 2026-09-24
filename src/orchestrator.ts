@@ -75,6 +75,22 @@ import {
   assertPathInsideWorkspace,
   sandboxConfig,
 } from "./sandbox.js";
+import { getRunContext, withRunContext } from "./run-context.js";
+import {
+  DEFAULT_MAX_TOKENS,
+  DEFAULT_MODELS,
+  diagnoseWorkspace,
+  ensureGitignoreIgnoresZteam,
+  ensureZteamBootstrapRoots,
+  envDefaultsTeamConfig,
+  hasAnyTeamConfig,
+  loadTeamConfig,
+  needsConfigPayload,
+  SETUP_QUESTIONS,
+  writeTeamConfig,
+  type ResolvedTeamConfig,
+  type TeamRole,
+} from "./zteam-config.js";
 import { pickSpecBatch } from "./spec-batch.js";
 import {
   archNotify,
@@ -109,14 +125,49 @@ const DEFAULT_GRAPH_RECURSION_LIMIT = 120;
 const SPEC_SPLIT_CHARS = 4000;
 const SE_INVOKE_ATTEMPTS = 6;
 
-function getWorkspaceRoot(): string {
+export type WorkspaceResolveResult = {
+  root: string;
+  source: "arg" | "env" | "cwd";
+};
+
+/**
+ * Resolve workspace root: MCP/CLI arg (absolute) > env WORKSPACE_ROOT > cwd.
+ * Prefer passing the Cursor-open folder as `workspaceRoot` on every tool call.
+ */
+export function resolveWorkspaceRoot(
+  override?: string | null
+): WorkspaceResolveResult {
+  const fromCtx = getRunContext()?.workspaceRoot;
+  const raw = (override ?? fromCtx)?.trim();
+  if (raw) {
+    if (!isAbsolute(raw)) {
+      throw new Error(
+        `workspaceRoot must be an absolute path (Cursor open folder), got: ${raw}`
+      );
+    }
+    return {
+      root: resolve(raw),
+      source: "arg",
+    };
+  }
   const fromEnv = process.env.WORKSPACE_ROOT?.trim();
-  return fromEnv ? resolve(fromEnv) : process.cwd();
+  if (fromEnv) {
+    return { root: resolve(fromEnv), source: "env" };
+  }
+  return { root: process.cwd(), source: "cwd" };
+}
+
+function getWorkspaceRoot(): string {
+  return resolveWorkspaceRoot().root;
 }
 
 /** Absolute path to the app project root (workspace + relative projectRoot). */
-export function resolveAppRoot(projectRoot = "."): string {
-  return resolve(getWorkspaceRoot(), projectRoot || ".");
+export function resolveAppRoot(
+  projectRoot = ".",
+  workspaceRootOverride?: string | null
+): string {
+  const workspace = resolveWorkspaceRoot(workspaceRootOverride).root;
+  return resolve(workspace, projectRoot || ".");
 }
 
 /** LangGraph recursionLimit: env GRAPH_RECURSION_LIMIT or estimate from pending specs. */
@@ -161,12 +212,19 @@ export function assertSafeAppRoot(
     throw new Error(
       [
         "Refusing to write into the orchestrator package root.",
-        "Set WORKSPACE_ROOT to your app folder and/or pass projectRoot",
-        '(e.g. "samples/my-app"), not projectRoot="." against the MCP cwd.',
+        "Pass workspaceRoot (absolute Cursor open folder) and/or a dedicated projectRoot",
+        '(e.g. "samples/my-app"), not projectRoot="." against the MCP package cwd.',
       ].join(" ")
     );
   }
 }
+
+const workspaceRootArg = z
+  .string()
+  .optional()
+  .describe(
+    "Absolute path of the Cursor-open workspace folder. Prefer over sticky WORKSPACE_ROOT env in mcp.json."
+  );
 
 function parseMaxTokens(envValue: string | undefined, fallback: number): number {
   const n = Number.parseInt(envValue ?? "", 10);
@@ -1132,31 +1190,6 @@ if (!NINEROUTER_KEY) {
   throw new Error("NINEROUTER_KEY não definida no .env");
 }
 
-const MODEL_SYSTEM_ARCHITECT =
-  process.env.MODEL_SYSTEM_ARCHITECT ?? "9RSA-system-architect-free";
-const MODEL_TECHNOLOGY_ARCHITECT =
-  process.env.MODEL_TECHNOLOGY_ARCHITECT ?? "9RTA-technology-architect-free";
-const MODEL_SOFTWARE_ENGINEER =
-  process.env.MODEL_SOFTWARE_ENGINEER ?? "9RSE-software-engineer-free";
-const MODEL_QA_ENGINEER =
-  process.env.MODEL_QA_ENGINEER ?? "9RQA-qa-free";
-
-const MAX_TOKENS_SYSTEM_ARCHITECT = parseMaxTokens(
-  process.env.MAX_TOKENS_SYSTEM_ARCHITECT,
-  1600
-);
-const MAX_TOKENS_TECHNOLOGY_ARCHITECT = parseMaxTokens(
-  process.env.MAX_TOKENS_TECHNOLOGY_ARCHITECT,
-  2500
-);
-const MAX_TOKENS_SOFTWARE_ENGINEER = parseMaxTokens(
-  process.env.MAX_TOKENS_SOFTWARE_ENGINEER,
-  8000
-);
-const MAX_TOKENS_QA_ENGINEER = parseMaxTokens(
-  process.env.MAX_TOKENS_QA_ENGINEER,
-  2000
-);
 const MAX_QA_FIX_ROUNDS = parseMaxQaFixRounds();
 const MAX_BOOTSTRAP_FIX_ROUNDS = parseMaxTokens(
   process.env.MAX_BOOTSTRAP_FIX_ROUNDS,
@@ -1168,12 +1201,33 @@ const LLM_LATENCY_FALLBACK_MS = parseMaxTokens(
 );
 const USE_WRITE_FILE_TOOL = process.env.ZTEAM_WRITE_FILE_TOOL !== "0";
 
+function activeTeamConfig(): ResolvedTeamConfig {
+  const fromCtx = getRunContext()?.teamConfig;
+  if (fromCtx) return fromCtx;
+  const env = envDefaultsTeamConfig();
+  return {
+    ...env,
+    sources: { workspaceConfig: null, appConfig: null },
+    exists: { workspace: false, app: false },
+  };
+}
+
+function roleLlm(role: TeamRole): { model: string; maxTokens: number } {
+  const cfg = activeTeamConfig();
+  return {
+    model: cfg.models[role],
+    maxTokens: cfg.maxTokens[role],
+  };
+}
+
 function makeLLM(
   model: string,
   maxTokens: number,
   opts?: { fallback?: boolean }
 ): ChatOpenAI {
+  const cfg = activeTeamConfig();
   const fallbackModel =
+    cfg.models.fallback ||
     process.env.MODEL_FALLBACK ||
     process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK ||
     "";
@@ -1351,13 +1405,15 @@ async function invokeWithRetry(
         if (
           !usedFallback &&
           (err.kind === "no_file_sections" || err.kind === "empty") &&
-          (process.env.MODEL_FALLBACK ||
+          (activeTeamConfig().models.fallback ||
+            process.env.MODEL_FALLBACK ||
             process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK)
         ) {
           usedFallback = true;
+          const se = roleLlm("softwareEngineer");
           activeLlm = makeLLM(
-            opts.modelName || MODEL_SOFTWARE_ENGINEER,
-            opts.maxTokens ?? MAX_TOKENS_SOFTWARE_ENGINEER,
+            opts.modelName || se.model,
+            opts.maxTokens ?? se.maxTokens,
             { fallback: true }
           );
           progress.emit(
@@ -1549,10 +1605,13 @@ const OrchestratorState = Annotation.Root({
 type OrchestratorStateType = typeof OrchestratorState.State;
 
 function appRootOf(state: OrchestratorStateType): string {
-  const appRoot = resolveAppRoot(state.projectRoot || ".");
+  const workspace = getWorkspaceRoot();
+  const appRoot = state.appRoot?.trim()
+    ? resolve(state.appRoot)
+    : resolveAppRoot(state.projectRoot || ".");
   assertSafeAppRoot(appRoot, state.projectRoot || ".");
-  assertExpectedWorkspace(getWorkspaceRoot());
-  assertPathInsideWorkspace(getWorkspaceRoot(), appRoot);
+  assertExpectedWorkspace(workspace);
+  assertPathInsideWorkspace(workspace, appRoot);
   return appRoot;
 }
 
@@ -1674,7 +1733,8 @@ async function orchestratorBootstrapReadmeNode(
     const appRoot = appRootOf(state);
     await mkdir(appRoot, { recursive: true });
 
-    const llm = makeLLM(MODEL_SYSTEM_ARCHITECT, MAX_TOKENS_SYSTEM_ARCHITECT);
+    const sa = roleLlm("systemArchitect");
+    const llm = makeLLM(sa.model, sa.maxTokens);
     const messages = [
       new SystemMessage(
         [
@@ -1835,7 +1895,8 @@ async function systemArchitectReqItemNode(
         state.resume ||
         "See README Resume — expand only the current pré-requirement.";
 
-      const llm = makeLLM(MODEL_SYSTEM_ARCHITECT, MAX_TOKENS_SYSTEM_ARCHITECT);
+      const sa = roleLlm("systemArchitect");
+      const llm = makeLLM(sa.model, sa.maxTokens);
       const messages = [
         new SystemMessage(
           [
@@ -2051,7 +2112,8 @@ async function technologyArchitectNode(
       readDoc(appRoot, REQUIREMENTS_PATH),
     ]);
 
-    const llm = makeLLM(MODEL_TECHNOLOGY_ARCHITECT, MAX_TOKENS_TECHNOLOGY_ARCHITECT);
+    const ta = roleLlm("technologyArchitect");
+    const llm = makeLLM(ta.model, ta.maxTokens);
     const messages = [
       new SystemMessage(
         [
@@ -2216,7 +2278,8 @@ async function systemArchitectSpecsNode(
       readDoc(appRoot, TECHNOLOGIES_PATH),
     ]);
 
-    const llm = makeLLM(MODEL_SYSTEM_ARCHITECT, MAX_TOKENS_SYSTEM_ARCHITECT);
+    const sa = roleLlm("systemArchitect");
+    const llm = makeLLM(sa.model, sa.maxTokens);
     const messages = [
       new SystemMessage(
         [
@@ -2535,7 +2598,8 @@ async function softwareEngineerNode(
     );
     const specBody = await readDoc(appRoot, specPath(slug));
 
-    const llm = makeLLM(MODEL_SOFTWARE_ENGINEER, MAX_TOKENS_SOFTWARE_ENGINEER);
+    const se = roleLlm("softwareEngineer");
+    const llm = makeLLM(se.model, se.maxTokens);
     let rawContent = "";
     try {
       const res = await invokeWithRetry(
@@ -2575,8 +2639,8 @@ async function softwareEngineerNode(
           attempts: SE_INVOKE_ATTEMPTS,
           fileOnlyReprompt: true,
           useWriteFileTool: true,
-          modelName: MODEL_SOFTWARE_ENGINEER,
-          maxTokens: MAX_TOKENS_SOFTWARE_ENGINEER,
+          modelName: se.model,
+          maxTokens: se.maxTokens,
           validate: (c) => assertHasFileSections(c, "softwareEngineer"),
         }
       );
@@ -2707,7 +2771,8 @@ async function softwareEngineerFixNode(
       slug ? readDoc(appRoot, specPath(slug)) : Promise.resolve("(no current spec)"),
     ]);
 
-    const llm = makeLLM(MODEL_SOFTWARE_ENGINEER, MAX_TOKENS_SOFTWARE_ENGINEER);
+    const se = roleLlm("softwareEngineer");
+    const llm = makeLLM(se.model, se.maxTokens);
     const res = await invokeWithRetry(
       llm,
       [
@@ -2741,8 +2806,8 @@ async function softwareEngineerFixNode(
         attempts: SE_INVOKE_ATTEMPTS,
         fileOnlyReprompt: true,
         useWriteFileTool: true,
-        modelName: MODEL_SOFTWARE_ENGINEER,
-        maxTokens: MAX_TOKENS_SOFTWARE_ENGINEER,
+        modelName: se.model,
+        maxTokens: se.maxTokens,
         validate: (c) => assertHasFileSections(c, "softwareEngineerFix"),
       }
     );
@@ -2826,7 +2891,8 @@ async function qaEngineerNode(
       slug ? readDoc(appRoot, specPath(slug)) : Promise.resolve(""),
     ]);
 
-    const llm = makeLLM(MODEL_QA_ENGINEER, MAX_TOKENS_QA_ENGINEER);
+    const qa = roleLlm("qaEngineer");
+    const llm = makeLLM(qa.model, qa.maxTokens);
     const res = await invokeWithRetry(
       llm,
       [
@@ -3492,21 +3558,22 @@ server.tool(
     `Workflows: ${workflowCatalogText()}.`,
     "Set workflow to full|docs|feature|punch|fix|resume to force a route; omit to auto-classify.",
     "docsOnly=true is an alias for workflow=docs (deprecated).",
-    "Set projectRoot to a relative folder (default '.') treated as the app root for all writes.",
+    "Pass workspaceRoot = absolute path of the Cursor-open folder (required by skill; preferred over WORKSPACE_ROOT env).",
+    "Set projectRoot to a relative folder under that workspace (default '.') treated as the app root for all writes.",
+    "Requires .zteam/config.json (workspace and/or app) unless skipConfigGate=true.",
     "FILE writes are sanitized (no .., strip projectRoot prefix, strip markdown fences).",
-    "SE retries up to 6 attempts; tsc smoke before markTodoDone; QA may use ===SUMMARY=== only.",
-    "GRAPH_RECURSION_LIMIT (default 120) passed to LangGraph invoke.",
     "On failure, check .docs/pipeline-result.json and resumeHint (prefer workflow=resume).",
     "Do not use Cursor Task subagents for this work.",
   ].join(" "),
   {
     userIdea: z.string().describe("The high-level idea or feature request"),
+    workspaceRoot: workspaceRootArg,
     projectRoot: z
       .string()
       .optional()
       .default(".")
       .describe(
-        "Relative project folder under WORKSPACE_ROOT/cwd treated as app root (default '.')"
+        "Relative project folder under workspaceRoot treated as app root (default '.')"
       ),
     workflow: z
       .enum(["full", "docs", "feature", "punch", "fix", "resume"])
@@ -3521,11 +3588,20 @@ server.tool(
       .describe(
         "Deprecated alias for workflow=docs (planning only, skip SE/QA)"
       ),
+    skipConfigGate: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Skip .zteam/config.json gate (smoke/dev only)"),
   },
-  async ({ userIdea, projectRoot, workflow, docsOnly }, extra) => {
+  async (
+    { userIdea, workspaceRoot, projectRoot, workflow, docsOnly, skipConfigGate },
+    extra
+  ) => {
     const root = projectRoot || ".";
     const started = Date.now();
-    const appRoot = resolveAppRoot(root);
+    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const appRoot = resolveAppRoot(root, ws.root);
     const recursionLimit = resolveGraphRecursionLimit();
     const metrics = createMetrics();
     const explicit = resolveExplicitWorkflow({
@@ -3543,136 +3619,302 @@ server.tool(
     });
     session.traceId = metrics.traceId;
 
-    return withProgressSession(session, async () => {
-      session.emit(
-        "pipeline",
-        "stage",
-        `MCP start (workflow=${mode}) projectRoot=${root} appRoot=${appRoot} recursionLimit=${recursionLimit} trace=${metrics.traceId}`
-      );
-      try {
-        assertSafeAppRoot(appRoot, root);
-        assertExpectedWorkspace(getWorkspaceRoot());
-        assertPathInsideWorkspace(getWorkspaceRoot(), appRoot);
+    // Materialize .zteam/ (README + skills/SKILL.md) before any LLM / config gate
+    await ensureZteamBootstrapRoots(ws.root, appRoot);
 
-        if (shouldHealthcheckForWorkflow(explicit || "full")) {
-          const health = await healthcheckNineRouter();
+    const teamConfig = await loadTeamConfig(ws.root, appRoot);
+    const workspaceDiag = diagnoseWorkspace(ws.root, ws.source);
+
+    if (!skipConfigGate && !hasAnyTeamConfig(teamConfig)) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              needsConfigPayload({
+                workspaceRoot: ws.root,
+                appRoot,
+                workspace: workspaceDiag,
+              }),
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    return withRunContext(
+      {
+        workspaceRoot: ws.root,
+        workspaceSource: ws.source,
+        teamConfig,
+      },
+      () =>
+        withProgressSession(session, async () => {
           session.emit(
             "pipeline",
-            health.ok ? "notify" : "error",
-            health.message
+            "stage",
+            `MCP start (workflow=${mode}) workspace=${ws.root} (${ws.source}) projectRoot=${root} appRoot=${appRoot} recursionLimit=${recursionLimit} trace=${metrics.traceId}`
           );
-          if (!health.ok) {
-            const err = new Error(health.message);
-            (err as Error & { failureKind?: string }).failureKind =
-              "healthcheck";
-            throw err;
-          }
-        }
+          try {
+            assertSafeAppRoot(appRoot, root);
+            assertExpectedWorkspace(ws.root);
+            assertPathInsideWorkspace(ws.root, appRoot);
 
-        const result = await compiledGraph.invoke(
-          {
-            userIdea,
-            projectRoot: root,
-            workflow: explicit || "",
-            docsOnly: Boolean(docsOnly) || explicit === "docs",
-            workflowReason: "",
-            notifications: [],
-            resume: "",
-            pendingPreReqs: [],
-            completedPreReqs: [],
-            currentPreReq: "",
-            preReqTotal: 0,
-            pendingSpecs: [],
-            completedSpecs: [],
-            pendingQaSpecs: [],
-            qaFixRound: 0,
-            bootstrapFixRound: 0,
-            qaFailureClass: "",
-            traceId: metrics.traceId,
-            appRoot,
-            filesWritten: [],
-            fidelityWarnings: [],
-            failureKind: "",
-            resumeHint: "",
-          },
-          { recursionLimit }
-        );
-        session.emit(
-          "pipeline",
-          "stage",
-          `MCP done in ${Date.now() - started}ms (workflow=${result.workflow || mode})`
-        );
-        const live = session.lines;
-        const merged = {
-          ...result,
-          appRoot: result.appRoot || appRoot,
-          filesWritten: result.filesWritten ?? [],
-          recursionLimit,
-          ...metricsSnapshot(),
-          notifications:
-            live.length > 0
-              ? live
-              : Array.isArray(result.notifications)
-                ? result.notifications
-                : [],
-        };
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(merged, null, 2),
-            },
-          ],
-        };
-      } catch (err) {
-        const hint =
-          (err as { resumeHint?: string }).resumeHint ||
-          `workflow=resume projectRoot=${root}`;
-        const failureKind =
-          (err as { failureKind?: string }).failureKind || "pipeline_error";
-        setErrorClass(failureKind);
-        session.emit(
-          "pipeline",
-          "error",
-          `MCP failed after ${Date.now() - started}ms (${mode}): ${errorText(err)}`
-        );
-        await writePipelineResult(appRoot, {
-          ok: false,
-          workflow: mode,
-          appRoot,
-          projectRoot: root,
-          failureKind,
-          resumeHint: hint,
-          error: errorText(err),
-          ms: Date.now() - started,
-        });
-        // Structured error — keep MCP usable (do not disconnect)
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
+            if (shouldHealthcheckForWorkflow(explicit || "full")) {
+              const health = await healthcheckNineRouter();
+              session.emit(
+                "pipeline",
+                health.ok ? "notify" : "error",
+                health.message
+              );
+              if (!health.ok) {
+                const err = new Error(health.message);
+                (err as Error & { failureKind?: string }).failureKind =
+                  "healthcheck";
+                throw err;
+              }
+            }
+
+            const result = await compiledGraph.invoke(
+              {
+                userIdea,
+                projectRoot: root,
+                workflow: explicit || "",
+                docsOnly: Boolean(docsOnly) || explicit === "docs",
+                workflowReason: "",
+                notifications: [],
+                resume: "",
+                pendingPreReqs: [],
+                completedPreReqs: [],
+                currentPreReq: "",
+                preReqTotal: 0,
+                pendingSpecs: [],
+                completedSpecs: [],
+                pendingQaSpecs: [],
+                qaFixRound: 0,
+                bootstrapFixRound: 0,
+                qaFailureClass: "",
+                traceId: metrics.traceId,
+                appRoot,
+                filesWritten: [],
+                fidelityWarnings: [],
+                failureKind: "",
+                resumeHint: "",
+              },
+              { recursionLimit }
+            );
+            session.emit(
+              "pipeline",
+              "stage",
+              `MCP done in ${Date.now() - started}ms (workflow=${result.workflow || mode})`
+            );
+            const live = session.lines;
+            const merged = {
+              ...result,
+              appRoot: result.appRoot || appRoot,
+              workspaceRoot: ws.root,
+              workspaceSource: ws.source,
+              teamModels: teamConfig.models,
+              filesWritten: result.filesWritten ?? [],
+              recursionLimit,
+              ...metricsSnapshot(),
+              notifications:
+                live.length > 0
+                  ? live
+                  : Array.isArray(result.notifications)
+                    ? result.notifications
+                    : [],
+            };
+            return {
+              content: [
                 {
-                  ok: false,
-                  failureKind,
-                  error: errorText(err),
-                  appRoot,
-                  resumeHint: hint,
-                  ...metricsSnapshot(),
-                  notifications: session.lines,
+                  type: "text" as const,
+                  text: JSON.stringify(merged, null, 2),
                 },
-                null,
-                2
-              ),
-            },
-          ],
-          isError: true,
-        };
-      } finally {
-        session.close();
-        clearMetrics();
+              ],
+            };
+          } catch (err) {
+            const hint =
+              (err as { resumeHint?: string }).resumeHint ||
+              `workflow=resume projectRoot=${root}`;
+            const failureKind =
+              (err as { failureKind?: string }).failureKind || "pipeline_error";
+            setErrorClass(failureKind);
+            session.emit(
+              "pipeline",
+              "error",
+              `MCP failed after ${Date.now() - started}ms (${mode}): ${errorText(err)}`
+            );
+            await writePipelineResult(appRoot, {
+              ok: false,
+              workflow: mode,
+              appRoot,
+              projectRoot: root,
+              failureKind,
+              resumeHint: hint,
+              error: errorText(err),
+              ms: Date.now() - started,
+            });
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    {
+                      ok: false,
+                      failureKind,
+                      error: errorText(err),
+                      appRoot,
+                      workspaceRoot: ws.root,
+                      resumeHint: hint,
+                      ...metricsSnapshot(),
+                      notifications: session.lines,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          } finally {
+            session.close();
+            clearMetrics();
+          }
+        })
+    );
+  }
+);
+
+server.tool(
+  "get_zteam_config",
+  "Read merged .zteam/config.json (workspace + app) and workspace diagnosis.",
+  {
+    workspaceRoot: workspaceRootArg,
+    projectRoot: z.string().optional().default("."),
+  },
+  async ({ workspaceRoot, projectRoot }) => {
+    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
+    const bootstrap = await ensureZteamBootstrapRoots(ws.root, appRoot);
+    const teamConfig = await loadTeamConfig(ws.root, appRoot);
+    const payload = {
+      ok: true,
+      exists: teamConfig.exists,
+      sources: teamConfig.sources,
+      models: teamConfig.models,
+      maxTokens: teamConfig.maxTokens,
+      needsConfig: !hasAnyTeamConfig(teamConfig),
+      questions: hasAnyTeamConfig(teamConfig) ? [] : [...SETUP_QUESTIONS],
+      workspace: diagnoseWorkspace(ws.root, ws.source),
+      appRoot,
+      bootstrap: {
+        workspaceSkill: bootstrap.workspace.skill,
+        appSkill: bootstrap.app?.skill ?? null,
+      },
+    };
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(payload, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "write_zteam_config",
+  "Write .zteam/config.json to workspace, app, or both; optionally update .gitignore.",
+  {
+    workspaceRoot: workspaceRootArg,
+    projectRoot: z.string().optional().default("."),
+    scope: z.enum(["workspace", "app", "both"]),
+    models: z.object({
+      systemArchitect: z.string().min(1),
+      technologyArchitect: z.string().min(1),
+      softwareEngineer: z.string().min(1),
+      qaEngineer: z.string().min(1),
+      fallback: z.string().optional().default(""),
+    }),
+    maxTokens: z
+      .object({
+        systemArchitect: z.number().int().positive().optional(),
+        technologyArchitect: z.number().int().positive().optional(),
+        softwareEngineer: z.number().int().positive().optional(),
+        qaEngineer: z.number().int().positive().optional(),
+      })
+      .optional(),
+    gitignoreIgnore: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("If true and no .gitignore, create one with .zteam/; if .gitignore exists, append .zteam/"),
+  },
+  async ({
+    workspaceRoot,
+    projectRoot,
+    scope,
+    models,
+    maxTokens,
+    gitignoreIgnore,
+  }) => {
+    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
+    const written: string[] = [];
+    const gitignore: Record<string, unknown>[] = [];
+
+    const targets: string[] = [];
+    if (scope === "workspace" || scope === "both") targets.push(ws.root);
+    if (scope === "app" || scope === "both") {
+      if (resolve(appRoot) !== resolve(ws.root) || scope === "app") {
+        targets.push(appRoot);
       }
-    });
+    }
+    // Deduplicate
+    const unique = [...new Set(targets.map((t) => resolve(t)))];
+
+    for (const dir of unique) {
+      const { path } = await writeTeamConfig(dir, { models, maxTokens });
+      written.push(path);
+      if (gitignoreIgnore) {
+        const gi = await ensureGitignoreIgnoresZteam(dir, {
+          createIfMissing: true,
+        });
+        gitignore.push(gi);
+      } else {
+        gitignore.push(
+          await ensureGitignoreIgnoresZteam(dir, { createIfMissing: false })
+        );
+      }
+    }
+
+    const teamConfig = await loadTeamConfig(ws.root, appRoot);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              ok: true,
+              written,
+              gitignore,
+              models: teamConfig.models,
+              maxTokens: teamConfig.maxTokens,
+              exists: teamConfig.exists,
+              workspace: diagnoseWorkspace(ws.root, ws.source),
+              appRoot,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
   }
 );
 
@@ -3680,14 +3922,16 @@ server.tool(
   "get_pipeline_state",
   "Read .docs/pipeline-state.json for a projectRoot (debug / resume).",
   {
+    workspaceRoot: workspaceRootArg,
     projectRoot: z
       .string()
       .optional()
       .default(".")
-      .describe("Relative project folder under WORKSPACE_ROOT"),
+      .describe("Relative project folder under workspaceRoot"),
   },
-  async ({ projectRoot }) => {
-    const appRoot = resolveAppRoot(projectRoot || ".");
+  async ({ workspaceRoot, projectRoot }) => {
+    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
     assertSafeAppRoot(appRoot, projectRoot || ".");
     const state = await readPipelineState(appRoot);
     return {
@@ -3695,7 +3939,12 @@ server.tool(
         {
           type: "text" as const,
           text: JSON.stringify(
-            state || { ok: false, message: "no pipeline-state.json" },
+            state || {
+              ok: false,
+              message: "no pipeline-state.json",
+              workspace: diagnoseWorkspace(ws.root, ws.source),
+              appRoot,
+            },
             null,
             2
           ),
@@ -3709,18 +3958,28 @@ server.tool(
   "approve_gate",
   "Human-in-the-loop: resume, abort, or redirect a paused pipeline (ZTEAM_HITL=1).",
   {
+    workspaceRoot: workspaceRootArg,
     projectRoot: z.string().optional().default("."),
     decision: z.enum(["resume", "abort", "redirect"]),
     redirectHint: z.string().optional(),
   },
-  async ({ projectRoot, decision, redirectHint }) => {
-    const appRoot = resolveAppRoot(projectRoot || ".");
+  async ({ workspaceRoot, projectRoot, decision, redirectHint }) => {
+    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
     const result = await applyHitlDecision(appRoot, decision, redirectHint);
     return {
       content: [
         {
           type: "text" as const,
-          text: JSON.stringify({ appRoot, ...result }, null, 2),
+          text: JSON.stringify(
+            {
+              appRoot,
+              workspace: diagnoseWorkspace(ws.root, ws.source),
+              ...result,
+            },
+            null,
+            2
+          ),
         },
       ],
     };
