@@ -115,3 +115,78 @@ export async function healthcheckNineRouter(
 export function shouldHealthcheckForWorkflow(workflow: string): boolean {
   return ["full", "docs", "feature", ""].includes(workflow);
 }
+
+/** Fetch model ids from OpenAI-compat GET /models (for early invalid_model). */
+export async function listNineRouterModelIds(
+  baseUrl?: string,
+  opts?: { timeoutMs?: number }
+): Promise<{ ok: boolean; ids: Set<string>; message: string }> {
+  const base = (baseUrl || process.env.NINEROUTER_BASE || "").replace(/\/$/, "");
+  if (!base) {
+    return {
+      ok: false,
+      ids: new Set(),
+      message: `NINEROUTER_BASE not set — ${TUNNEL_HINT}`,
+    };
+  }
+  const timeoutMs = opts?.timeoutMs ?? 8_000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${base}/models`, {
+      method: "GET",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${process.env.NINEROUTER_KEY || "none"}`,
+      },
+    });
+    if (!res.ok) {
+      return {
+        ok: false,
+        ids: new Set(),
+        message: `GET /models HTTP ${res.status}`,
+      };
+    }
+    const json = (await res.json()) as {
+      data?: Array<{ id?: string }>;
+    };
+    const ids = new Set(
+      (json.data ?? [])
+        .map((m) => (m.id || "").trim())
+        .filter(Boolean)
+    );
+    return { ok: true, ids, message: `${ids.size} models` };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, ids: new Set(), message: msg };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Primary (+ non-empty fallbacks) must exist in 9router /models. */
+export function missingNineRouterModels(
+  cfg: {
+    models: Record<string, string>;
+  },
+  available: Set<string>
+): string[] {
+  const keys = [
+    "systemArchitect",
+    "technologyArchitect",
+    "softwareEngineer",
+    "qaEngineer",
+    "systemArchitectFallback",
+    "technologyArchitectFallback",
+    "softwareEngineerFallback",
+    "qaEngineerFallback",
+    "fallback",
+  ];
+  const missing: string[] = [];
+  for (const key of keys) {
+    const id = (cfg.models[key] || "").trim();
+    if (!id) continue;
+    if (!available.has(id)) missing.push(`${key}=${id}`);
+  }
+  return missing;
+}

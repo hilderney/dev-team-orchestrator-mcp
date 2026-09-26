@@ -79,7 +79,8 @@ MCP tools: `get_zteam_config`, `write_zteam_config`, `run_development_pipeline`,
 | `NINEROUTER_BASE` / `NINEROUTER_KEY` | 9router OpenAI-compat endpoint |
 | `ZTEAM_FORCE_BOOTSTRAP=1` | Force wipe of `.docs/requirements.md` on full/docs bootstrap (default: preserve if file has real `##` sections) |
 | `ZTEAM_SE_BATCH` | SE batch size 1–3 (default **1**; workflow `punch` defaults to 3) |
-| `MODEL_FALLBACK` / config `models.fallback` | Local fallback model after empty / no_file_sections |
+| `MODEL_FALLBACK` / `*Fallback` per role | Local handoff after primary exhausts retries |
+| `MODEL_SYSTEM_ARCHITECT_FALLBACK` etc. | Env override for per-role fallback |
 | `MAX_DELIVERY_FIX_ROUNDS` | SE verify redo rounds (default 3) |
 
 **After changing orchestrator source:** restart the MCP server `user-zteam` (no hot-reload). Confirm discovery lists config tools.

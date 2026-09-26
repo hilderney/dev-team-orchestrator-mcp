@@ -11,3 +11,4 @@ Session write-ups and improvement plans that drove harness work. **Not** an acti
 | [3-zteam-improvements.md](./3-zteam-improvements.md) | P0–P2 harness plan — **implemented** |
 | [5-zteam-improvement-plan.md](./5-zteam-improvement-plan.md) | Verify / DoD / critics plan — **implemented** |
 | [6-zz-review-hygiene.md](./6-zz-review-hygiene.md) | MyPokeCards zz-review hygiene (bootstrap/stdio/batch/…) — **implemented** |
+| [7-tiny-counter-dry-run.md](./7-tiny-counter-dry-run.md) | Dry-run raciocínio: app mínimo 2 tasks (`samples/tiny-counter`) |

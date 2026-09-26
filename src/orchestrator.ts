@@ -64,6 +64,8 @@ import {
 } from "./verify-delivery.js";
 import {
   healthcheckNineRouter,
+  listNineRouterModelIds,
+  missingNineRouterModels,
   shouldHealthcheckForWorkflow,
 } from "./healthcheck.js";
 import {
@@ -100,7 +102,12 @@ import {
   needsConfigPayload,
   MODEL_QUESTIONS,
   SETUP_QUESTIONS,
+  ROLE_DUTIES,
+  ROLE_MODEL_SUGGESTIONS,
+  resolveRoleFallbackModel,
   writeTeamConfig,
+  resolveTeamRuntime,
+  buildCursorDelegationPlaybook,
   type ResolvedTeamConfig,
   type TeamRole,
 } from "./zteam-config.js";
@@ -1254,22 +1261,10 @@ function roleLlm(role: TeamRole): { model: string; maxTokens: number } {
   };
 }
 
-function makeLLM(
-  model: string,
-  maxTokens: number,
-  opts?: { fallback?: boolean }
-): ChatOpenAI {
-  const cfg = activeTeamConfig();
-  const fallbackModel =
-    cfg.models.fallback ||
-    process.env.MODEL_FALLBACK ||
-    process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK ||
-    "";
-  const useModel =
-    opts?.fallback && fallbackModel ? fallbackModel : model;
+function makeLLM(model: string, maxTokens: number): ChatOpenAI {
   const traceId = getMetrics().traceId;
   return new ChatOpenAI({
-    model: useModel,
+    model,
     configuration: {
       baseURL: NINEROUTER_BASE,
       apiKey: NINEROUTER_KEY,
@@ -1350,8 +1345,7 @@ async function invokeWithRetry(
   let lastContent = "";
   const baseMessages = messages;
   const progress = getProgress();
-  let activeLlm = llm;
-  let usedFallback = false;
+  const activeLlm = llm;
 
   for (let i = 1; i <= attempts; i++) {
     const attemptMessages =
@@ -1436,29 +1430,6 @@ async function invokeWithRetry(
       lastError = err;
       if (err instanceof LlmContentError) {
         recordRetry(err.kind);
-        if (
-          !usedFallback &&
-          (err.kind === "no_file_sections" || err.kind === "empty") &&
-          (activeTeamConfig().models.fallback ||
-            process.env.MODEL_FALLBACK ||
-            process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK)
-        ) {
-          usedFallback = true;
-          const se = roleLlm("softwareEngineer");
-          activeLlm = makeLLM(
-            opts.modelName || se.model,
-            opts.maxTokens ?? se.maxTokens,
-            { fallback: true }
-          );
-          progress.emit(
-            opts.stage,
-            "retry",
-            "Trying model 2/N (local fallback after empty/no_file_sections)"
-          );
-          recordRetry("model_fallback");
-          // Immediate retry with fallback — do not burn a delay round
-          continue;
-        }
       }
       const retryable = isRetryableError(err);
       if (i >= attempts || !retryable) {
@@ -1491,6 +1462,115 @@ async function invokeWithRetry(
     lastContent,
     lastError
   );
+}
+
+/**
+ * Run primary role model to exhaustion, then hand off to per-role fallback agent.
+ */
+async function invokeRoleLlm(
+  role: TeamRole,
+  messages: BaseMessage[],
+  opts: {
+    stage: string;
+    attempts?: number;
+    validate?: (content: string) => void;
+    fileOnlyReprompt?: boolean;
+    useWriteFileTool?: boolean;
+  }
+): Promise<{ content: unknown; modelUsed: string; handedOff: boolean }> {
+  const primary = roleLlm(role);
+  const progress = getProgress();
+  const llm = makeLLM(primary.model, primary.maxTokens);
+  try {
+    const res = await invokeWithRetry(llm, messages, {
+      ...opts,
+      modelName: primary.model,
+      maxTokens: primary.maxTokens,
+    });
+    return { content: res.content, modelUsed: primary.model, handedOff: false };
+  } catch (err) {
+    const handoffWorthy =
+      err instanceof LlmRetriesExhaustedError ||
+      err instanceof LlmContentError ||
+      isRetryableNetworkError(err);
+    const fb = resolveRoleFallbackModel(activeTeamConfig(), role);
+    if (!handoffWorthy || !fb || fb === primary.model) {
+      throw err;
+    }
+    progress.emit(
+      opts.stage,
+      "notify",
+      `handoff ${role}: primary ${primary.model} → fallback agent ${fb}`
+    );
+    recordRetry("model_handoff");
+    const llm2 = makeLLM(fb, primary.maxTokens);
+    const res = await invokeWithRetry(llm2, messages, {
+      ...opts,
+      modelName: fb,
+      maxTokens: primary.maxTokens,
+    });
+    return { content: res.content, modelUsed: fb, handedOff: true };
+  }
+}
+
+/**
+ * Gate consult: asker role poses a question to advisor role (responsibilities-scoped).
+ * Failures are swallowed — returns empty string.
+ */
+async function consultTeammate(opts: {
+  asker: TeamRole;
+  advisor: TeamRole;
+  question: string;
+  context: string;
+  stage?: string;
+}): Promise<string> {
+  if (opts.asker === opts.advisor) return "";
+  const stage =
+    opts.stage || `consult:${opts.asker}->${opts.advisor}`;
+  try {
+    const advisor = roleLlm(opts.advisor);
+    const maxTok = Math.min(advisor.maxTokens, 1200);
+    const llm = makeLLM(advisor.model, maxTok);
+    const res = await invokeWithRetry(
+      llm,
+      [
+        new SystemMessage(
+          [
+            `You are the team's ${opts.advisor}.`,
+            `Duties: ${ROLE_DUTIES[opts.advisor]}.`,
+            `Answer briefly for the ${opts.asker}.`,
+            "Stay in your lane. Max ~200 words. No ===FILE=== unless asked.",
+          ].join(" ")
+        ),
+        new HumanMessage(
+          [
+            `## Question from ${opts.asker}`,
+            opts.question,
+            "",
+            "## Context",
+            opts.context.slice(0, 8000),
+          ].join("\n")
+        ),
+      ],
+      { stage, attempts: 2 }
+    );
+    const text = String(res.content ?? "").trim();
+    if (text) {
+      getProgress().emit(
+        stage,
+        "notify",
+        `consult ok (${opts.asker}←${opts.advisor}, ${text.length} chars)`
+      );
+    }
+    return text;
+  } catch (err) {
+    getProgress().emit(
+      stage,
+      "warning",
+      `consult failed: ${errorText(err)}`
+    );
+    return "";
+  }
 }
 
 async function timedStage<T>(
@@ -1824,7 +1904,6 @@ async function orchestratorBootstrapReadmeNode(
     await mkdir(appRoot, { recursive: true });
 
     const sa = roleLlm("systemArchitect");
-    const llm = makeLLM(sa.model, sa.maxTokens);
     const messages = [
       new SystemMessage(
         [
@@ -1853,7 +1932,7 @@ async function orchestratorBootstrapReadmeNode(
     let resume: string;
     let preRequirements: string[];
     try {
-      const res = await invokeWithRetry(llm, messages, {
+      const res = await invokeRoleLlm("systemArchitect", messages, {
         stage: "orchestratorBootstrapReadme",
         validate: (c) =>
           assertParsedResumeAndPreRequirements(c, "orchestratorBootstrapReadme"),
@@ -1992,7 +2071,6 @@ async function systemArchitectReqItemNode(
         "See README Resume — expand only the current pré-requirement.";
 
       const sa = roleLlm("systemArchitect");
-      const llm = makeLLM(sa.model, sa.maxTokens);
       const messages = [
         new SystemMessage(
           [
@@ -2027,7 +2105,7 @@ async function systemArchitectReqItemNode(
 
       let section: string;
       try {
-        const res = await invokeWithRetry(llm, messages, {
+        const res = await invokeRoleLlm("systemArchitect", messages, {
           stage: "systemArchitectReqItem",
           validate: (c) => {
             assertUsableLlmText(c, "systemArchitectReqItem");
@@ -2209,7 +2287,7 @@ async function technologyArchitectNode(
     ]);
 
     const ta = roleLlm("technologyArchitect");
-    const llm = makeLLM(ta.model, ta.maxTokens);
+    void ta;
     const messages = [
       new SystemMessage(
         [
@@ -2239,13 +2317,25 @@ async function technologyArchitectNode(
           "",
           "## .docs/requirements.md",
           requirementsFromDisk,
-        ].join("\n")
+          (state.architectureGaps ?? []).length > 0
+            ? [
+                "",
+                "## Architecture critic gaps (must address on this redo)",
+                ...(state.architectureGaps ?? []).map((g) => `- ${g}`),
+                state.currentPreReq
+                  ? `\n## SA consult / guidance\n${state.currentPreReq}`
+                  : "",
+              ].join("\n")
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n")
       ),
     ];
 
     let raw: string;
     try {
-      const res = await invokeWithRetry(llm, messages, {
+      const res = await invokeRoleLlm("technologyArchitect", messages, {
         stage: "technologyArchitect",
         validate: (c) =>
           assertParsedTechSummaryAndBody(c, "technologyArchitect"),
@@ -2334,7 +2424,7 @@ async function systemArchitectSpecsNode(
     ]);
 
     const sa = roleLlm("systemArchitect");
-    const llm = makeLLM(sa.model, sa.maxTokens);
+    void sa;
     const messages = [
       new SystemMessage(
         [
@@ -2370,7 +2460,7 @@ async function systemArchitectSpecsNode(
     let specs: { slug: string; content: string }[];
 
     try {
-      const res = await invokeWithRetry(llm, messages, {
+      const res = await invokeRoleLlm("systemArchitect", messages, {
         stage: "systemArchitectSpecs",
         validate: (c) => assertParsedTodoAndSpecs(c, "systemArchitectSpecs"),
       });
@@ -2708,13 +2798,11 @@ async function softwareEngineerNode(
     );
     const specBody = await readDoc(appRoot, specPath(slug));
 
-    const se = roleLlm("softwareEngineer");
-    const llm = makeLLM(se.model, se.maxTokens);
     const verifyFeedback = (state.deliveryVerifyFeedback || "").trim();
     let rawContent = "";
     try {
-      const res = await invokeWithRetry(
-        llm,
+      const res = await invokeRoleLlm(
+        "softwareEngineer",
         [
           new SystemMessage(
             [
@@ -2758,8 +2846,6 @@ async function softwareEngineerNode(
           attempts: SE_INVOKE_ATTEMPTS,
           fileOnlyReprompt: true,
           useWriteFileTool: true,
-          modelName: se.model,
-          maxTokens: se.maxTokens,
           validate: (c) => assertHasFileSections(c, "softwareEngineer"),
         }
       );
@@ -2829,6 +2915,21 @@ async function softwareEngineerNode(
       const feedback = formatVerifyFeedback(verified);
       const round = (state.deliveryFixRound ?? 0) + 1;
       const failKind = verified.failureKind || "spec_incomplete";
+
+      const saAdvice = await consultTeammate({
+        asker: "softwareEngineer",
+        advisor: "systemArchitect",
+        question: `VERIFY FAIL for specs [${batch.join(", ")}]. Clarify Files to touch and what files the SE must emit next. Reasons: ${verified.reasons.slice(0, 5).join("; ")}`,
+        context: [
+          feedback,
+          "",
+          ...batch.map((s) => `### ${s}\n${specBodiesMap[s] || ""}`),
+        ].join("\n"),
+      });
+      const feedbackWithConsult = saAdvice
+        ? `${feedback}\n\n## Consult System Architect\n${saAdvice}`
+        : feedback;
+
       await implNotify(
         (s, m) => notify(s, m),
         appRoot,
@@ -2846,7 +2947,7 @@ async function softwareEngineerNode(
 
       if (round >= MAX_DELIVERY_FIX_ROUNDS) {
         throw classifiedError(
-          `[softwareEngineer] delivery verify exhausted (${failKind}): ${feedback}`,
+          `[softwareEngineer] delivery verify exhausted (${failKind}): ${feedbackWithConsult}`,
           failKind,
           `workflow=resume projectRoot=${projectRoot} reopen=${verified.reopenSlugs.join(",")}`
         );
@@ -2861,7 +2962,7 @@ async function softwareEngineerNode(
         pendingSpecs: workPending,
         completedSpecs: [],
         deliveryFixRound: round,
-        deliveryVerifyFeedback: feedback,
+        deliveryVerifyFeedback: feedbackWithConsult,
         failureKind: failKind,
         resumeHint: `delivery redo ${round}/${MAX_DELIVERY_FIX_ROUNDS}`,
       };
@@ -2943,9 +3044,9 @@ async function softwareEngineerFixNode(
     ]);
 
     const se = roleLlm("softwareEngineer");
-    const llm = makeLLM(se.model, se.maxTokens);
-    const res = await invokeWithRetry(
-      llm,
+    void se;
+    const res = await invokeRoleLlm(
+      "softwareEngineer",
       [
         new SystemMessage(
           [
@@ -2977,8 +3078,6 @@ async function softwareEngineerFixNode(
         attempts: SE_INVOKE_ATTEMPTS,
         fileOnlyReprompt: true,
         useWriteFileTool: true,
-        modelName: se.model,
-        maxTokens: se.maxTokens,
         validate: (c) => assertHasFileSections(c, "softwareEngineerFix"),
       }
     );
@@ -3062,10 +3161,8 @@ async function qaEngineerNode(
       slug ? readDoc(appRoot, specPath(slug)) : Promise.resolve(""),
     ]);
 
-    const qa = roleLlm("qaEngineer");
-    const llm = makeLLM(qa.model, qa.maxTokens);
-    const res = await invokeWithRetry(
-      llm,
+    const res = await invokeRoleLlm(
+      "qaEngineer",
       [
         new SystemMessage(
           [
@@ -3486,11 +3583,28 @@ async function deliveryCriticArchitectureNode(
       );
     }
 
+    // Gate consult: TA asks SA what requirements/specs imply for the gaps
+    const saAdvice = await consultTeammate({
+      asker: "technologyArchitect",
+      advisor: "systemArchitect",
+      question: `Architecture coverage gaps vs userIdea. What must technologies.md / specs cover next?\nGaps: ${gaps.join("\n")}`,
+      context: [
+        `## userIdea\n${state.userIdea || ""}`,
+        `## technologies.md\n${techText.slice(0, 4000)}`,
+        `## spec slugs\n${slugs.join(", ")}`,
+      ].join("\n\n"),
+    });
+
     return {
       appRoot,
       architectureGaps: gaps,
       failureKind: "fidelity",
-      resumeHint: `architecture gaps: ${gaps.slice(0, 3).join("; ")}`,
+      resumeHint: saAdvice
+        ? `architecture gaps: ${gaps.slice(0, 3).join("; ")} | SA: ${saAdvice.slice(0, 200)}`
+        : `architecture gaps: ${gaps.slice(0, 3).join("; ")}`,
+      currentPreReq: saAdvice
+        ? `Address architecture gaps with SA guidance: ${saAdvice.slice(0, 400)}`
+        : undefined,
     };
   });
 }
@@ -3973,9 +4087,10 @@ server.tool(
     "Pass workspaceRoot = absolute path of the Cursor-open folder (required by skill; preferred over WORKSPACE_ROOT env).",
     "Set projectRoot to a relative folder under that workspace (default '.') treated as the app root for all writes.",
     "Requires .zteam/config.json (workspace and/or app) unless skipConfigGate=true.",
+    "Config models are absolute truth: cursor aliases (inherit/auto/cursor/cursor-auto) → returns delegationPlaybook for Cursor Task (no 9router LLM); any other id → ChatOpenAI literal via 9router (validated against GET /models).",
+    "Mixed cursor+9router primaries → failureKind=mixed_runtime.",
     "FILE writes are sanitized (no .., strip projectRoot prefix, strip markdown fences).",
     "On failure, check .docs/pipeline-result.json and resumeHint (prefer workflow=resume).",
-    "Do not use Cursor Task subagents for this work.",
   ].join(" "),
   {
     userIdea: z.string().describe("The high-level idea or feature request"),
@@ -4057,6 +4172,77 @@ server.tool(
       };
     }
 
+    const runtimeRes = resolveTeamRuntime(teamConfig);
+    if (!runtimeRes.ok) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                ok: false,
+                failureKind: runtimeRes.failureKind,
+                error: runtimeRes.message,
+                roles: runtimeRes.roles,
+                models: teamConfig.models,
+                appRoot,
+                workspaceRoot: ws.root,
+                resumeHint:
+                  "Use the same runtime for all primaries: all inherit/auto/cursor OR all 9router ids. Fix .zteam/config.json then re-run.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (runtimeRes.runtime === "cursor") {
+      const playbook = buildCursorDelegationPlaybook({
+        workflow: explicit || "full",
+        userIdea,
+        workspaceRoot: ws.root,
+        projectRoot: root,
+        appRoot,
+        models: teamConfig.models,
+        maxTokens: teamConfig.maxTokens,
+      });
+      session.emit(
+        "pipeline",
+        "notify",
+        `llmRuntime=cursor — returning delegationPlaybook (${playbook.stages.length} stages); skill must run Cursor Task`
+      );
+      session.close();
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                ok: true,
+                llmRuntime: "cursor",
+                delegated: true,
+                workflow: explicit || mode,
+                appRoot,
+                workspaceRoot: ws.root,
+                projectRoot: root,
+                models: teamConfig.models,
+                maxTokens: teamConfig.maxTokens,
+                delegationPlaybook: playbook,
+                resumeHint: playbook.resumeHint,
+                notifications: session.lines,
+                ms: Date.now() - started,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
     return withRunContext(
       {
         workspaceRoot: ws.root,
@@ -4088,6 +4274,35 @@ server.tool(
                   "healthcheck";
                 throw err;
               }
+            }
+
+            {
+              const listed = await listNineRouterModelIds();
+              if (!listed.ok) {
+                const err = new Error(
+                  `Could not list 9router models: ${listed.message}`
+                );
+                (err as Error & { failureKind?: string }).failureKind =
+                  "invalid_model";
+                throw err;
+              }
+              const missing = missingNineRouterModels(
+                teamConfig,
+                listed.ids
+              );
+              if (missing.length > 0) {
+                const err = new Error(
+                  `Models not found on 9router: ${missing.join("; ")}`
+                );
+                (err as Error & { failureKind?: string }).failureKind =
+                  "invalid_model";
+                throw err;
+              }
+              session.emit(
+                "pipeline",
+                "notify",
+                `models validated against 9router (${listed.message})`
+              );
             }
 
             const result = await compiledGraph.invoke(
@@ -4217,15 +4432,26 @@ server.tool(
     const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
     const bootstrap = await ensureZteamBootstrapRoots(ws.root, appRoot);
     const teamConfig = await loadTeamConfig(ws.root, appRoot);
+    const runtimeRes = resolveTeamRuntime(teamConfig);
     const payload = {
       ok: true,
       exists: teamConfig.exists,
       sources: teamConfig.sources,
       models: teamConfig.models,
       maxTokens: teamConfig.maxTokens,
+      llmRuntime: runtimeRes.ok ? runtimeRes.runtime : null,
+      runtimeError: runtimeRes.ok
+        ? null
+        : {
+            failureKind: runtimeRes.failureKind,
+            message: runtimeRes.message,
+            roles: runtimeRes.roles,
+          },
+      cursorAliases: ["inherit", "auto", "cursor", "cursor-auto"],
       needsConfig: !configGateSatisfied(teamConfig),
       questions: configGateSatisfied(teamConfig) ? [] : [...SETUP_QUESTIONS],
       modelQuestions: [...MODEL_QUESTIONS],
+      modelSuggestions: ROLE_MODEL_SUGGESTIONS,
       suggestedDefaults: {
         models: teamConfig.models,
         maxTokens: teamConfig.maxTokens,
@@ -4261,6 +4487,10 @@ server.tool(
       softwareEngineer: z.string().min(1),
       qaEngineer: z.string().min(1),
       fallback: z.string().optional().default(""),
+      systemArchitectFallback: z.string().optional().default(""),
+      technologyArchitectFallback: z.string().optional().default(""),
+      softwareEngineerFallback: z.string().optional().default(""),
+      qaEngineerFallback: z.string().optional().default(""),
     }),
     maxTokens: z
       .object({

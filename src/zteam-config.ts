@@ -26,7 +26,12 @@ export const DEFAULT_MODELS = {
   technologyArchitect: "9RTA-technology-architect-free",
   softwareEngineer: "9RSE-software-engineer-free",
   qaEngineer: "9RQA-qa-free",
+  /** @deprecated Prefer per-role *Fallback; kept as SE legacy alias. */
   fallback: "",
+  systemArchitectFallback: "",
+  technologyArchitectFallback: "",
+  softwareEngineerFallback: "",
+  qaEngineerFallback: "",
 } as const;
 
 export const DEFAULT_MAX_TOKENS = {
@@ -42,6 +47,310 @@ export type TeamRole =
   | "softwareEngineer"
   | "qaEngineer";
 
+/** Cursor-native model aliases (Task subagents; never send to 9router). */
+export const CURSOR_MODEL_ALIASES = new Set([
+  "inherit",
+  "auto",
+  "cursor",
+  "cursor-auto",
+]);
+
+export type LlmRuntime = "cursor" | "ninerouter";
+
+export type CursorSubagentType =
+  | "system-architect"
+  | "technology-architect"
+  | "software-engineer"
+  | "qa-engineer";
+
+export const ROLE_TO_SUBAGENT: Record<TeamRole, CursorSubagentType> = {
+  systemArchitect: "system-architect",
+  technologyArchitect: "technology-architect",
+  softwareEngineer: "software-engineer",
+  qaEngineer: "qa-engineer",
+};
+
+export const TEAM_ROLES: TeamRole[] = [
+  "systemArchitect",
+  "technologyArchitect",
+  "softwareEngineer",
+  "qaEngineer",
+];
+
+export function isCursorModelAlias(model: string): boolean {
+  return CURSOR_MODEL_ALIASES.has(model.trim().toLowerCase());
+}
+
+export type TeamRuntimeOk = {
+  ok: true;
+  runtime: LlmRuntime;
+};
+
+export type TeamRuntimeErr = {
+  ok: false;
+  failureKind: "mixed_runtime";
+  message: string;
+  roles: Record<TeamRole, { model: string; runtime: LlmRuntime }>;
+};
+
+export type TeamRuntimeResolution = TeamRuntimeOk | TeamRuntimeErr;
+
+/** Homogeneous runtime from primary models; mix → mixed_runtime. */
+export function resolveTeamRuntime(
+  cfg: Pick<ResolvedTeamConfig, "models">
+): TeamRuntimeResolution {
+  const roles = {} as Record<
+    TeamRole,
+    { model: string; runtime: LlmRuntime }
+  >;
+  for (const role of TEAM_ROLES) {
+    const model = cfg.models[role]?.trim() || "";
+    roles[role] = {
+      model,
+      runtime: isCursorModelAlias(model) ? "cursor" : "ninerouter",
+    };
+  }
+  const runtimes = new Set(TEAM_ROLES.map((r) => roles[r].runtime));
+  if (runtimes.size > 1) {
+    const detail = TEAM_ROLES.map(
+      (r) => `${r}=${roles[r].model}(${roles[r].runtime})`
+    ).join(", ");
+    return {
+      ok: false,
+      failureKind: "mixed_runtime",
+      message: `All primary models must share one runtime (cursor aliases OR 9router ids). Got mixed: ${detail}`,
+      roles,
+    };
+  }
+  return {
+    ok: true,
+    runtime: [...runtimes][0] ?? "ninerouter",
+  };
+}
+
+export type DelegationStage = {
+  id: string;
+  role: TeamRole;
+  subagentType: CursorSubagentType;
+  model: string;
+  title: string;
+  instructions: string;
+  expectedOutputs: string[];
+};
+
+export type CursorDelegationPlaybook = {
+  llmRuntime: "cursor";
+  workflow: string;
+  userIdea: string;
+  workspaceRoot: string;
+  projectRoot: string;
+  appRoot: string;
+  models: ResolvedTeamConfig["models"];
+  maxTokens: ResolvedTeamConfig["maxTokens"];
+  stages: DelegationStage[];
+  resumeHint: string;
+};
+
+/** Stages for skill-driven Cursor Task path (no ChatOpenAI). */
+export function buildCursorDelegationPlaybook(opts: {
+  workflow: string;
+  userIdea: string;
+  workspaceRoot: string;
+  projectRoot: string;
+  appRoot: string;
+  models: ResolvedTeamConfig["models"];
+  maxTokens: ResolvedTeamConfig["maxTokens"];
+}): CursorDelegationPlaybook {
+  const wf = opts.workflow || "full";
+  const idea = opts.userIdea.trim();
+  const rootHint = `workspaceRoot=${opts.workspaceRoot} projectRoot=${opts.projectRoot} appRoot=${opts.appRoot}`;
+
+  const stage = (
+    id: string,
+    role: TeamRole,
+    title: string,
+    instructions: string,
+    expectedOutputs: string[]
+  ): DelegationStage => ({
+    id,
+    role,
+    subagentType: ROLE_TO_SUBAGENT[role],
+    model: opts.models[role],
+    title,
+    instructions: `${instructions}\n\nConstraints: ${rootHint}. Idea: ${idea}`,
+    expectedOutputs,
+  });
+
+  const stages: DelegationStage[] = [];
+  const needsArch = ["full", "docs", "feature", ""].includes(wf);
+  const needsImpl = ["full", "feature", "punch", "fix", "resume", ""].includes(
+    wf
+  );
+  const needsQa = ["full", "feature", "punch", "fix", "resume", ""].includes(
+    wf
+  );
+  const docsOnly = wf === "docs";
+
+  if (needsArch || wf === "docs") {
+    stages.push(
+      stage(
+        "sa-requirements",
+        "systemArchitect",
+        "System Architect — requirements / specs",
+        "Produce or update .docs/requirements.md (## sections), .docs/todo.md checklist, and any missing .docs/specs/{slug}.spec.md. Do not write implementation code.",
+        [
+          ".docs/requirements.md",
+          ".docs/todo.md",
+          ".docs/specs/*.spec.md",
+        ]
+      )
+    );
+    stages.push(
+      stage(
+        "ta-stack",
+        "technologyArchitect",
+        "Technology Architect — stack / structure",
+        "Produce or update .docs/technologies.md and technical decisions from approved requirements. Do not write full feature implementations.",
+        [".docs/technologies.md"]
+      )
+    );
+  }
+
+  if (needsImpl && !docsOnly) {
+    stages.push(
+      stage(
+        "se-implement",
+        "softwareEngineer",
+        "Software Engineer — implement",
+        "Implement pending [ ] todos that have specs. Write production code under appRoot. Follow technologies.md and specs. Do not write tests (QA does).",
+        ["src/**", "package.json"]
+      )
+    );
+  }
+
+  if (needsQa && !docsOnly) {
+    stages.push(
+      stage(
+        "qa-tests",
+        "qaEngineer",
+        "QA Engineer — tests",
+        "Add/fix unit and integration tests for implemented features. Do not change production behavior except minor testability hooks if required.",
+        ["**/*.{test,spec}.*", "tests/**"]
+      )
+    );
+  }
+
+  return {
+    llmRuntime: "cursor",
+    workflow: wf,
+    userIdea: idea,
+    workspaceRoot: opts.workspaceRoot,
+    projectRoot: opts.projectRoot,
+    appRoot: opts.appRoot,
+    models: opts.models,
+    maxTokens: opts.maxTokens,
+    stages,
+    resumeHint:
+      "llmRuntime=cursor: run each delegationPlaybook.stages entry via Cursor Task (subagentType + model from stage). Do NOT call 9router. After stages, optionally call run_development_pipeline with the same roots for verify-only / resume if needed.",
+  };
+}
+
+export type RoleModelSuggestion = {
+  id: string;
+  tier: "free" | "paid";
+  label: string;
+};
+
+/**
+ * Curated 9router suggestions per role: 2 free + 2 paid.
+ * Ids may vary by operator tunnel — user can paste any valid combo id.
+ */
+export const ROLE_MODEL_SUGGESTIONS: Record<TeamRole, RoleModelSuggestion[]> = {
+  systemArchitect: [
+    {
+      id: "9RSA-system-architect-free",
+      tier: "free",
+      label: "SA free (padrão)",
+    },
+    {
+      id: "9RSA-system-architect-fast-free",
+      tier: "free",
+      label: "SA free rápido / curto",
+    },
+    {
+      id: "9RSA-system-architect",
+      tier: "paid",
+      label: "SA pago (qualidade)",
+    },
+    {
+      id: "9RSA-system-architect-pro",
+      tier: "paid",
+      label: "SA pago pro / longo contexto",
+    },
+  ],
+  technologyArchitect: [
+    {
+      id: "9RTA-technology-architect-free",
+      tier: "free",
+      label: "TA free (padrão)",
+    },
+    {
+      id: "9RTA-technology-architect-fast-free",
+      tier: "free",
+      label: "TA free rápido",
+    },
+    {
+      id: "9RTA-technology-architect",
+      tier: "paid",
+      label: "TA pago",
+    },
+    {
+      id: "9RTA-technology-architect-pro",
+      tier: "paid",
+      label: "TA pago pro",
+    },
+  ],
+  softwareEngineer: [
+    {
+      id: "9RSE-software-engineer-free",
+      tier: "free",
+      label: "SE free (padrão)",
+    },
+    {
+      id: "9RSE-software-engineer-fast-free",
+      tier: "free",
+      label: "SE free rápido",
+    },
+    {
+      id: "9RSE-software-engineer",
+      tier: "paid",
+      label: "SE pago (código)",
+    },
+    {
+      id: "9RSE-software-engineer-pro",
+      tier: "paid",
+      label: "SE pago pro / lotes",
+    },
+  ],
+  qaEngineer: [
+    { id: "9RQA-qa-free", tier: "free", label: "QA free (padrão)" },
+    { id: "9RQA-qa-fast-free", tier: "free", label: "QA free rápido" },
+    { id: "9RQA-qa", tier: "paid", label: "QA pago" },
+    { id: "9RQA-qa-pro", tier: "paid", label: "QA pago pro" },
+  ],
+};
+
+/** Short duty lines for cross-role consult prompts. */
+export const ROLE_DUTIES: Record<TeamRole, string> = {
+  systemArchitect:
+    "requirements, pré-reqs, specs, Files to touch, fidelity to userIdea — no implementation code",
+  technologyArchitect:
+    "stack, folder layout, schemas, technologies.md — no feature code",
+  softwareEngineer:
+    "implement specs via ===FILE=== / write_file; respect Files to touch and tsc",
+  qaEngineer: "tests, vitest, classify bootstrap vs logic failures",
+};
+
 const modelsSchema = z
   .object({
     systemArchitect: z.string().min(1).optional(),
@@ -49,6 +358,10 @@ const modelsSchema = z
     softwareEngineer: z.string().min(1).optional(),
     qaEngineer: z.string().min(1).optional(),
     fallback: z.string().optional(),
+    systemArchitectFallback: z.string().optional(),
+    technologyArchitectFallback: z.string().optional(),
+    softwareEngineerFallback: z.string().optional(),
+    qaEngineerFallback: z.string().optional(),
   })
   .passthrough();
 
@@ -79,7 +392,12 @@ export type ResolvedTeamConfig = {
     technologyArchitect: string;
     softwareEngineer: string;
     qaEngineer: string;
+    /** Legacy global fallback (SE alias if softwareEngineerFallback empty). */
     fallback: string;
+    systemArchitectFallback: string;
+    technologyArchitectFallback: string;
+    softwareEngineerFallback: string;
+    qaEngineerFallback: string;
   };
   maxTokens: {
     systemArchitect: number;
@@ -105,29 +423,77 @@ export type WorkspaceDiagnosis = {
 
 export const SETUP_QUESTIONS = [
   "Escopo: gravar no workspace, neste app (projectRoot), ou ambos?",
-  "System Architect — model id (default sugerido abaixo)",
-  "Technology Architect — model id",
-  "Software Engineer — model id",
-  "QA Engineer — model id",
-  "Fallback opcional — model id ou vazio",
+  "System Architect — primary model (ver modelSuggestions.systemArchitect: 2 free + 2 paid)",
+  "System Architect — fallback model (segundo agente SA se o primary esgotar; vazio = sem handoff)",
+  "Technology Architect — primary (ver modelSuggestions.technologyArchitect)",
+  "Technology Architect — fallback",
+  "Software Engineer — primary (ver modelSuggestions.softwareEngineer)",
+  "Software Engineer — fallback (recomendado se usares SE free)",
+  "QA Engineer — primary (ver modelSuggestions.qaEngineer)",
+  "QA Engineer — fallback",
   "maxTokens por papel? (defaults / custom)",
   "Se não houver .gitignore no alvo: ignorar .zteam/config.json no git? (recomendado: sim)",
 ] as const;
 
 /** Focused questions for `@zteam/models` (LLM ids only). */
 export const MODEL_QUESTIONS = [
-  "System Architect — model id 9router (default: 9RSA-system-architect-free)",
-  "Technology Architect — model id (default: 9RTA-technology-architect-free)",
-  "Software Engineer — model id (default: 9RSE-software-engineer-free)",
-  "QA Engineer — model id (default: 9RQA-qa-free)",
-  "Fallback opcional — model id ou vazio (usado se empty/OUT=0 no SE)",
+  "Para CADA papel (SA/TA/SE/QA): escolhe primary + fallback. Família homogénea: aliases Cursor (inherit/auto/cursor/cursor-auto) OU ids 9router (modelSuggestions). Não misturar.",
+  "System Architect — primary",
+  "System Architect — fallback (vazio ok; só ninerouter)",
+  "Technology Architect — primary",
+  "Technology Architect — fallback",
+  "Software Engineer — primary",
+  "Software Engineer — fallback",
+  "QA Engineer — primary",
+  "QA Engineer — fallback",
   "Gravar neste projeto: workspace (raiz aberta), app (projectRoot), ou ambos?",
 ] as const;
+
+/** Resolve per-role fallback model id (role-specific → legacy global for SE). */
+export function resolveRoleFallbackModel(
+  cfg: ResolvedTeamConfig,
+  role: TeamRole
+): string {
+  const key = `${role}Fallback` as const;
+  const perRole = (cfg.models as Record<string, string>)[key]?.trim() || "";
+  if (perRole) return perRole;
+  if (role === "softwareEngineer") {
+    return (
+      cfg.models.fallback?.trim() ||
+      process.env.MODEL_FALLBACK?.trim() ||
+      process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK?.trim() ||
+      ""
+    );
+  }
+  const envKey =
+    role === "systemArchitect"
+      ? "MODEL_SYSTEM_ARCHITECT_FALLBACK"
+      : role === "technologyArchitect"
+        ? "MODEL_TECHNOLOGY_ARCHITECT_FALLBACK"
+        : role === "qaEngineer"
+          ? "MODEL_QA_ENGINEER_FALLBACK"
+          : "";
+  if (envKey && process.env[envKey]?.trim()) return process.env[envKey]!.trim();
+  return "";
+}
 
 /** Canonical command guide copied into each project's `.zteam/README.MD`. */
 export const ZTEAM_README_MD = `# zteam — comandos e configuração
 
-Fonte de verdade local do time 9router neste projeto. Ver também a skill Cursor **\`zteam\`** (\`/zteam\`, \`@zteam\`).
+Fonte de verdade local do time neste projeto: **\`.zteam/config.json\`** (verdade absoluta dos modelos). Ver também a skill Cursor **\`zteam\`** (\`/zteam\`, \`@zteam\`).
+
+## Dual runtime (modelos)
+
+O valor de cada primary em \`models\` escolhe o runtime (**família homogénea** — não misturar):
+
+| Valor no config | Runtime | O que acontece |
+|-----------------|---------|----------------|
+| \`inherit\` / \`auto\` / \`cursor\` / \`cursor-auto\` | **cursor** | Skill corre SA/TA/SE/QA via Cursor Task (Auto do chat pai). MCP **não** chama 9router. |
+| Qualquer outro id (\`9RSA-…\`, \`cu/default\`, …) | **ninerouter** | MCP \`ChatOpenAI\` com o id **literal** → 9router. |
+
+Mix (\`inherit\` + \`9RSE-…\`) → \`failureKind: mixed_runtime\` (fail cedo).
+
+Precedência: ficheiro app → ficheiro workspace → (só se **não** houver ficheiro) env \`MODEL_*\` / defaults.
 
 ## Comandos
 
@@ -139,7 +505,7 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 | **\`@zteam/models\`** | Só LLMs por papel — perguntas guiadas → atualiza \`models\` em \`.zteam/config.json\` neste projeto. | \`get_zteam_config\` → \`modelQuestions\` → \`write_zteam_config\` |
 | **\`@zteam/documentation\`** | Só documentação / arquitetura (requirements, technologies, todo, specs). Sem SE/QA. | \`run_development_pipeline\` com \`workflow: "docs"\` |
 | **\`@zteam/tests\`** | Analisa o app/specs e cria ou reforça testes (QA + fix loop se falhar). | \`run_development_pipeline\` com foco em testes (\`workflow: "fix"\` ou \`"feature"\` / \`"resume"\` conforme o estado) |
-| **\`@zteam\`** / **\`/zteam\`** | Pipeline completo ou o workflow que pedires (full, feature, punch, resume, …). | \`run_development_pipeline\` |
+| **\`@zteam\`** / **\`/zteam\`** | Pipeline completo ou o workflow que pedires (full, feature, punch, resume, …). | \`run_development_pipeline\` (ou Task playbook se runtime=cursor) |
 
 ### Exemplos
 
@@ -164,21 +530,25 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 
 | Path | Papel |
 |------|--------|
-| \`.zteam/config.json\` | Modelos e maxTokens por papel (app override → workspace → env) |
+| \`.zteam/config.json\` | **Verdade absoluta** — modelos e maxTokens por papel |
 | \`.zteam/README.MD\` | Este guia (comandos) |
 | \`.zteam/skills/SKILL.md\` | Cópia local da skill Cursor zteam (sincronizada ao criar \`.zteam/\`) |
 | \`.docs/*\` | Artefactos da pipeline (requirements, technologies, specs, progress, …) |
 
-### Exemplo \`config.json\`
+### Exemplo \`config.json\` (9router)
 
 \`\`\`json
 {
   "version": 1,
   "models": {
     "systemArchitect": "9RSA-system-architect-free",
+    "systemArchitectFallback": "9RSA-system-architect",
     "technologyArchitect": "9RTA-technology-architect-free",
+    "technologyArchitectFallback": "",
     "softwareEngineer": "9RSE-software-engineer-free",
+    "softwareEngineerFallback": "9RSE-software-engineer",
     "qaEngineer": "9RQA-qa-free",
+    "qaEngineerFallback": "",
     "fallback": ""
   },
   "maxTokens": {
@@ -189,6 +559,29 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
   }
 }
 \`\`\`
+
+### Exemplo Cursor Auto (fora do 9router)
+
+\`\`\`json
+{
+  "version": 1,
+  "models": {
+    "systemArchitect": "inherit",
+    "systemArchitectFallback": "",
+    "technologyArchitect": "inherit",
+    "technologyArchitectFallback": "",
+    "softwareEngineer": "inherit",
+    "softwareEngineerFallback": "",
+    "qaEngineer": "inherit",
+    "qaEngineerFallback": "",
+    "fallback": ""
+  }
+}
+\`\`\`
+
+Handoff (só runtime **ninerouter**): se o primary esgotar retries, o MCP promove o \`*Fallback\` do papel. Papéis ativos podem consultar-se nos gates (SE↔SA após VERIFY FAIL; TA↔SA em gaps de arquitetura).
+
+No \`@zteam/config\` / \`@zteam/models\`, pergunta primary+fallback por papel e mostra \`modelSuggestions\` (2 free + 2 paid) **e** aliases Cursor (\`inherit\`).
 
 ## Workspace (pasta raiz)
 
@@ -202,9 +595,9 @@ Evita o footgun de pipelines a escrever noutro repo (ex. \`pacman-z2\`).
 ## Precedência de modelos
 
 \`\`\`text
-{appRoot}/.zteam/config.json
+{appRoot}/.zteam/config.json   (SoT se existir)
   → {workspaceRoot}/.zteam/config.json
-    → env MODEL_* / MAX_TOKENS_*
+    → (só sem ficheiro) env MODEL_* / MAX_TOKENS_*
       → defaults 9RSA / 9RTA / 9RSE / 9RQA
 \`\`\`
 
@@ -212,8 +605,8 @@ Credenciais (\`NINEROUTER_*\`) ficam só no env do MCP — nunca neste JSON.
 
 ## Playbook operador (greenfield / resume)
 
-1. Garantir \`.zteam/config.json\` (\`@zteam/models\` ou \`@zteam/config\`) + 9router saudável.
-2. Após patch no orchestrator: **reiniciar MCP** \`user-zteam\` (sem hot-reload). Discovery deve listar \`get_zteam_config\`, \`write_zteam_config\`, \`run_development_pipeline\`, …
+1. Garantir \`.zteam/config.json\` (\`@zteam/models\` ou \`@zteam/config\`) — escolher família cursor **ou** 9router.
+2. Após patch no orchestrator: **reiniciar MCP** \`user-zteam\` (sem hot-reload).
 3. Evitar re-rodar \`full\`/\`docs\` após requirements bons — o bootstrap **preserva** \`.docs/requirements.md\` com seções \`##\` (use \`ZTEAM_FORCE_BOOTSTRAP=1\` só para recomeçar de propósito).
 4. Antes de \`resume\`: cada \`[ ]\` no todo precisa de \`.docs/specs/{slug}.spec.md\`. Órfãos → \`workflow=feature\`.
 5. Modelos free no 9router: default \`ZTEAM_SE_BATCH=1\`. Se \`IN 0 · OUT 0\` / empty SE → configure \`models.fallback\` no config.
@@ -223,7 +616,7 @@ Credenciais (\`NINEROUTER_*\`) ficam só no env do MCP — nunca neste JSON.
 |-----|---------|------|
 | \`ZTEAM_FORCE_BOOTSTRAP\` | off | Força stub novo de requirements |
 | \`ZTEAM_SE_BATCH\` | \`1\` (\`punch\`→3) | Lotes SE |
-| \`MODEL_FALLBACK\` | — | Fallback após empty LLM |
+| \`MODEL_FALLBACK\` | — | Fallback após empty LLM (só sem config file) |
 `;
 
 export async function ensureZteamReadme(
@@ -341,6 +734,18 @@ export function envDefaultsTeamConfig(): Omit<
         process.env.MODEL_FALLBACK?.trim() ||
         process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK?.trim() ||
         DEFAULT_MODELS.fallback,
+      systemArchitectFallback:
+        process.env.MODEL_SYSTEM_ARCHITECT_FALLBACK?.trim() ||
+        DEFAULT_MODELS.systemArchitectFallback,
+      technologyArchitectFallback:
+        process.env.MODEL_TECHNOLOGY_ARCHITECT_FALLBACK?.trim() ||
+        DEFAULT_MODELS.technologyArchitectFallback,
+      softwareEngineerFallback:
+        process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK?.trim() ||
+        DEFAULT_MODELS.softwareEngineerFallback,
+      qaEngineerFallback:
+        process.env.MODEL_QA_ENGINEER_FALLBACK?.trim() ||
+        DEFAULT_MODELS.qaEngineerFallback,
     },
     maxTokens: {
       systemArchitect: parseMaxTokensEnv(
@@ -360,6 +765,17 @@ export function envDefaultsTeamConfig(): Omit<
         DEFAULT_MAX_TOKENS.qaEngineer
       ),
     },
+  };
+}
+
+/** Hardcoded defaults only — used when a config file is present (config is SoT; ignore MODEL_*). */
+export function defaultsOnlyTeamConfig(): Omit<
+  ResolvedTeamConfig,
+  "sources" | "exists"
+> {
+  return {
+    models: { ...DEFAULT_MODELS },
+    maxTokens: { ...DEFAULT_MAX_TOKENS },
   };
 }
 
@@ -409,6 +825,22 @@ function mergeLayer(
         layer.models?.fallback !== undefined
           ? String(layer.models.fallback).trim()
           : base.models.fallback,
+      systemArchitectFallback:
+        layer.models?.systemArchitectFallback !== undefined
+          ? String(layer.models.systemArchitectFallback).trim()
+          : base.models.systemArchitectFallback,
+      technologyArchitectFallback:
+        layer.models?.technologyArchitectFallback !== undefined
+          ? String(layer.models.technologyArchitectFallback).trim()
+          : base.models.technologyArchitectFallback,
+      softwareEngineerFallback:
+        layer.models?.softwareEngineerFallback !== undefined
+          ? String(layer.models.softwareEngineerFallback).trim()
+          : base.models.softwareEngineerFallback,
+      qaEngineerFallback:
+        layer.models?.qaEngineerFallback !== undefined
+          ? String(layer.models.qaEngineerFallback).trim()
+          : base.models.qaEngineerFallback,
     },
     maxTokens: {
       systemArchitect:
@@ -442,7 +874,10 @@ export async function loadTeamConfig(
     ? workspaceExists
     : await pathExists(paths.appConfig);
 
-  let merged = envDefaultsTeamConfig();
+  let merged =
+    workspaceFile || appFile
+      ? defaultsOnlyTeamConfig()
+      : envDefaultsTeamConfig();
   merged = mergeLayer(merged, workspaceFile);
   if (!samePath) merged = mergeLayer(merged, appFile);
   else if (workspaceFile) {
@@ -499,6 +934,10 @@ export type WriteTeamConfigInput = {
     softwareEngineer: string;
     qaEngineer: string;
     fallback?: string;
+    systemArchitectFallback?: string;
+    technologyArchitectFallback?: string;
+    softwareEngineerFallback?: string;
+    qaEngineerFallback?: string;
   };
   maxTokens?: Partial<ResolvedTeamConfig["maxTokens"]>;
 };
@@ -530,6 +969,19 @@ export async function writeTeamConfig(
       softwareEngineer: input.models.softwareEngineer.trim(),
       qaEngineer: input.models.qaEngineer.trim(),
       fallback: (input.models.fallback ?? "").trim(),
+      systemArchitectFallback: (
+        input.models.systemArchitectFallback ??
+        ""
+      ).trim(),
+      technologyArchitectFallback: (
+        input.models.technologyArchitectFallback ??
+        ""
+      ).trim(),
+      softwareEngineerFallback: (
+        input.models.softwareEngineerFallback ??
+        ""
+      ).trim(),
+      qaEngineerFallback: (input.models.qaEngineerFallback ?? "").trim(),
     },
     maxTokens: {
       systemArchitect:
@@ -612,6 +1064,7 @@ export function needsConfigPayload(opts: {
     envModelsPresent: envModels,
     questions: [...SETUP_QUESTIONS],
     modelQuestions: [...MODEL_QUESTIONS],
+    modelSuggestions: ROLE_MODEL_SUGGESTIONS,
     suggestedDefaults: defaults,
     suggestedPaths: {
       workspace: paths.workspaceConfig,

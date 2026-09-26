@@ -19,7 +19,14 @@ const {
   ensureGitignoreIgnoresZteam,
   hasAnyTeamConfig,
   DEFAULT_MODELS,
+  ROLE_MODEL_SUGGESTIONS,
+  resolveRoleFallbackModel,
+  resolveTeamRuntime,
+  isCursorModelAlias,
+  buildCursorDelegationPlaybook,
+  defaultsOnlyTeamConfig,
 } = await import("../src/zteam-config.ts");
+const { missingNineRouterModels } = await import("../src/healthcheck.ts");
 const { withRunContext } = await import("../src/run-context.ts");
 
 function assert(cond, msg) {
@@ -111,6 +118,35 @@ try {
     assert(cfg.models.technologyArchitect === "ws-ta", "workspace TA kept");
     assert(cfg.models.fallback === "app-fb", "app fallback");
     assert(cfg.maxTokens.softwareEngineer === 9999, "app maxTokens");
+    assert(
+      resolveRoleFallbackModel(cfg, "softwareEngineer") === "app-fb",
+      "SE fallback resolves legacy fallback"
+    );
+    await writeTeamConfig(app, {
+      models: {
+        systemArchitect: "app-sa",
+        technologyArchitect: "ws-ta",
+        softwareEngineer: "ws-se",
+        qaEngineer: "ws-qa",
+        softwareEngineerFallback: "se-fb-2",
+        fallback: "app-fb",
+      },
+    });
+    const cfg2 = await loadTeamConfig(ws, app);
+    assert(
+      resolveRoleFallbackModel(cfg2, "softwareEngineer") === "se-fb-2",
+      "per-role SE fallback wins over legacy"
+    );
+    assert(
+      ROLE_MODEL_SUGGESTIONS.systemArchitect.filter((s) => s.tier === "free")
+        .length === 2,
+      "2 free SA suggestions"
+    );
+    assert(
+      ROLE_MODEL_SUGGESTIONS.softwareEngineer.filter((s) => s.tier === "paid")
+        .length === 2,
+      "2 paid SE suggestions"
+    );
     const readme = await readFile(join(ws, ".zteam", "README.MD"), "utf8");
     assert(readme.includes("@zteam/config"), "README documents @zteam/config");
     assert(readme.includes("@zteam/models"), "README documents @zteam/models");
@@ -119,6 +155,10 @@ try {
       "README documents @zteam/documentation"
     );
     assert(readme.includes("@zteam/tests"), "README documents @zteam/tests");
+    assert(
+      /handoff|Fallback|\*Fallback/i.test(readme),
+      "README mentions handoff/fallback"
+    );
     const skillText = await readFile(
       join(ws, ".zteam", "skills", "SKILL.md"),
       "utf8"
@@ -174,6 +214,81 @@ try {
       threw = true;
     }
     assert(threw, "empty model rejected");
+  }
+
+  // --- config SoT: file present ignores MODEL_* env ---
+  {
+    const ws = join(base, "sot-ws");
+    await mkdir(ws, { recursive: true });
+    process.env.MODEL_SYSTEM_ARCHITECT = "env-should-not-win";
+    await writeTeamConfig(ws, {
+      models: {
+        systemArchitect: "inherit",
+        technologyArchitect: "inherit",
+        softwareEngineer: "inherit",
+        qaEngineer: "inherit",
+      },
+    });
+    const cfg = await loadTeamConfig(ws, ws);
+    assert(cfg.models.systemArchitect === "inherit", "config SoT beats env");
+    assert(
+      resolveTeamRuntime(cfg).ok &&
+        resolveTeamRuntime(cfg).ok &&
+        /** @type {{ok:true,runtime:string}} */ (resolveTeamRuntime(cfg))
+          .runtime === "cursor",
+      "cursor runtime"
+    );
+    assert(isCursorModelAlias("auto"), "auto alias");
+    delete process.env.MODEL_SYSTEM_ARCHITECT;
+  }
+
+  // --- mixed runtime rejected ---
+  {
+    const mixed = {
+      models: {
+        systemArchitect: "inherit",
+        technologyArchitect: "9RTA-technology-architect-free",
+        softwareEngineer: "inherit",
+        qaEngineer: "inherit",
+        fallback: "",
+        systemArchitectFallback: "",
+        technologyArchitectFallback: "",
+        softwareEngineerFallback: "",
+        qaEngineerFallback: "",
+      },
+    };
+    const res = resolveTeamRuntime(mixed);
+    assert(!res.ok && res.failureKind === "mixed_runtime", "mixed fails");
+  }
+
+  // --- playbook + missing models helper ---
+  {
+    const pb = buildCursorDelegationPlaybook({
+      workflow: "docs",
+      userIdea: "pacman",
+      workspaceRoot: base,
+      projectRoot: ".",
+      appRoot: base,
+      models: {
+        ...defaultsOnlyTeamConfig().models,
+        systemArchitect: "inherit",
+        technologyArchitect: "inherit",
+        softwareEngineer: "inherit",
+        qaEngineer: "inherit",
+      },
+      maxTokens: defaultsOnlyTeamConfig().maxTokens,
+    });
+    assert(pb.llmRuntime === "cursor", "playbook cursor");
+    assert(pb.stages.length >= 2, "docs has SA+TA");
+    assert(
+      pb.stages.every((s) => s.model === "inherit"),
+      "stage models inherit"
+    );
+    const miss = missingNineRouterModels(
+      { models: { systemArchitect: "no-such-model", qaEngineer: "" } },
+      new Set(["ok"])
+    );
+    assert(miss.includes("systemArchitect=no-such-model"), "missing detect");
   }
 
   console.log("smoke:zteam-config OK");
