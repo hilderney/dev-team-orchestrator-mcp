@@ -87,6 +87,16 @@ function assert(cond, msg) {
   assert(v.length > 0, "detects lives drift");
 }
 
+// --- coerce skips types.ts ---
+{
+  const { coercePathForContent } = await import("../src/file-contract.ts");
+  const p = coercePathForContent(
+    "src/types.ts",
+    "type X = Array<string>;\nconst y = <T>(x: T) => x;"
+  );
+  assert(p === "src/types.ts", "do not coerce types.ts");
+}
+
 // --- ensureTestScript ---
 {
   const dir = await mkdtemp(join(tmpdir(), "zteam-smoke-"));

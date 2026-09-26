@@ -7,9 +7,10 @@ alwaysApply: true
 
 When the user asks for team/feature work via **zteam**, **@zteam**, **/zteam**, or **dev-team-orchestrator** (requirements, tech design, implementation plan, tests, or a full pipeline):
 
-1. Call the MCP tool `run_development_pipeline` on **`user-zteam`** (MCP server key `zteam`).
-2. Do **not** use Cursor `Task` with `software-engineer`, `qa-engineer`, `system-architect`, or `technology-architect` for that work.
-3. Those Cursor Task subagents use Cursor models and **never** hit 9router.
+1. **Before the pipeline:** call MCP `get_zteam_config` with `workspaceRoot` (+ `projectRoot`). If `needsConfig`, do **not** call `run_development_pipeline` — run `@zteam/models` / `@zteam/config` first.
+2. Call the MCP tool `run_development_pipeline` on **`user-zteam`** (MCP server key `zteam`).
+3. Do **not** use Cursor `Task` with `software-engineer`, `qa-engineer`, `system-architect`, or `technology-architect` for that work.
+4. Those Cursor Task subagents use Cursor models and **never** hit 9router.
 
 Prefer the project skill **`zteam`** (`/zteam` or `@zteam`) for the short trigger; this rule still applies when the user uses the long name.
 
@@ -17,24 +18,30 @@ Prefer the project skill **`zteam`** (`/zteam` or `@zteam`) for the short trigge
 
 The MCP tool runs LangGraph. **Always pass `workspaceRoot`** = absolute path of the Cursor-open folder (skill contract). Optional `projectRoot` (default `"."`) is resolved under that workspace. Prefer `projectRoot` like `samples/my-app` so the MCP package README is not overwritten. Writes into the orchestrator package root with `projectRoot: "."` are rejected.
 
-Team models come from `.zteam/config.json` (app override → workspace default → env `MODEL_*`). If missing, the pipeline returns `failureKind=needsConfig` — use `@zteam/config` / `get_zteam_config` / `write_zteam_config`. Prefer **not** setting sticky `WORKSPACE_ROOT` in `mcp.json` (wrong-repo footgun).
+**Subcommands (skill):** `@zteam/config` (full setup), `@zteam/models` (LLM ids → `.zteam/config.json`), `@zteam/documentation` (`workflow=docs`), `@zteam/tests` (QA-focused). See [`.zteam/README.MD`](../../.zteam/README.MD).
 
-**Subcommands (skill):** `@zteam/config` (setup), `@zteam/documentation` (`workflow=docs`), `@zteam/tests` (QA-focused). See [`.zteam/README.MD`](../../.zteam/README.MD).
+Team models: `.zteam/config.json` (app → workspace → env `MODEL_*` → defaults). Config gate opens if a config file exists **or** explicit `MODEL_*` env is set (`configGateSatisfied`). Otherwise `failureKind=needsConfig` — use `@zteam/models` / `@zteam/config` / `get_zteam_config` / `write_zteam_config`. Prefer **not** setting sticky `WORKSPACE_ROOT` in `mcp.json`.
 
-**Requirements (full/docs):** iterative — bootstrap Resume + Pré Requirements → SA expands one pré-req at a time → clean README → then TA as usual.
+**Requirements (full/docs):** iterative — bootstrap Resume + Pré Requirements → SA expands one pré-req at a time → clean README → fidelity → TA → specs (+ architecture critic) → (scaffold → SE verify loop → delivery critic → QA if not docs-only).
 
 | Stage | Env var | Default | Writes / reads |
 |---|---|---|---|
 | System Architect (requirements) | `MODEL_SYSTEM_ARCHITECT` | `9RSA-system-architect-free` | bootstrap `README.md` → per-item `.docs/requirements.md` → clean README |
+| Fidelity critic | (heurística) | — | FAIL hard vs `userIdea` (redo SA); no silent pass on stub/API drift |
 | Technology Architect | `MODEL_TECHNOLOGY_ARCHITECT` | `9RTA-technology-architect-free` | `.docs/technologies.md` + README update |
 | System Architect (specs) | `MODEL_SYSTEM_ARCHITECT` | same | `.docs/todo.md` + `.docs/specs/*.spec.md` + README |
-| Software Engineer | `MODEL_SOFTWARE_ENGINEER` | `9RSE-software-engineer-free` | Implements **one** pending spec at a time; marks todo |
-| QA Engineer | `MODEL_QA_ENGINEER` | `9RQA-qa-free` | Tests per spec; runs tests; SE fix loop on failure |
-| Orchestrator finalize | (no LLM) | — | README pipeline status |
+| Delivery critic (architecture) | (heurística) | — | gaps idea ↔ tech/specs; may reopen TA |
+| Scaffold | (no LLM) | — | vite+vitest template / augment missing shell files |
+| Software Engineer | `MODEL_SOFTWARE_ENGINEER` | `9RSE-software-engineer-free` | Batch pending specs; `verifyDelivery` (Files to touch + `tsc`) before `markTodoDone`; redo with `deliveryFixRound` |
+| Delivery critic (delivery) | (heurística) | — | reopen incomplete slugs after SE |
+| QA Engineer | `MODEL_QA_ENGINEER` | `9RQA-qa-free` | Tests per spec; bootstrapFix vs SE fix by error class |
+| Orchestrator finalize | (no LLM) | — | README status + `.docs/pipeline-result.json` (metrics: retries, `llmEmpty`, …) |
+
+**Empty LLM:** no silent charter/TBD/`implement-core` stubs — `failureKind=llm_empty`. Classified failures include `spec_incomplete`, `tsc`, `bootstrap`, `fidelity`, `qa`, `healthcheck`.
 
 **Docs-only:** pass `workflow: "docs"` (or deprecated `docsOnly: true` / CLI `--docs-only` / `--workflow=docs`).
 
-**Workflows:** omit `workflow` for auto-routing, or set `full` | `docs` | `feature` | `punch` | `fix` | `resume`. See [`src/workflows/`](../../src/workflows/).
+**Workflows:** omit `workflow` for auto-routing, or set `full` | `docs` | `feature` | `punch` | `fix` | `resume`. See [`src/workflows/`](../../src/workflows/). Resume reopens phantom `[x]` todos whose Files to touch are missing on disk.
 
 **CLI:** `npm run pipeline -- --workflow punch --project-root samples/foo "idea…"` and `pipeline:docs` / `pipeline:resume`.
 

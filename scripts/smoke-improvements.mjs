@@ -34,9 +34,9 @@ const {
   coercePathForContent,
   stripAgentNotesFromCode,
 } = await import("../src/file-contract.ts");
-const { healthcheckNineRouter, clearHealthcheckCache } = await import(
-  "../src/healthcheck.ts"
-);
+const { healthcheckNineRouter, clearHealthcheckCache, FAIL_CACHE_MS, SUCCESS_CACHE_MS } =
+  await import("../src/healthcheck.ts");
+const { resolveSeMaxBatch } = await import("../src/spec-batch.ts");
 const { createMetrics, metricsSnapshot, clearMetrics } = await import(
   "../src/metrics.ts"
 );
@@ -64,6 +64,16 @@ const results = [];
   assert(!body.includes("omitido"), "strips omitido");
   const path = coercePathForContent("src/A.ts", "export const A = () => <div/>;");
   assert(path === "src/A.tsx", `jsx coerce got ${path}`);
+  const types = coercePathForContent(
+    "src/api/types.ts",
+    "export type Card = { id: string };\nexport type List = Array<string>;"
+  );
+  assert(types === "src/api/types.ts", "types.ts not coerced");
+  const store = coercePathForContent(
+    "src/deckStore.ts",
+    "export const useDeck = () => ({ x: 1 as Array<number> });"
+  );
+  assert(store === "src/deckStore.ts", "Store.ts not coerced");
   results.push("sanitize jsx/notes");
 }
 
@@ -127,7 +137,7 @@ const results = [];
   results.push("repairFileContract");
 }
 
-// --- 5.4 progress close ---
+// --- 5.4 progress close + MCP no console by default ---
 {
   let progressAfterClose = 0;
   const session = createProgressSession({
@@ -136,19 +146,33 @@ const results = [];
     },
     progressToken: "tok-1",
   });
+  assert(session.consoleEnabled === false, "MCP default: no console");
   await withProgressSession(session, async () => {
     session.emit("t", "notify", "before");
     session.close();
     session.emit("t", "notify", "after close should not progress");
   });
-  // first emit may send progress; after close must not
   assert(session.isClosed, "closed");
-  // only the pre-close notify should have incremented once
   assert(progressAfterClose <= 1, `progress spam after close: ${progressAfterClose}`);
+  const cli = createProgressSession({ consoleEnabled: true });
+  assert(cli.consoleEnabled === true, "CLI can enable console");
   results.push("progressToken close");
 }
 
-// --- 5.5 healthcheck fail fast ---
+// --- SE batch default 1 ---
+{
+  const prev = process.env.ZTEAM_SE_BATCH;
+  delete process.env.ZTEAM_SE_BATCH;
+  assert(resolveSeMaxBatch("full") === 1, "default batch 1");
+  assert(resolveSeMaxBatch("punch") === 3, "punch batch 3");
+  process.env.ZTEAM_SE_BATCH = "2";
+  assert(resolveSeMaxBatch("full") === 2, "env override");
+  if (prev === undefined) delete process.env.ZTEAM_SE_BATCH;
+  else process.env.ZTEAM_SE_BATCH = prev;
+  results.push("resolveSeMaxBatch");
+}
+
+// --- 5.5 healthcheck fail fast + fail TTL shorter than success ---
 {
   clearHealthcheckCache();
   process.env.NINEROUTER_BASE = "http://127.0.0.1:1";
@@ -158,6 +182,11 @@ const results = [];
   });
   assert(!h.ok, "healthcheck should fail");
   assert(h.ms < 30_000, `healthcheck too slow: ${h.ms}`);
+  assert(/reinicie MCP|túnel|tunnel/i.test(h.message), "fail message hints restart");
+  assert(FAIL_CACHE_MS < SUCCESS_CACHE_MS, "fail TTL shorter");
+  assert(FAIL_CACHE_MS <= 30_000, "fail TTL ~20s");
+  const cached = await healthcheckNineRouter(undefined, { timeoutMs: 500 });
+  assert(/cached/i.test(cached.message), "failure is cached briefly");
   results.push("healthcheck fail");
 }
 

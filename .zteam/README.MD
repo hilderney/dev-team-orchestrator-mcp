@@ -8,7 +8,8 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
 
 | Comando | O que faz | MCP |
 |---------|-----------|-----|
-| **`@zteam/config`** | Cria/atualiza `.zteam/config.json` (modelos, maxTokens, escopo workspace/app). Fonte de verdade dos modelos 9router. | `get_zteam_config` → perguntas → `write_zteam_config` |
+| **`@zteam/config`** | Setup completo: `.zteam/config.json` (modelos, maxTokens, escopo workspace/app, gitignore). | `get_zteam_config` → perguntas → `write_zteam_config` |
+| **`@zteam/models`** | Só LLMs por papel — perguntas guiadas → atualiza `models` em `.zteam/config.json` neste projeto. | `get_zteam_config` → `modelQuestions` → `write_zteam_config` |
 | **`@zteam/documentation`** | Só documentação / arquitetura (requirements, technologies, todo, specs). Sem SE/QA. | `run_development_pipeline` com `workflow: "docs"` |
 | **`@zteam/tests`** | Analisa o app/specs e cria ou reforça testes (QA + fix loop se falhar). | `run_development_pipeline` com foco em testes (`workflow: "fix"` ou `"feature"` / `"resume"` conforme o estado) |
 | **`@zteam`** / **`/zteam`** | Pipeline completo ou o workflow que pedires (full, feature, punch, resume, …). | `run_development_pipeline` |
@@ -16,8 +17,11 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
 ### Exemplos
 
 ```text
+@zteam/models
+→ mostra modelos atuais + defaults → pergunta SA/TA/SE/QA/fallback → grava .zteam/config.json
+
 @zteam/config
-→ pergunta modelos / escopo → grava .zteam/config.json (+ .gitignore para config)
+→ pergunta modelos / escopo / maxTokens → grava .zteam/config.json (+ .gitignore para config)
 
 @zteam/documentation samples/pacman — canvas TS, infinite lives
 → workflow=docs, projectRoot=samples/pacman
@@ -78,3 +82,18 @@ Evita o footgun de pipelines a escrever noutro repo (ex. `pacman-z2`).
 ```
 
 Credenciais (`NINEROUTER_*`) ficam só no env do MCP — nunca neste JSON.
+
+## Playbook operador (greenfield / resume)
+
+1. Garantir `.zteam/config.json` (`@zteam/models` ou `@zteam/config`) + 9router saudável.
+2. Após patch no orchestrator: **reiniciar MCP** `user-zteam` (sem hot-reload). Discovery deve listar `get_zteam_config`, `write_zteam_config`, `run_development_pipeline`, …
+3. Evitar re-rodar `full`/`docs` após requirements bons — o bootstrap **preserva** `.docs/requirements.md` com seções `##` (use `ZTEAM_FORCE_BOOTSTRAP=1` só para recomeçar de propósito).
+4. Antes de `resume`: cada `[ ]` no todo precisa de `.docs/specs/{slug}.spec.md`. Órfãos → `workflow=feature`.
+5. Modelos free no 9router: default `ZTEAM_SE_BATCH=1`. Se `IN 0 · OUT 0` / empty SE → configure `models.fallback` no config.
+6. Healthcheck falhou: aguardar ~20s ou reiniciar MCP / verificar túnel Cloudflare; não spamar retries com `(cached)`.
+
+| Env | Default | Nota |
+|-----|---------|------|
+| `ZTEAM_FORCE_BOOTSTRAP` | off | Força stub novo de requirements |
+| `ZTEAM_SE_BATCH` | `1` (`punch`→3) | Lotes SE |
+| `MODEL_FALLBACK` | — | Fallback após empty LLM |

@@ -122,12 +122,16 @@ async function main() {
   const { resolveExplicitWorkflow } = await import("../src/workflows/index.ts");
   const {
     loadTeamConfig,
-    hasAnyTeamConfig,
+    configGateSatisfied,
     needsConfigPayload,
     diagnoseWorkspace,
     ensureZteamBootstrapRoots,
   } = await import("../src/zteam-config.ts");
   const { withRunContext } = await import("../src/run-context.ts");
+  const {
+    healthcheckNineRouter,
+    shouldHealthcheckForWorkflow,
+  } = await import("../src/healthcheck.ts");
 
   const explicit = resolveExplicitWorkflow({
     workflow: workflowArg,
@@ -158,7 +162,7 @@ async function main() {
     `[pipeline] userIdea=${userIdea.slice(0, 120)}${userIdea.length > 120 ? "…" : ""}`
   );
 
-  if (!skipConfigGate && !hasAnyTeamConfig(teamConfig)) {
+  if (!skipConfigGate && !configGateSatisfied(teamConfig)) {
     const payload = needsConfigPayload({
       workspaceRoot: ws.root,
       appRoot,
@@ -170,12 +174,34 @@ async function main() {
     return;
   }
 
+  if (shouldHealthcheckForWorkflow(explicit || "full")) {
+    const health = await healthcheckNineRouter();
+    console.error(`[pipeline] ${health.message}`);
+    if (!health.ok) {
+      const failure = {
+        ok: false,
+        failureKind: "healthcheck",
+        error: health.message,
+        resumeHint: "Fix NINEROUTER_BASE / tunnel, then re-run",
+        workspaceRoot: ws.root,
+        appRoot,
+      };
+      await writeFile(
+        join(PACKAGE_ROOT, "pipeline-result.json"),
+        JSON.stringify(failure, null, 2),
+        "utf8"
+      );
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   console.error(
     `[pipeline] invoking graph (router → ${mode === "auto" ? "classify" : mode})…`
   );
 
   const started = Date.now();
-  const session = createProgressSession();
+  const session = createProgressSession({ consoleEnabled: true });
 
   let result;
   try {
@@ -205,6 +231,10 @@ async function main() {
               completedSpecs: [],
               pendingQaSpecs: [],
               qaFixRound: 0,
+              deliveryFixRound: 0,
+              deliveryVerifyFeedback: "",
+              fidelityFixRound: 0,
+              architectureGaps: [],
               appRoot,
               filesWritten: [],
               fidelityWarnings: [],

@@ -10,10 +10,20 @@ export type HealthcheckResult = {
 };
 
 let cached: { at: number; result: HealthcheckResult } | null = null;
-const CACHE_MS = 3 * 60_000;
+
+/** Success stays warm longer; failures expire quickly so retries are useful. */
+export const SUCCESS_CACHE_MS = 3 * 60_000;
+export const FAIL_CACHE_MS = 20_000;
+
+const TUNNEL_HINT =
+  "reinicie MCP / verifique túnel 9router (Cloudflare 1016)";
 
 export function clearHealthcheckCache(): void {
   cached = null;
+}
+
+function cacheTtlMs(result: HealthcheckResult): number {
+  return result.ok ? SUCCESS_CACHE_MS : FAIL_CACHE_MS;
 }
 
 export async function healthcheckNineRouter(
@@ -22,7 +32,7 @@ export async function healthcheckNineRouter(
 ): Promise<HealthcheckResult> {
   const timeoutMs = opts?.timeoutMs ?? 5_000;
   const now = Date.now();
-  if (!opts?.force && cached && now - cached.at < CACHE_MS) {
+  if (!opts?.force && cached && now - cached.at < cacheTtlMs(cached.result)) {
     return { ...cached.result, message: `${cached.result.message} (cached)` };
   }
 
@@ -31,7 +41,7 @@ export async function healthcheckNineRouter(
     const result: HealthcheckResult = {
       ok: false,
       ms: 0,
-      message: "NINEROUTER_BASE not set",
+      message: `NINEROUTER_BASE not set — ${TUNNEL_HINT}`,
     };
     return result;
   }
@@ -62,7 +72,7 @@ export async function healthcheckNineRouter(
         ok: false,
         ms,
         status: res.status,
-        message: `9router tunnel/DNS down (Cloudflare ${res.status}/1016) in ${ms}ms`,
+        message: `9router tunnel/DNS down (Cloudflare ${res.status}/1016) in ${ms}ms — ${TUNNEL_HINT}`,
       };
       cached = { at: now, result };
       return result;
@@ -73,7 +83,7 @@ export async function healthcheckNineRouter(
         ok: false,
         ms,
         status: res.status,
-        message: `9router unhealthy HTTP ${res.status} in ${ms}ms`,
+        message: `9router unhealthy HTTP ${res.status} in ${ms}ms — ${TUNNEL_HINT}`,
       };
       cached = { at: now, result };
       return result;
@@ -93,7 +103,7 @@ export async function healthcheckNineRouter(
     const result: HealthcheckResult = {
       ok: false,
       ms,
-      message: `9router healthcheck failed in ${ms}ms: ${msg}`,
+      message: `9router healthcheck failed in ${ms}ms: ${msg} — ${TUNNEL_HINT}`,
     };
     cached = { at: now, result };
     return result;

@@ -31,7 +31,6 @@ import {
   buildSmoke,
   ensureAppScaffold,
   ensureVitestTestScript,
-  markProjectSetupDone,
   npmInstall,
   runBootstrapGate,
   runCanonicalTests,
@@ -43,13 +42,26 @@ import {
   createMetrics,
   getMetrics,
   metricsSnapshot,
+  recordDeliveryVerifyFail,
+  recordLlmEmpty,
   recordNoFileSections,
   recordRetry,
+  recordSpecsMarkedWithoutFiles,
   recordStageTiming,
   recordToolCallMalformed,
   setBatchSize,
   setErrorClass,
 } from "./metrics.js";
+import {
+  MAX_DELIVERY_FIX_ROUNDS,
+  assertFilesToTouchClean,
+  findArchitectureCoverageGaps,
+  findPhantomDoneSlugs,
+  formatVerifyFeedback,
+  loadSpecBody,
+  unmarkTodoSlugs,
+  verifyDelivery,
+} from "./verify-delivery.js";
 import {
   healthcheckNineRouter,
   shouldHealthcheckForWorkflow,
@@ -82,16 +94,17 @@ import {
   diagnoseWorkspace,
   ensureGitignoreIgnoresZteam,
   ensureZteamBootstrapRoots,
+  configGateSatisfied,
   envDefaultsTeamConfig,
-  hasAnyTeamConfig,
   loadTeamConfig,
   needsConfigPayload,
+  MODEL_QUESTIONS,
   SETUP_QUESTIONS,
   writeTeamConfig,
   type ResolvedTeamConfig,
   type TeamRole,
 } from "./zteam-config.js";
-import { pickSpecBatch } from "./spec-batch.js";
+import { pickSpecBatch, resolveSeMaxBatch } from "./spec-batch.js";
 import {
   archNotify,
   architectureSnapshot,
@@ -324,8 +337,27 @@ async function pathExists(abs: string): Promise<boolean> {
 
 async function writeDoc(appRoot: string, relPath: string, content: string): Promise<void> {
   const abs = join(appRoot, relPath);
+  const workspace = getWorkspaceRoot();
+  assertPathInsideWorkspace(workspace, appRoot);
+  assertPathInsideWorkspace(workspace, abs);
   await mkdir(dirname(abs), { recursive: true });
   await writeFile(abs, content, "utf8");
+}
+
+/** Attach failureKind / resumeHint for classified pipeline aborts. */
+function classifiedError(
+  message: string,
+  failureKind: string,
+  resumeHint?: string
+): Error {
+  const err = new Error(message);
+  (err as Error & { failureKind?: string; resumeHint?: string }).failureKind =
+    failureKind;
+  if (resumeHint) {
+    (err as Error & { resumeHint?: string }).resumeHint = resumeHint;
+  }
+  setErrorClass(failureKind);
+  return err;
 }
 
 async function readDoc(appRoot: string, relPath: string): Promise<string> {
@@ -385,6 +417,8 @@ export class ProgressSession {
   sendNotification?: McpProgressSend;
   progressToken?: string | number;
   traceId?: string;
+  /** When false (MCP stdio default), never write progress to console — avoids JSON-RPC corruption. */
+  consoleEnabled = false;
 
   /** Stop progress notifications (P1-2). Safe to call multiple times. */
   close(): void {
@@ -462,9 +496,12 @@ export class ProgressSession {
     const line = `[${stage}] ${kind}: ${message}${tid}`;
     this.lines.push(line);
     const level = progressKindToLevel(kind);
-    if (level === "error") console.error(line);
-    else if (level === "warning") console.warn(line);
-    else console.info(line);
+    // MCP stdio: never print to stdout/stderr (breaks JSON-RPC). CLI sets consoleEnabled.
+    if (this.consoleEnabled) {
+      if (level === "error") console.error(line);
+      else if (level === "warning") console.warn(line);
+      else console.info(line);
+    }
     void this.forward(line, level, kind);
     return line;
   }
@@ -543,12 +580,17 @@ export function createProgressSession(opts?: {
   onStatus?: ProgressSink;
   sendNotification?: McpProgressSend;
   progressToken?: string | number;
+  /** Default false (MCP-safe). Set true for CLI `run-pipeline`. */
+  consoleEnabled?: boolean;
 }): ProgressSession {
   const session = new ProgressSession();
   if (opts?.onStatus) session.onStatus = opts.onStatus;
   if (opts?.sendNotification) session.sendNotification = opts.sendNotification;
   if (opts?.progressToken !== undefined) {
     session.progressToken = opts.progressToken;
+  }
+  if (opts?.consoleEnabled !== undefined) {
+    session.consoleEnabled = opts.consoleEnabled;
   }
   return session;
 }
@@ -1098,43 +1140,31 @@ function assertParsedTechSummaryAndBody(text: string, stage: string): void {
 
 function assertParsedTodoAndSpecs(text: string, stage: string): void {
   assertUsableLlmText(text, stage);
-  if (!parseTodoAndSpecs(text)) {
+  const parsed = parseTodoAndSpecs(text);
+  if (!parsed) {
     throw new LlmContentError(
       stage,
       "parse_failed",
       "expected ===TODO=== and at least one ===SPEC: slug==="
     );
   }
-}
-
-function implementCoreStub(): {
-  todo: string;
-  specs: { slug: string; content: string }[];
-} {
-  return {
-    todo: "- [ ] implement-core: Implement core deliverable from requirements\n",
-    specs: [
-      {
-        slug: "implement-core",
-        content: [
-          "# implement-core",
-          "",
-          "## Goal",
-          "Implement the core deliverable described in requirements and technologies.",
-          "",
-          "## Acceptance criteria",
-          "- Primary deliverable exists under the project root",
-          "- Matches stack and folder layout in technologies.md",
-          "",
-          "## Files to touch",
-          "- As defined in technologies.md",
-          "",
-          "## Out of scope",
-          "- Unrelated refactors",
-        ].join("\n"),
-      },
-    ],
-  };
+  const todoSlugs = parseTodoChecklist(parsed.todo).map((t) => t.slug);
+  if (todoSlugs.length === 0) {
+    throw new LlmContentError(
+      stage,
+      "parse_failed",
+      "===TODO=== has no valid checklist lines (- [ ] slug: Title)"
+    );
+  }
+  const specSlugs = new Set(parsed.specs.map((s) => s.slug));
+  const missing = todoSlugs.filter((s) => !specSlugs.has(s));
+  if (missing.length > 0) {
+    throw new LlmContentError(
+      stage,
+      "parse_failed",
+      `todo slugs missing ===SPEC=== blocks: ${missing.join(", ")}`
+    );
+  }
 }
 
 /** True for transient network / HTTP failures (9router handles model failover). */
@@ -1193,6 +1223,10 @@ if (!NINEROUTER_KEY) {
 const MAX_QA_FIX_ROUNDS = parseMaxQaFixRounds();
 const MAX_BOOTSTRAP_FIX_ROUNDS = parseMaxTokens(
   process.env.MAX_BOOTSTRAP_FIX_ROUNDS,
+  1
+);
+const MAX_FIDELITY_FIX_ROUNDS = parseMaxTokens(
+  process.env.MAX_FIDELITY_FIX_ROUNDS,
   1
 );
 const LLM_LATENCY_FALLBACK_MS = parseMaxTokens(
@@ -1419,9 +1453,11 @@ async function invokeWithRetry(
           progress.emit(
             opts.stage,
             "retry",
-            "Trying model 2/N (local fallback after contract failure)"
+            "Trying model 2/N (local fallback after empty/no_file_sections)"
           );
           recordRetry("model_fallback");
+          // Immediate retry with fallback — do not burn a delay round
+          continue;
         }
       }
       const retryable = isRetryableError(err);
@@ -1583,6 +1619,15 @@ const OrchestratorState = Annotation.Root({
   qaFailureLog: Annotation<string>(),
   qaFixRound: Annotation<number>(),
   bootstrapFixRound: Annotation<number>(),
+  /** SE deliver→verify→redo rounds (mirrors qaFixRound). */
+  deliveryFixRound: Annotation<number>(),
+  /** Structured VERIFY FAIL feedback injected into next SE prompt. */
+  deliveryVerifyFeedback: Annotation<string>(),
+  fidelityFixRound: Annotation<number>(),
+  architectureGaps: Annotation<string[]>({
+    reducer: (_left, right) => right ?? [],
+    default: () => [],
+  }),
   qaFailureClass: Annotation<string>(),
   testsPassed: Annotation<boolean>(),
   traceId: Annotation<string>(),
@@ -1615,6 +1660,25 @@ function appRootOf(state: OrchestratorStateType): string {
   return appRoot;
 }
 
+/**
+ * Whether bootstrap should overwrite requirements.md with the stub.
+ * Preserves real ## sections unless ZTEAM_FORCE_BOOTSTRAP=1.
+ */
+export function shouldWriteRequirementsStub(
+  existing: string | null | undefined,
+  force =
+    process.env.ZTEAM_FORCE_BOOTSTRAP === "1" ||
+    process.env.ZTEAM_FORCE_BOOTSTRAP === "true"
+): boolean {
+  if (force) return true;
+  if (!existing || !String(existing).trim()) return true;
+  if (String(existing).startsWith("[Document missing:")) return true;
+  const text = String(existing);
+  const hasSections = /^##\s+/m.test(text);
+  if (hasSections && text.trim().length >= 80) return false;
+  return true;
+}
+
 /** Heuristic fidelity checks: userIdea claims vs requirements text. */
 export function findFidelityViolations(
   userIdea: string,
@@ -1644,11 +1708,37 @@ export function findFidelityViolations(
     /\b(hooks?\s+de\s+som|sound\s+hooks?|no\s+audio|sem\s+som|document(?:ed)?\s+hooks)\b/i.test(
       idea
     ) &&
-    /\b(sprite\s+sheet|web\s*audio\s+api|full\s+soundtrack)\b/i.test(req) &&
+    /\b(sprite\s+sheet|web\s+audio\s+api|full\s+soundtrack)\b/i.test(req) &&
     !/\bhook/i.test(req)
   ) {
     violations.push("userIdea wants sound hooks only; requirements invent fuller audio");
   }
+
+  // Named API in idea must appear in requirements (TCGdex vs pokemontcg drift)
+  const apiTokens =
+    userIdea.match(
+      /\b(TCGdex|pokemontcg(?:\.io)?|PokeAPI|Stripe|OpenAI)[a-zA-Z0-9.-]*/gi
+    ) || [];
+  for (const token of apiTokens) {
+    if (!req.includes(token.toLowerCase())) {
+      violations.push(
+        `userIdea names API/product '${token}' but requirements omit it`
+      );
+    }
+  }
+
+  // Stub / empty requirements — stub line alone fails; stub + real ## sections is OK
+  // (bootstrap writes the italic placeholder; SA appends sections without removing it)
+  const hasSections = /^##\s+/m.test(requirements);
+  if (
+    !requirements.trim() ||
+    requirements.trim().length < 80 ||
+    (/Sections are filled one pré-requirement/i.test(requirements) &&
+      !hasSections)
+  ) {
+    violations.push("requirements empty or still bootstrap stub");
+  }
+
   return violations;
 }
 
@@ -1785,18 +1875,13 @@ async function orchestratorBootstrapReadmeNode(
       ) {
         throw err;
       }
-      notify(
-        "orchestratorBootstrapReadme",
-        `Fallback charter after retries (${contentKindOf(err)}): ${errorText(err)}`
+      recordLlmEmpty();
+      const kind = contentKindOf(err);
+      throw classifiedError(
+        `[orchestratorBootstrapReadme] llm_empty after retries (${kind}): ${errorText(err)}`,
+        "llm_empty",
+        `workflow=full — charter failed (empty LLM); retry after model/tunnel healthy`
       );
-      resume = clampResumeWords(
-        `This project implements: ${state.userIdea}`.trim()
-      );
-      preRequirements = [
-        "Core deliverable described in the user idea",
-        "Essential user-facing behaviors from the request",
-        "Documented constraints stated by the user",
-      ];
     }
 
     await writeDoc(
@@ -1804,11 +1889,22 @@ async function orchestratorBootstrapReadmeNode(
       README_PATH,
       buildBootstrapReadme(resume, preRequirements)
     );
-    await writeDoc(
-      appRoot,
-      REQUIREMENTS_PATH,
-      "# Requirements\n\n_Sections are filled one pré-requirement at a time._\n"
-    );
+    const existingReqs = await readDoc(appRoot, REQUIREMENTS_PATH);
+    const reqBody = existingReqs.startsWith("[Document missing:")
+      ? ""
+      : existingReqs;
+    if (shouldWriteRequirementsStub(reqBody)) {
+      await writeDoc(
+        appRoot,
+        REQUIREMENTS_PATH,
+        "# Requirements\n\n_Sections are filled one pré-requirement at a time._\n"
+      );
+    } else {
+      notify(
+        "orchestratorBootstrapReadme",
+        "preserved existing requirements.md (has ## sections; set ZTEAM_FORCE_BOOTSTRAP=1 to wipe)"
+      );
+    }
 
     const preview = preRequirements
       .slice(0, 5)
@@ -1952,22 +2048,12 @@ async function systemArchitectReqItemNode(
         ) {
           throw err;
         }
-        notify(
-          "systemArchitectReqItem",
-          `Fallback section after retries (${contentKindOf(err)})`
+        recordLlmEmpty();
+        throw classifiedError(
+          `[systemArchitectReqItem] llm_empty after retries (${contentKindOf(err)})`,
+          "llm_empty",
+          `workflow=resume — pré-req ${index} failed empty LLM`
         );
-        section = [
-          `## ${index}. ${item.slice(0, 80)}`,
-          "",
-          "### Goal",
-          item,
-          "",
-          "### Functional requirements",
-          `- Deliver behavior described in pré-requirement ${index}, consistent with the user idea.`,
-          "",
-          "### Acceptance criteria",
-          "- Matches the user idea and Resume; no contradictory rules.",
-        ].join("\n");
       }
 
       if (!section.startsWith("##")) {
@@ -2068,7 +2154,17 @@ async function orchestratorCleanReadmeNode(
     const resume =
       state.resume?.trim() ||
       clampResumeWords(`This project implements: ${state.userIdea}`);
-    const reqs = await readDoc(appRoot, REQUIREMENTS_PATH);
+    let reqs = await readDoc(appRoot, REQUIREMENTS_PATH);
+    // Strip bootstrap placeholder so fidelityCritic does not hard-fail after SA filled sections
+    if (
+      !reqs.startsWith("[Document missing:") &&
+      /Sections are filled one pré-requirement/i.test(reqs)
+    ) {
+      reqs = reqs
+        .replace(/\n*_Sections are filled one pré-requirement at a time\._\n*/gi, "\n")
+        .replace(/\n{3,}/g, "\n\n");
+      await writeDoc(appRoot, REQUIREMENTS_PATH, reqs.trimEnd() + "\n");
+    }
 
     await writeDoc(appRoot, README_PATH, buildCleanReadme(resume));
 
@@ -2162,53 +2258,12 @@ async function technologyArchitectNode(
       ) {
         throw err;
       }
-      const last =
-        err instanceof LlmRetriesExhaustedError ? err.lastContent : "";
-      notify(
-        "technologyArchitect",
-        `Fallback after content retries failed (${contentKindOf(err)}): ${errorText(err)}`
+      recordLlmEmpty();
+      throw classifiedError(
+        `[technologyArchitect] llm_empty after retries (${contentKindOf(err)}): ${errorText(err)}`,
+        "llm_empty",
+        `workflow=docs or resume — TA failed empty LLM; do not use TBD stub`
       );
-      if (last.trim() && parseTechSummaryAndBody(last)) {
-        raw = last;
-      } else if (last.trim()) {
-        raw = [
-          "===SUMMARY===",
-          "Technology decisions (stack, folder layout, standards) are documented below.",
-          "===TECH===",
-          stripOuterMarkdownFence(last),
-        ].join("\n");
-      } else {
-        raw = [
-          "===SUMMARY===",
-          "Technology decisions (stack, folder layout, standards) are documented below.",
-          "===TECH===",
-          [
-            "## Technology decisions",
-            "",
-            "- TBD after model recovery",
-            "",
-            "## Folder architecture",
-            "",
-            "- `.docs/` for requirements, technologies, todo, specs",
-            "",
-            "## Stacks",
-            "",
-            "- TBD",
-            "",
-            "## Schemas / API exposure",
-            "",
-            "- TBD",
-            "",
-            "## Security",
-            "",
-            "- TBD",
-            "",
-            "## Development standards",
-            "",
-            "- Clean code, semantic naming, human-readable code",
-          ].join("\n"),
-        ].join("\n");
-      }
     }
 
     const parsed = parseTechSummaryAndBody(raw);
@@ -2337,17 +2392,25 @@ async function systemArchitectSpecsNode(
       ) {
         throw err;
       }
-      notify(
-        "systemArchitectSpecs",
-        `Using implement-core stub after content retries failed (${contentKindOf(err)}): ${errorText(err)}`
+      recordLlmEmpty();
+      throw classifiedError(
+        `[systemArchitectSpecs] llm_empty after retries (${contentKindOf(err)}): ${errorText(err)}`,
+        "llm_empty",
+        `workflow=feature — specs failed; refuse implement-core stub`
       );
-      const stub = implementCoreStub();
-      todoMd = stub.todo;
-      specs = stub.specs;
     }
 
     await writeDoc(appRoot, TODO_PATH, todoMd.endsWith("\n") ? todoMd : todoMd + "\n");
     for (const spec of specs) {
+      try {
+        assertFilesToTouchClean(spec.content, spec.slug);
+      } catch (err) {
+        throw classifiedError(
+          `[systemArchitectSpecs] ${errorText(err)}`,
+          "spec_incomplete",
+          `workflow=feature — fix Files to touch in ${spec.slug}`
+        );
+      }
       await writeDoc(appRoot, specPath(spec.slug), spec.content + "\n");
     }
 
@@ -2356,6 +2419,20 @@ async function systemArchitectSpecsNode(
       .map((t) => t.slug);
     const pendingSpecs =
       pendingFromTodo.length > 0 ? pendingFromTodo : specs.map((s) => s.slug);
+
+    const missingOnDisk: string[] = [];
+    for (const slug of pendingSpecs) {
+      if (!(await pathExists(join(appRoot, specPath(slug))))) {
+        missingOnDisk.push(slug);
+      }
+    }
+    if (missingOnDisk.length > 0) {
+      throw classifiedError(
+        `[systemArchitectSpecs] missing .spec.md on disk for: ${missingOnDisk.join(", ")}`,
+        "spec_incomplete",
+        `workflow=feature — regenerate specs for ${missingOnDisk.join(",")}`
+      );
+    }
 
     getProgress().setPending({
       pendingSpecs,
@@ -2409,7 +2486,7 @@ async function scaffoldPrepareNode(
     async () => {
       const appRoot = appRootOf(state);
       const scaffold = await ensureAppScaffold(appRoot);
-      if (scaffold.applied) {
+      if (scaffold.applied || scaffold.augmented) {
         const install = await npmInstall(appRoot);
         if (!install.ok) {
           await implNotify(
@@ -2417,13 +2494,19 @@ async function scaffoldPrepareNode(
             appRoot,
             "scaffoldPrepare",
             `scaffold npm install FAILED`,
-            { phase: "scaffold", scaffold: { applied: true, files: scaffold.files } }
+            {
+              phase: "scaffold",
+              scaffold: {
+                applied: scaffold.applied,
+                files: scaffold.files,
+              },
+            }
           );
-          const err = new Error(
-            `[scaffoldPrepare] npm install failed: ${install.log.slice(0, 500)}`
+          throw classifiedError(
+            `[scaffoldPrepare] npm install failed: ${install.log.slice(0, 500)}`,
+            "bootstrap",
+            `workflow=resume — fix bootstrap then resume`
           );
-          (err as Error & { failureKind?: string }).failureKind = "bootstrap";
-          throw err;
         }
         const build = await buildSmoke(appRoot);
         if (!build.ok) {
@@ -2432,15 +2515,18 @@ async function scaffoldPrepareNode(
             `build smoke warning: ${build.log.slice(0, 300)}`
           );
         }
-        await markProjectSetupDone(appRoot);
+        // Do NOT mark project-setup [x] here — SE + verifyDelivery own DoD
+        await ensureTestScript(appRoot, "scaffoldPrepare");
         await implNotify(
           (s, m) => notify(s, m),
           appRoot,
           "scaffoldPrepare",
-          `scaffold applied (${scaffold.files.length} files) + npm install OK`,
+          scaffold.applied
+            ? `scaffold applied (${scaffold.files.length} files) + npm install OK`
+            : `scaffold augmented (${scaffold.files.length} missing files) + npm install OK`,
           {
             phase: "scaffold",
-            scaffold: { applied: true, files: scaffold.files },
+            scaffold: { applied: scaffold.applied, files: scaffold.files },
             lastWrite: {
               count: scaffold.files.length,
               files: scaffold.files,
@@ -2450,14 +2536,14 @@ async function scaffoldPrepareNode(
         return {
           appRoot,
           filesWritten: scaffold.files,
-          completedSpecs: ["project-setup"],
+          completedSpecs: [],
         };
       }
       await implNotify(
         (s, m) => notify(s, m),
         appRoot,
         "scaffoldPrepare",
-        "scaffold skipped — package.json already present",
+        "scaffold skipped — package.json + shell files already present",
         {
           phase: "scaffold",
           scaffold: { applied: false, files: [] },
@@ -2500,8 +2586,11 @@ async function bootstrapFixNode(
         }
       );
       const scaffold = await ensureAppScaffold(appRoot);
-      if (scaffold.applied) {
-        notify("bootstrapFix", "scaffold applied");
+      if (scaffold.applied || scaffold.augmented) {
+        notify(
+          "bootstrapFix",
+          scaffold.applied ? "scaffold applied" : "scaffold augmented"
+        );
       }
       await ensureTestScript(appRoot, "bootstrapFix");
       const install = await npmInstall(appRoot);
@@ -2542,9 +2631,26 @@ async function softwareEngineerNode(
     }
 
     let workPending = pending;
+    // project-setup: if scaffold already satisfies DoD on disk, mark done without LLM
     if (workPending[0] === "project-setup") {
-      if (await pathExists(join(appRoot, "package.json"))) {
+      const setupBody = await loadSpecBody(appRoot, "project-setup");
+      const smoke = await runTscSmoke(appRoot, "softwareEngineer");
+      const preVerify = await verifyDelivery({
+        stage: "softwareEngineer",
+        slugs: ["project-setup"],
+        filesWritten: [],
+        userIdea: state.userIdea || "",
+        appRoot,
+        specBodies: { "project-setup": setupBody },
+        tscOk: smoke.ok,
+        tscLog: smoke.log,
+      });
+      if (preVerify.ok) {
         await markTodoDone(appRoot, "project-setup");
+        notify(
+          "softwareEngineer",
+          "project-setup already satisfies DoD on disk — marked [x]"
+        );
         workPending = workPending.slice(1);
         if (workPending.length === 0) {
           return {
@@ -2556,7 +2662,11 @@ async function softwareEngineerNode(
       }
     }
 
-    const batch = await pickSpecBatch(appRoot, workPending, 3);
+    const batch = await pickSpecBatch(
+      appRoot,
+      workPending,
+      resolveSeMaxBatch(state.workflow)
+    );
     setBatchSize(batch.length);
     const slug = batch[0];
     const alreadyDone = (state.completedSpecs ?? []).length;
@@ -2600,6 +2710,7 @@ async function softwareEngineerNode(
 
     const se = roleLlm("softwareEngineer");
     const llm = makeLLM(se.model, se.maxTokens);
+    const verifyFeedback = (state.deliveryVerifyFeedback || "").trim();
     let rawContent = "";
     try {
       const res = await invokeWithRetry(
@@ -2613,6 +2724,7 @@ async function softwareEngineerNode(
               "Prefer calling write_file(path, content) for each file.",
               "Fallback: ===FILE: relative/path=== then contents.",
               "Paths relative to project root. No markdown fences. Use .tsx when file has JSX.",
+              "Cover EVERY file listed under Files to touch in each spec.",
             ].join(" ")
           ),
           new HumanMessage(
@@ -2620,6 +2732,11 @@ async function softwareEngineerNode(
               `## Current spec batch (${batch.join(", ")})`,
               ...specBodies,
               "",
+              verifyFeedback
+                ? ["## Previous VERIFY FAIL — fix these gaps", verifyFeedback, ""].join(
+                    "\n"
+                  )
+                : "",
               "## README.md",
               readme,
               "",
@@ -2631,7 +2748,9 @@ async function softwareEngineerNode(
               "",
               "## .docs/technologies.md",
               technologies,
-            ].join("\n")
+            ]
+              .filter(Boolean)
+              .join("\n")
           ),
         ],
         {
@@ -2647,6 +2766,9 @@ async function softwareEngineerNode(
       rawContent = String(res.content ?? "");
     } catch (err) {
       const kind = contentKindOf(err);
+      if (kind === "empty" || kind === "no_file_sections") {
+        recordLlmEmpty();
+      }
       const oversized =
         !specBody.startsWith("[Document missing:") &&
         specBody.length > SPEC_SPLIT_CHARS;
@@ -2667,18 +2789,51 @@ async function softwareEngineerNode(
           resumeHint: `workflow=resume after implementing split specs ${split.pending.join(",")}`,
         };
       }
+      if (err instanceof LlmRetriesExhaustedError || err instanceof LlmContentError) {
+        throw classifiedError(
+          `[softwareEngineer] llm_empty (${kind}): ${errorText(err)}`,
+          "llm_empty",
+          `workflow=resume projectRoot=${projectRoot} (empty LLM on ${batch.join(",")})`
+        );
+      }
       throw err;
     }
 
     const written = await writeParsedFiles(appRoot, rawContent, projectRoot);
     const smoke = await runTscSmoke(appRoot, "softwareEngineer");
-    if (!smoke.ok) {
-      const hint = `workflow=resume projectRoot=${projectRoot} (tsc failed on '${slug}')`;
+
+    const specBodiesMap: Record<string, string> = {};
+    for (const s of batch) {
+      specBodiesMap[s] = await loadSpecBody(appRoot, s);
+    }
+
+    const verified = await verifyDelivery({
+      stage: "softwareEngineer",
+      slugs: batch,
+      filesWritten: written.filesWritten,
+      userIdea: state.userIdea || "",
+      appRoot,
+      specBodies: specBodiesMap,
+      tscOk: smoke.ok,
+      tscLog: smoke.log,
+    });
+
+    if (!verified.ok) {
+      recordDeliveryVerifyFail();
+      if (verified.failureKind === "spec_incomplete") {
+        recordSpecsMarkedWithoutFiles(verified.reopenSlugs.length || batch.length);
+      }
+      if (verified.failureKind === "llm_empty") {
+        recordLlmEmpty();
+      }
+      const feedback = formatVerifyFeedback(verified);
+      const round = (state.deliveryFixRound ?? 0) + 1;
+      const failKind = verified.failureKind || "spec_incomplete";
       await implNotify(
         (s, m) => notify(s, m),
         appRoot,
         "softwareEngineer",
-        `tsc smoke FAILED on '${slug}' — not marking todo done`,
+        `VERIFY FAIL (${failKind}) round ${round}/${MAX_DELIVERY_FIX_ROUNDS}: ${verified.reasons.slice(0, 2).join("; ")}`,
         {
           phase: "implement",
           specs: { current: slug, batch },
@@ -2688,14 +2843,28 @@ async function softwareEngineerNode(
           },
         }
       );
-      const err = new Error(
-        `[softwareEngineer] tsc smoke failed for '${slug}': ${smoke.log.slice(0, 500)}. Resume with ${hint}`
-      );
-      (err as Error & { failureKind?: string; resumeHint?: string }).failureKind =
-        "tsc_smoke";
-      (err as Error & { failureKind?: string; resumeHint?: string }).resumeHint =
-        hint;
-      throw err;
+
+      if (round >= MAX_DELIVERY_FIX_ROUNDS) {
+        throw classifiedError(
+          `[softwareEngineer] delivery verify exhausted (${failKind}): ${feedback}`,
+          failKind,
+          `workflow=resume projectRoot=${projectRoot} reopen=${verified.reopenSlugs.join(",")}`
+        );
+      }
+
+      // A4: redo — keep pending, do NOT markTodoDone
+      return {
+        appRoot,
+        code: rawContent,
+        filesWritten: written.filesWritten,
+        currentSpec: slug,
+        pendingSpecs: workPending,
+        completedSpecs: [],
+        deliveryFixRound: round,
+        deliveryVerifyFeedback: feedback,
+        failureKind: failKind,
+        resumeHint: `delivery redo ${round}/${MAX_DELIVERY_FIX_ROUNDS}`,
+      };
     }
 
     for (const s of batch) {
@@ -2739,6 +2908,8 @@ async function softwareEngineerNode(
       currentSpec: slug,
       pendingSpecs: remaining,
       completedSpecs: batch,
+      deliveryFixRound: 0,
+      deliveryVerifyFeedback: "",
       failureKind: "",
       resumeHint: "",
     };
@@ -3085,22 +3256,49 @@ async function orchestratorFinalizeNode(
     const appRoot = appRootOf(state);
     let readme = await readDoc(appRoot, README_PATH);
 
+    // B4: pre-finalize checklist vs userIdea (docs + full)
+    if (!(state.workflow === "docs" || state.docsOnly)) {
+      const techDoc = await readDoc(appRoot, TECHNOLOGIES_PATH);
+      const techText = techDoc.startsWith("[Document missing:") ? "" : techDoc;
+      const gaps = findArchitectureCoverageGaps(
+        state.userIdea || "",
+        techText,
+        await listSpecSlugs(appRoot)
+      );
+      const helloOnly =
+        /hello\s*world/i.test(readme) &&
+        /\b(search|collection|favorite|api)\b/i.test(state.userIdea || "") &&
+        !(await pathExists(join(appRoot, "src")));
+      if (gaps.length > 0 && helloOnly) {
+        throw classifiedError(
+          `[orchestratorFinalize] fidelity: generic Hello app vs userIdea gaps: ${gaps.join("; ")}`,
+          "fidelity",
+          "workflow=resume — implement missing features"
+        );
+      }
+    }
+
     const statusLines =
       state.workflow === "docs" || state.docsOnly
-      ? [
-          `Pipeline mode: **docs** (workflow=${state.workflow || "docs"}).`,
-          "Implementation and QA were skipped.",
-        ]
-      : [
-          `Pipeline mode: **${state.workflow || "full"}**.`,
-          state.testsPassed
-            ? "All automated tests passed."
-            : "Pipeline finished (see notifications for details).",
-        ];
+        ? [
+            `Pipeline mode: **docs** (workflow=${state.workflow || "docs"}).`,
+            "Implementation and QA were skipped.",
+          ]
+        : [
+            `Pipeline mode: **${state.workflow || "full"}**.`,
+            state.testsPassed
+              ? "All automated tests passed."
+              : "Pipeline finished (see notifications for details).",
+          ];
 
     if ((state.fidelityWarnings ?? []).length > 0) {
       statusLines.push(
         `Fidelity warnings: ${(state.fidelityWarnings ?? []).join("; ")}`
+      );
+    }
+    if ((state.architectureGaps ?? []).length > 0) {
+      statusLines.push(
+        `Architecture gaps: ${(state.architectureGaps ?? []).join("; ")}`
       );
     }
 
@@ -3119,15 +3317,17 @@ async function orchestratorFinalizeNode(
         : "");
 
     await writePipelineResult(appRoot, {
-      ok: true,
+      ok: !(state.failureKind === "fidelity" || state.failureKind === "llm_empty"),
       workflow: state.workflow || "full",
       appRoot,
       projectRoot: state.projectRoot || ".",
       filesWritten: state.filesWritten ?? [],
       fidelityWarnings: state.fidelityWarnings ?? [],
+      architectureGaps: state.architectureGaps ?? [],
       failureKind: state.failureKind || null,
       resumeHint: resumeHint || null,
       testsPassed: state.testsPassed ?? null,
+      deliveryFixRound: state.deliveryFixRound ?? 0,
     });
 
     if (state.workflow === "docs" || state.docsOnly) {
@@ -3159,7 +3359,7 @@ async function fidelityCriticRequirementsNode(
     const reqText = requirements.startsWith("[Document missing:")
       ? ""
       : requirements;
-    let violations = findFidelityViolations(state.userIdea || "", reqText);
+    const violations = findFidelityViolations(state.userIdea || "", reqText);
 
     if (violations.length === 0) {
       await archNotify(
@@ -3172,25 +3372,32 @@ async function fidelityCriticRequirementsNode(
           fidelity: { ok: true, warnings: [] },
         }
       );
-      return { appRoot, fidelityWarnings: [] };
+      return {
+        appRoot,
+        fidelityWarnings: [],
+        fidelityFixRound: 0,
+        failureKind: "",
+      };
     }
 
+    const round = (state.fidelityFixRound ?? 0) + 1;
     await archNotify(
       (s, m) => notify(s, m),
       appRoot,
       "fidelityCriticRequirements",
-      `fidelity WARN: ${violations.slice(0, 3).join("; ")}${
+      `fidelity FAIL: ${violations.slice(0, 3).join("; ")}${
         violations.length > 3 ? ` (+${violations.length - 3})` : ""
-      } — appending Constraints`,
+      }`,
       {
         phase: "fidelity",
         fidelity: { ok: false, warnings: violations },
       }
     );
 
+    // Append Constraints so a redo SA can see gaps (but do NOT continue to TA as PASS)
     const constraints = [
       "",
-      "## Constraints (userIdea — fidelity)",
+      "## Constraints (userIdea — fidelity FAIL)",
       "",
       "The following must not be contradicted:",
       "",
@@ -3207,21 +3414,141 @@ async function fidelityCriticRequirementsNode(
       (reqText.trimEnd() + "\n" + constraints).trimEnd() + "\n"
     );
 
-    const after = await readDoc(appRoot, REQUIREMENTS_PATH);
-    violations = findFidelityViolations(state.userIdea || "", after);
-    if (violations.length > 0) {
-      notify(
-        "fidelityCriticRequirements",
-        `Still warning after Constraints append: ${violations.join("; ")}`
+    if (round > MAX_FIDELITY_FIX_ROUNDS) {
+      throw classifiedError(
+        `[fidelityCriticRequirements] fidelity FAIL after ${round} round(s): ${violations.join("; ")}`,
+        "fidelity",
+        "workflow=docs — fix requirements to match userIdea then resume"
+      );
+    }
+
+    // Signal conditional edge to re-open requirements expansion
+    return {
+      appRoot,
+      requirements: await readDoc(appRoot, REQUIREMENTS_PATH),
+      fidelityWarnings: violations,
+      fidelityFixRound: round,
+      failureKind: "fidelity",
+      pendingPreReqs: [
+        `Correct fidelity gaps: ${violations.slice(0, 3).join("; ")}`,
+      ],
+      preReqTotal: 1,
+      currentPreReq: `Correct fidelity gaps: ${violations.slice(0, 3).join("; ")}`,
+      resumeHint: `fidelity redo ${round}/${MAX_FIDELITY_FIX_ROUNDS}`,
+    };
+  });
+}
+
+/** B2: post-TA+specs coverage critic (heuristic, no LLM writer). */
+async function deliveryCriticArchitectureNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("deliveryCriticArchitecture", async () => {
+    const appRoot = appRootOf(state);
+    const tech = await readDoc(appRoot, TECHNOLOGIES_PATH);
+    const techText = tech.startsWith("[Document missing:") ? "" : tech;
+    const slugs =
+      (state.pendingSpecs ?? []).length > 0
+        ? [...(state.pendingSpecs ?? [])]
+        : await listSpecSlugs(appRoot);
+
+    const gaps = findArchitectureCoverageGaps(
+      state.userIdea || "",
+      techText,
+      slugs
+    );
+
+    if (gaps.length === 0) {
+      await archNotify(
+        (s, m) => notify(s, m),
+        appRoot,
+        "deliveryCriticArchitecture",
+        "architecture critic PASS",
+        { phase: "specs" }
+      );
+      return { appRoot, architectureGaps: [], failureKind: "" };
+    }
+
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "deliveryCriticArchitecture",
+      `architecture critic FAIL: ${gaps.slice(0, 3).join("; ")}`,
+      { phase: "specs" }
+    );
+
+    // One redo of TA: surface gaps; if already failed once, hard fail
+    if ((state.architectureGaps ?? []).length > 0) {
+      throw classifiedError(
+        `[deliveryCriticArchitecture] gaps remain: ${gaps.join("; ")}`,
+        "fidelity",
+        "workflow=docs — align technologies/specs with userIdea"
       );
     }
 
     return {
       appRoot,
-      requirements: after,
-      fidelityWarnings: violations.length > 0 ? violations : [
-        "Constraints section appended after fidelity reject",
+      architectureGaps: gaps,
+      failureKind: "fidelity",
+      resumeHint: `architecture gaps: ${gaps.slice(0, 3).join("; ")}`,
+    };
+  });
+}
+
+/** B3: post-batch SE critic — reopen incomplete slugs after gate PASS. */
+async function deliveryCriticDeliveryNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("deliveryCriticDelivery", async () => {
+    const appRoot = appRootOf(state);
+    // Only runs when SE reported no pending; spot-check completed batch files
+    const completed = state.completedSpecs ?? [];
+    const written = state.filesWritten ?? [];
+    if (completed.length === 0) {
+      return { appRoot };
+    }
+
+    const verified = await verifyDelivery({
+      stage: "softwareEngineer",
+      slugs: completed.slice(-3),
+      filesWritten: written,
+      userIdea: state.userIdea || "",
+      appRoot,
+      tscOk: true,
+    });
+
+    if (verified.ok) {
+      notify("deliveryCriticDelivery", "delivery critic PASS");
+      return { appRoot, failureKind: "" };
+    }
+
+    recordDeliveryVerifyFail();
+    const feedback = formatVerifyFeedback(verified);
+    const round = (state.deliveryFixRound ?? 0) + 1;
+    notify(
+      "deliveryCriticDelivery",
+      `delivery critic FAIL — reopening ${verified.reopenSlugs.join(", ")} (round ${round})`
+    );
+
+    if (round >= MAX_DELIVERY_FIX_ROUNDS) {
+      throw classifiedError(
+        `[deliveryCriticDelivery] exhausted: ${feedback}`,
+        verified.failureKind || "spec_incomplete",
+        "workflow=resume — delivery critic reopen budget exhausted"
+      );
+    }
+
+    return {
+      appRoot,
+      pendingSpecs: [
+        ...verified.reopenSlugs,
+        ...(state.pendingSpecs ?? []).filter(
+          (s) => !verified.reopenSlugs.includes(s)
+        ),
       ],
+      deliveryVerifyFeedback: feedback,
+      deliveryFixRound: round,
+      failureKind: verified.failureKind || "spec_incomplete",
     };
   });
 }
@@ -3237,23 +3564,59 @@ async function resumePrepareNode(
       const items = todo.startsWith("[Document missing:")
         ? []
         : parseTodoChecklist(todo);
+
+      // C1: reopen phantom [x] without Files to touch on disk
+      const phantoms = await findPhantomDoneSlugs(appRoot, items);
+      if (phantoms.length > 0) {
+        const updated = await unmarkTodoSlugs(appRoot, phantoms);
+        if (updated) {
+          await writeDoc(appRoot, TODO_PATH, updated);
+          notify(
+            "resumePrepare",
+            `Reopened ${phantoms.length} phantom [x] spec(s): ${phantoms.join(", ")}`
+          );
+        }
+      }
+
+      const todoAfter = phantoms.length > 0
+        ? await readDoc(appRoot, TODO_PATH)
+        : todo;
+      const itemsAfter = todoAfter.startsWith("[Document missing:")
+        ? []
+        : parseTodoChecklist(todoAfter);
+
       const pending: string[] = [];
-      for (const item of items) {
+      const orphans: string[] = [];
+      for (const item of itemsAfter) {
         if (item.done) continue;
         const exists = await pathExists(join(appRoot, specPath(item.slug)));
         if (exists) pending.push(item.slug);
+        else orphans.push(item.slug);
+      }
+
+      if (orphans.length > 0) {
+        notify(
+          "resumePrepare",
+          `Orphan [ ] without .spec.md: ${orphans.join(", ")} — rerun workflow=feature`
+        );
       }
 
       if (pending.length === 0) {
+        const hint =
+          orphans.length > 0
+            ? `missing specs: ${orphans.join(",")} — rerun workflow=feature`
+            : "nothing pending";
         notify(
           "resumePrepare",
-          "No pending [ ] specs with existing .spec.md — nothing to resume"
+          orphans.length > 0
+            ? `No pending [ ] with .spec.md (${orphans.length} orphan slug(s))`
+            : "No pending [ ] specs with existing .spec.md — nothing to resume"
         );
         return {
           appRoot,
           pendingSpecs: [],
           pendingQaSpecs: [],
-          resumeHint: "nothing pending",
+          resumeHint: hint,
         };
       }
 
@@ -3273,7 +3636,9 @@ async function resumePrepareNode(
         currentSpec: pending[0] ?? "",
         completedSpecs: [],
         qaFixRound: 0,
-        todo: todo.startsWith("[Document missing:") ? "" : todo,
+        deliveryFixRound: 0,
+        deliveryVerifyFeedback: "",
+        todo: todoAfter.startsWith("[Document missing:") ? "" : todoAfter,
       };
     },
     { detail: "retomando todos pendentes" }
@@ -3438,7 +3803,27 @@ function routeFromWorkflow(state: OrchestratorStateType): string {
   return WORKFLOW_CATALOG.full.entry;
 }
 
+function routeAfterFidelity(state: OrchestratorStateType): string {
+  if (state.failureKind === "fidelity" && (state.pendingPreReqs ?? []).length > 0) {
+    return "systemArchitectReqItem";
+  }
+  return "technologyArchitect";
+}
+
 function routeAfterSpecs(state: OrchestratorStateType): string {
+  if (state.workflow === "docs" || state.docsOnly) {
+    return "deliveryCriticArchitecture";
+  }
+  return "deliveryCriticArchitecture";
+}
+
+function routeAfterArchitectureCritic(state: OrchestratorStateType): string {
+  if (
+    state.failureKind === "fidelity" &&
+    (state.architectureGaps ?? []).length > 0
+  ) {
+    return "technologyArchitect";
+  }
   if (state.workflow === "docs" || state.docsOnly) {
     return "orchestratorFinalize";
   }
@@ -3446,7 +3831,17 @@ function routeAfterSpecs(state: OrchestratorStateType): string {
 }
 
 function routeAfterSoftwareEngineer(state: OrchestratorStateType): string {
-  return (state.pendingSpecs ?? []).length > 0 ? "softwareEngineer" : "qaEngineer";
+  if ((state.pendingSpecs ?? []).length > 0) {
+    return "softwareEngineer";
+  }
+  return "deliveryCriticDelivery";
+}
+
+function routeAfterDeliveryCritic(state: OrchestratorStateType): string {
+  if ((state.pendingSpecs ?? []).length > 0) {
+    return "softwareEngineer";
+  }
+  return "qaEngineer";
 }
 
 function routeAfterResumePrepare(state: OrchestratorStateType): string {
@@ -3480,9 +3875,11 @@ const fullGraph = new StateGraph(OrchestratorState)
   .addNode("fidelityCriticRequirements", fidelityCriticRequirementsNode)
   .addNode("technologyArchitect", technologyArchitectNode)
   .addNode("systemArchitectSpecs", systemArchitectSpecsNode)
+  .addNode("deliveryCriticArchitecture", deliveryCriticArchitectureNode)
   .addNode("scaffoldPrepare", scaffoldPrepareNode)
   .addNode("bootstrapFix", bootstrapFixNode)
   .addNode("softwareEngineer", softwareEngineerNode)
+  .addNode("deliveryCriticDelivery", deliveryCriticDeliveryNode)
   .addNode("softwareEngineerFix", softwareEngineerFixNode)
   .addNode("qaEngineer", qaEngineerNode)
   .addNode("orchestratorFinalize", orchestratorFinalizeNode)
@@ -3501,12 +3898,23 @@ const fullGraph = new StateGraph(OrchestratorState)
     orchestratorCleanReadme: "orchestratorCleanReadme",
   })
   .addEdge("orchestratorCleanReadme", "fidelityCriticRequirements")
-  .addEdge("fidelityCriticRequirements", "technologyArchitect")
+  .addConditionalEdges("fidelityCriticRequirements", routeAfterFidelity, {
+    systemArchitectReqItem: "systemArchitectReqItem",
+    technologyArchitect: "technologyArchitect",
+  })
   .addEdge("technologyArchitect", "systemArchitectSpecs")
   .addConditionalEdges("systemArchitectSpecs", routeAfterSpecs, {
-    scaffoldPrepare: "scaffoldPrepare",
-    orchestratorFinalize: "orchestratorFinalize",
+    deliveryCriticArchitecture: "deliveryCriticArchitecture",
   })
+  .addConditionalEdges(
+    "deliveryCriticArchitecture",
+    routeAfterArchitectureCritic,
+    {
+      technologyArchitect: "technologyArchitect",
+      scaffoldPrepare: "scaffoldPrepare",
+      orchestratorFinalize: "orchestratorFinalize",
+    }
+  )
   .addEdge("scaffoldPrepare", "softwareEngineer")
   .addEdge("punchPrepare", "softwareEngineer")
   .addEdge("fixPrepare", "softwareEngineerFix")
@@ -3515,6 +3923,10 @@ const fullGraph = new StateGraph(OrchestratorState)
     orchestratorFinalize: "orchestratorFinalize",
   })
   .addConditionalEdges("softwareEngineer", routeAfterSoftwareEngineer, {
+    softwareEngineer: "softwareEngineer",
+    deliveryCriticDelivery: "deliveryCriticDelivery",
+  })
+  .addConditionalEdges("deliveryCriticDelivery", routeAfterDeliveryCritic, {
     softwareEngineer: "softwareEngineer",
     qaEngineer: "qaEngineer",
   })
@@ -3625,7 +4037,7 @@ server.tool(
     const teamConfig = await loadTeamConfig(ws.root, appRoot);
     const workspaceDiag = diagnoseWorkspace(ws.root, ws.source);
 
-    if (!skipConfigGate && !hasAnyTeamConfig(teamConfig)) {
+    if (!skipConfigGate && !configGateSatisfied(teamConfig)) {
       return {
         content: [
           {
@@ -3696,6 +4108,10 @@ server.tool(
                 pendingQaSpecs: [],
                 qaFixRound: 0,
                 bootstrapFixRound: 0,
+                deliveryFixRound: 0,
+                deliveryVerifyFeedback: "",
+                fidelityFixRound: 0,
+                architectureGaps: [],
                 qaFailureClass: "",
                 traceId: metrics.traceId,
                 appRoot,
@@ -3807,8 +4223,13 @@ server.tool(
       sources: teamConfig.sources,
       models: teamConfig.models,
       maxTokens: teamConfig.maxTokens,
-      needsConfig: !hasAnyTeamConfig(teamConfig),
-      questions: hasAnyTeamConfig(teamConfig) ? [] : [...SETUP_QUESTIONS],
+      needsConfig: !configGateSatisfied(teamConfig),
+      questions: configGateSatisfied(teamConfig) ? [] : [...SETUP_QUESTIONS],
+      modelQuestions: [...MODEL_QUESTIONS],
+      suggestedDefaults: {
+        models: teamConfig.models,
+        maxTokens: teamConfig.maxTokens,
+      },
       workspace: diagnoseWorkspace(ws.root, ws.source),
       appRoot,
       bootstrap: {

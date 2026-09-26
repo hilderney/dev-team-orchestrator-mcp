@@ -11,15 +11,16 @@ When this rule is attached (`@zteam`) or the user says **zteam** / **/zteam** / 
 
 | Trigger | Do this |
 |---------|---------|
-| **`@zteam/config`** | `get_zteam_config` → questions → `write_zteam_config` only (models source of truth). See `.zteam/README.MD`. |
-| **`@zteam/documentation`** | `run_development_pipeline` with `workflow: "docs"`. |
-| **`@zteam/tests`** | QA-focused pipeline (`fix` / `feature` / `resume` as appropriate). |
-| **`@zteam`** (plain) | Full/auto pipeline as usual. |
+| **`@zteam/config`** | Full setup: `get_zteam_config` → questions → `write_zteam_config`. See `.zteam/README.MD`. |
+| **`@zteam/models`** | LLMs only: `get_zteam_config` → `modelQuestions` → `write_zteam_config` (update models in this project's `.zteam/config.json`). |
+| **`@zteam/documentation`** | Config gate first, then `run_development_pipeline` with `workflow: "docs"`. |
+| **`@zteam/tests`** | Config gate first, then QA-focused pipeline (`fix` / `feature` / `resume`). |
+| **`@zteam`** (plain) | Config gate first, then full/auto pipeline. |
 
 ## Always
 
 1. Call MCP on **`user-zteam`** (not Cursor Task subagents).
 2. Pass **`workspaceRoot`** = absolute Cursor-open folder (not sticky `mcp.json` `WORKSPACE_ROOT`).
 3. Pass rich `userIdea` + **`projectRoot`** (prefer `samples/…`).
-4. If `needsConfig`, run the config flow (or tell user `@zteam/config`) then re-run.
-5. Report `workspaceRoot`, `appRoot`, `filesWritten`, `resumeHint`; never silently copy sibling projects.
+4. **Before any `run_development_pipeline`:** call **`get_zteam_config`**. If `needsConfig === true`, do **not** start the pipeline — run `@zteam/models` or `@zteam/config` (`write_zteam_config`) first, then re-check. Exceptions: `@zteam/config` / `@zteam/models` (they are the setup).
+5. Report `workspaceRoot`, `appRoot`, `filesWritten`, `failureKind`, `resumeHint`; never silently copy sibling projects.

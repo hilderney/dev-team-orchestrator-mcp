@@ -54,17 +54,14 @@ function runCmd(
   });
 }
 
-/** Copy static Vite+Vitest+React template into appRoot when package.json is missing. */
+/** Copy static Vite+Vitest+React template into appRoot when package.json is missing.
+ * If package.json exists but key scaffold files are absent, augment (C2).
+ */
 export async function ensureAppScaffold(
   appRoot: string
-): Promise<{ applied: boolean; files: string[] }> {
+): Promise<{ applied: boolean; augmented: boolean; files: string[] }> {
   const pkgPath = join(appRoot, "package.json");
-  if (await pathExists(pkgPath)) {
-    return { applied: false, files: [] };
-  }
-  await mkdir(appRoot, { recursive: true });
-  await cp(TEMPLATE_DIR, appRoot, { recursive: true });
-  const files = [
+  const requiredRel = [
     "package.json",
     "tsconfig.json",
     "vite.config.ts",
@@ -74,7 +71,29 @@ export async function ensureAppScaffold(
     "src/App.tsx",
     "tests/smoke/env.test.ts",
   ];
-  return { applied: true, files };
+
+  if (!(await pathExists(pkgPath))) {
+    await mkdir(appRoot, { recursive: true });
+    await cp(TEMPLATE_DIR, appRoot, { recursive: true });
+    return { applied: true, augmented: false, files: requiredRel };
+  }
+
+  // Augment missing shell files without overwriting existing ones
+  const copied: string[] = [];
+  for (const rel of requiredRel) {
+    if (rel === "package.json") continue;
+    const dest = join(appRoot, rel);
+    if (await pathExists(dest)) continue;
+    const src = join(TEMPLATE_DIR, rel);
+    if (!(await pathExists(src))) continue;
+    await mkdir(dirname(dest), { recursive: true });
+    await cp(src, dest);
+    copied.push(rel);
+  }
+  if (copied.length > 0) {
+    return { applied: false, augmented: true, files: copied };
+  }
+  return { applied: false, augmented: false, files: [] };
 }
 
 export async function npmInstall(
@@ -298,7 +317,8 @@ export async function runQaSmokeTests(
   return { ...result, skipped: false };
 }
 
-/** Mark project-setup todo done if present. */
+/** Mark project-setup todo done if present.
+ * Prefer SE + verifyDelivery DoD; scaffold no longer calls this. */
 export async function markProjectSetupDone(appRoot: string): Promise<void> {
   const todoPath = join(appRoot, ".docs", "todo.md");
   if (!(await pathExists(todoPath))) return;

@@ -2,19 +2,24 @@
 
 MCP server that runs a **spec-driven** LangGraph pipeline against 9router models:
 
-1. System Architect → `README.md` + `.docs/requirements.md`
-2. Technology Architect → `.docs/technologies.md`
-3. System Architect → `.docs/todo.md` + `.docs/specs/*.spec.md`
-4. Software Engineer → one spec at a time (or small punch-sized batch)
-5. QA Engineer → vitest + fix loop with SE (bootstrap failures → bootstrapFix, not feature fix)
-6. Finalize → README status + `.docs/pipeline-result.json` metrics
+1. System Architect → `README.md` + `.docs/requirements.md` (pré-reqs loop)
+2. Fidelity critic → hard FAIL vs `userIdea` (redo SA) — no silent stub pass
+3. Technology Architect → `.docs/technologies.md`
+4. System Architect → `.docs/todo.md` + `.docs/specs/*.spec.md`
+5. Delivery critic (architecture) → idea ↔ tech/specs gaps
+6. Scaffold → vite+vitest template / augment missing shell files
+7. Software Engineer → punch-sized **batch** of specs; `verifyDelivery` (Files to touch + `tsc`) before `markTodoDone`; redo with feedback
+8. Delivery critic (delivery) → reopen incomplete slugs
+9. QA Engineer → vitest + fix loop (bootstrap → bootstrapFix; logic → SE fix)
+10. Finalize → README status + `.docs/pipeline-result.json` metrics
 
-Greenfield (`full`/`feature`): **scaffold** (vite+vitest template) + `npm install` before SE.
 MCP also exposes `get_pipeline_state` and `approve_gate` (HITL when `ZTEAM_HITL=1`).
+
+Package docs and pipeline graph live under **`.docs/`** (not `docs/`) — same convention as app artefacts (`.docs/requirements.md`, …).
 
 ## Setup
 
-1. `cp .env.example .env` and fill in `NINEROUTER_BASE` / `NINEROUTER_KEY` (optional `MODEL_*`, `GRAPH_RECURSION_LIMIT`, `MAX_QA_FIX_ROUNDS`, `PROGRESS_HEARTBEAT_MS`).
+1. `cp .env.example .env` and fill in `NINEROUTER_BASE` / `NINEROUTER_KEY` (optional `MODEL_*`, `GRAPH_RECURSION_LIMIT`, `MAX_QA_FIX_ROUNDS`, `MAX_DELIVERY_FIX_ROUNDS`, `PROGRESS_HEARTBEAT_MS`).
 2. `npm install`
 3. Register the MCP server in Cursor (`~/.cursor/mcp.json`) under the key **`zteam`**:
 
@@ -42,6 +47,8 @@ Cursor exposes the tool namespace as **`user-zteam`**. Restart MCP after changin
 
 Models resolve as: `{app}/.zteam/config.json` → `{workspace}/.zteam/config.json` → env `MODEL_*` → built-in defaults.
 
+The config gate opens when a config file exists **or** explicit `MODEL_*` env vars are set (`configGateSatisfied`). Otherwise the pipeline returns `failureKind=needsConfig` (CLI: `--skip-config-gate` for smoke).
+
 Example:
 
 ```json
@@ -63,7 +70,19 @@ Example:
 }
 ```
 
-MCP tools: `get_zteam_config`, `write_zteam_config`. Pipeline returns `failureKind=needsConfig` until at least one config file exists (CLI: `--skip-config-gate` for smoke).
+MCP tools: `get_zteam_config`, `write_zteam_config`, `run_development_pipeline`, `get_pipeline_state`, `approve_gate`.
+
+### Env vars (orchestrator)
+
+| Var | Role |
+|-----|------|
+| `NINEROUTER_BASE` / `NINEROUTER_KEY` | 9router OpenAI-compat endpoint |
+| `ZTEAM_FORCE_BOOTSTRAP=1` | Force wipe of `.docs/requirements.md` on full/docs bootstrap (default: preserve if file has real `##` sections) |
+| `ZTEAM_SE_BATCH` | SE batch size 1–3 (default **1**; workflow `punch` defaults to 3) |
+| `MODEL_FALLBACK` / config `models.fallback` | Local fallback model after empty / no_file_sections |
+| `MAX_DELIVERY_FIX_ROUNDS` | SE verify redo rounds (default 3) |
+
+**After changing orchestrator source:** restart the MCP server `user-zteam` (no hot-reload). Confirm discovery lists config tools.
 
 ## Cursor — `@zteam` / `/zteam`
 
@@ -85,38 +104,38 @@ Examples:
 
 Always pass `workspaceRoot` (absolute Cursor open folder) and `projectRoot` when you can. Optional `workflow`: `full` | `docs` | `feature` | `punch` | `fix` | `resume` (omit = auto-router).
 
-Skill subcommands: **`@zteam/config`**, **`@zteam/documentation`**, **`@zteam/tests`** — see [`.zteam/README.MD`](.zteam/README.MD).
+Skill subcommands: **`@zteam/config`**, **`@zteam/models`**, **`@zteam/documentation`**, **`@zteam/tests`** — see [`.zteam/README.MD`](.zteam/README.MD).
 
-Also see the always-on routing rule for stage/env details. Rescue mid-failure with `workflow=resume` (see skill).
+Also see the always-on routing rule for stage/env details. Rescue mid-failure with `workflow=resume` (see skill). Resume reopens phantom `[x]` todos whose Files to touch are missing on disk.
 
 ## Modes / workflows
 
 | Mode | How | Route |
 |------|-----|--------|
 | **auto** | omit `workflow` | `workflowRouter` classifies from idea + `.docs` on disk |
-| **full** | `workflow=full` | bootstrap → SA pré-reqs\* → clean → fidelity → TA → specs → SE\* → QA\* → finalize |
-| **docs** | `workflow=docs` or `docsOnly=true` / `--docs-only` | bootstrap → SA pré-reqs\* → clean → fidelity → TA → specs → finalize |
-| **feature** | `workflow=feature` | specs → SE\* → QA\* → finalize |
-| **punch** | `workflow=punch` | prepare → SE → QA → finalize |
+| **full** | `workflow=full` | bootstrap → SA pré-reqs\* → clean → fidelity → TA → specs → arch critic → scaffold → SE\* → delivery critic → QA\* → finalize |
+| **docs** | `workflow=docs` or `docsOnly=true` / `--docs-only` | … → arch critic → finalize (no SE/QA) |
+| **feature** | `workflow=feature` | specs → arch critic → scaffold → SE\* → … |
+| **punch** | `workflow=punch` | prepare → SE → … |
 | **fix** | `workflow=fix` | prepare → SE fix → QA → finalize |
-| **resume** | `workflow=resume` | pending `[ ]` todos with specs → SE\* → QA\* → finalize |
+| **resume** | `workflow=resume` | reopen phantoms + pending `[ ]` → scaffold → SE\* → QA\* |
 
-Catalog + classifier: [`src/workflows/`](src/workflows/). Multiagent ideal (future): [`docs/adr-multiagent-flow.md`](docs/adr-multiagent-flow.md).
+Catalog + classifier: [`src/workflows/`](src/workflows/). Multiagent ideal (future): [`.docs/adr-multiagent-flow.md`](.docs/adr-multiagent-flow.md). Historical plans: [`.docs/postmortems/`](.docs/postmortems/).
 
 ### Workflow `full`
 
-Default greenfield path (`workflow=full`, or auto when there is no `.docs/requirements.md`):
-
-1. **Bootstrap** — `README.md` with **Resume** (≤512 words) + numbered **Pré Requirements** (needs only, no tech); stub `.docs/requirements.md`
-2. **SA loop** — for each pré-req: expand into a section of `.docs/requirements.md` (anchored to `userIdea` + Resume); notify progress
-3. **Clean README** — keep only Resume + link to requirements
-4. **Fidelity** — heuristic check vs `userIdea`; append Constraints if needed
-5. **TA** → `.docs/technologies.md` (+ README)
-6. **SA specs** → `.docs/todo.md` + `.docs/specs/*.spec.md`
-7. **SE** → one pending spec at a time; `tsc` smoke before marking todo done; FILE paths sanitized
-8. **QA** → SUMMARY and/or test FILEs; ensures `scripts.test` (vitest); smoke under `tests/smoke`; on bootstrap fail → **bootstrapFix**; on logic fail → **SE fix** → QA again
-9. **Finalize** → README + `pipeline-result.json` (timings, retries, traceId, errorClass)
-9. **Finalize** → README + `.docs/pipeline-result.json`
+1. **Bootstrap** — Resume + Pré Requirements; stub `.docs/requirements.md` (empty LLM → `llm_empty`, no stub charter)
+2. **SA loop** — expand each pré-req into `.docs/requirements.md`
+3. **Clean README** — Resume + link to requirements
+4. **Fidelity** — hard FAIL vs `userIdea` (API/locale/stub); one redo then classified abort
+5. **TA** → `.docs/technologies.md`
+6. **SA specs** → todo + `.docs/specs/*.spec.md`
+7. **Architecture critic** — coverage gaps; may reopen TA
+8. **Scaffold** — template or augment missing shell files + install
+9. **SE** — batch specs; `verifyDelivery` (Files to touch + anti-batch-fake + `tsc`); redo with `deliveryFixRound` feedback; only then `markTodoDone`
+10. **Delivery critic** — reopen incomplete slugs
+11. **QA** — vitest; bootstrapFix vs SE fix by error class
+12. **Finalize** → README + `.docs/pipeline-result.json` (timings, retries, `llmEmpty`, `specsMarkedWithoutFiles`, …)
 
 ```mermaid
 flowchart TD
@@ -129,7 +148,10 @@ flowchart TD
   fidelity[fidelityCriticRequirements]
   ta[technologyArchitect]
   saSpecs[systemArchitectSpecs]
+  archCritic[deliveryCriticArchitecture]
+  scaffold[scaffoldPrepare]
   se[softwareEngineer]
+  delCritic[deliveryCriticDelivery]
   qa[qaEngineer]
   seFix[softwareEngineerFix]
   finalize[orchestratorFinalize]
@@ -141,11 +163,17 @@ flowchart TD
   afterItem -->|pendingPreReqs| saItem
   afterItem -->|done| clean
   clean --> fidelity
-  fidelity --> ta
+  fidelity -->|FAIL| saItem
+  fidelity -->|PASS| ta
   ta --> saSpecs
-  saSpecs --> se
+  saSpecs --> archCritic
+  archCritic -->|gaps| ta
+  archCritic -->|PASS| scaffold
+  scaffold --> se
   se -->|pendingSpecs| se
-  se -->|done| qa
+  se -->|done| delCritic
+  delCritic -->|reopen| se
+  delCritic -->|PASS| qa
   qa -->|fail| seFix
   seFix --> qa
   qa -->|moreSpecs| qa
@@ -153,13 +181,14 @@ flowchart TD
   finalize --> endNode
 ```
 
-Hard guard: refuses to write when `projectRoot` is `.` and `appRoot` equals the orchestrator package (pass `workspaceRoot` and/or a dedicated `projectRoot`). `GRAPH_RECURSION_LIMIT` default **120**.
+Hard guard: refuses to write when `projectRoot` is `.` and `appRoot` equals the orchestrator package, or when a path escapes `workspaceRoot`. `GRAPH_RECURSION_LIMIT` default **120**.
 
 ## Resilience (empty / invalid LLM)
 
-- Empty/whitespace replies, missing `===FILE===`, empty file bodies, and failed docs section parses are **retryable** (up to 3 attempts, exponential backoff + short re-prompt).
+- Empty/whitespace replies, missing `===FILE===`, empty file bodies, and failed docs section parses are **retryable** (re-prompt + optional model fallback).
+- After exhausted retries on docs/SE: **`failureKind=llm_empty`** — no silent TBD / implement-core stubs.
 - Network / 429 / 5xx are also retried.
-- Docs stages (SA/TA/specs) may fall back or stub only **after** retries; SE/QA fail hard if content stays invalid.
+- Delivery verify FAIL → structured feedback + redo until `MAX_DELIVERY_FIX_ROUNDS`.
 
 ## Live progress
 
@@ -170,6 +199,7 @@ While the pipeline runs (MCP tool or CLI):
 - **partial** truncated preview after a heartbeat if stream text is interesting (`===FILE===` / section markers)
 - MCP: `notifications/message` (logging) + `notifications/progress` when the client sends `progressToken`
 - CLI: same lines on **stderr**; final `notifications[]` matches the live log
+- Pre-pipeline **healthcheck** on 9router/tunnel for `full`/`docs`/`feature` (&lt;30s fail-fast)
 
 ## CLI
 
@@ -188,6 +218,7 @@ npm run smoke:improvements
 npm run smoke:architecture
 npm run smoke:implementation
 npm run smoke:zteam-config
+npm run smoke:verify
 npm run smoke:all
 ```
 
@@ -200,9 +231,10 @@ Use `--workspace-root` + `projectRoot` so generated docs land in the app folder,
 - `npm run smoke:reqs` — Resume / Pré Requirements parsers + safe appRoot guard
 - `npm run smoke:files` — FILE sanitize, recursion helper, test preflight, fidelity heuristic
 - `npm run smoke:improvements` — bootstrap/vitest/scaffold/FILE repair/progress close/healthcheck/metrics
-- `npm run smoke:architecture` — architecture progress pack (pré-req hints, JSON artifact, summaries)
-- `npm run smoke:implementation` — implementation progress pack (spec/QA hints, JSON artifact)
+- `npm run smoke:architecture` — architecture progress pack
+- `npm run smoke:implementation` — implementation progress pack
 - `npm run smoke:zteam-config` — workspaceRoot override, `.zteam` merge, needsConfig, gitignore
+- `npm run smoke:verify` — DoD / anti-batch / phantoms / architecture gaps / metrics
 - CI: [`.github/workflows/zteam-smokes.yml`](.github/workflows/zteam-smokes.yml) runs `smoke:all`
 
 Optional live check (needs 9router): run `npm run pipeline:docs -- --project-root samples/smoke-app "tiny idea"` and confirm heartbeats if a stage exceeds 30s.

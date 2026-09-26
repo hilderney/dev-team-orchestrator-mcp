@@ -114,6 +114,16 @@ export const SETUP_QUESTIONS = [
   "Se não houver .gitignore no alvo: ignorar .zteam/config.json no git? (recomendado: sim)",
 ] as const;
 
+/** Focused questions for `@zteam/models` (LLM ids only). */
+export const MODEL_QUESTIONS = [
+  "System Architect — model id 9router (default: 9RSA-system-architect-free)",
+  "Technology Architect — model id (default: 9RTA-technology-architect-free)",
+  "Software Engineer — model id (default: 9RSE-software-engineer-free)",
+  "QA Engineer — model id (default: 9RQA-qa-free)",
+  "Fallback opcional — model id ou vazio (usado se empty/OUT=0 no SE)",
+  "Gravar neste projeto: workspace (raiz aberta), app (projectRoot), ou ambos?",
+] as const;
+
 /** Canonical command guide copied into each project's `.zteam/README.MD`. */
 export const ZTEAM_README_MD = `# zteam — comandos e configuração
 
@@ -125,7 +135,8 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 
 | Comando | O que faz | MCP |
 |---------|-----------|-----|
-| **\`@zteam/config\`** | Cria/atualiza \`.zteam/config.json\` (modelos, maxTokens, escopo workspace/app). Fonte de verdade dos modelos 9router. | \`get_zteam_config\` → perguntas → \`write_zteam_config\` |
+| **\`@zteam/config\`** | Setup completo: \`.zteam/config.json\` (modelos, maxTokens, escopo workspace/app, gitignore). | \`get_zteam_config\` → perguntas → \`write_zteam_config\` |
+| **\`@zteam/models\`** | Só LLMs por papel — perguntas guiadas → atualiza \`models\` em \`.zteam/config.json\` neste projeto. | \`get_zteam_config\` → \`modelQuestions\` → \`write_zteam_config\` |
 | **\`@zteam/documentation\`** | Só documentação / arquitetura (requirements, technologies, todo, specs). Sem SE/QA. | \`run_development_pipeline\` com \`workflow: "docs"\` |
 | **\`@zteam/tests\`** | Analisa o app/specs e cria ou reforça testes (QA + fix loop se falhar). | \`run_development_pipeline\` com foco em testes (\`workflow: "fix"\` ou \`"feature"\` / \`"resume"\` conforme o estado) |
 | **\`@zteam\`** / **\`/zteam\`** | Pipeline completo ou o workflow que pedires (full, feature, punch, resume, …). | \`run_development_pipeline\` |
@@ -133,8 +144,11 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 ### Exemplos
 
 \`\`\`text
+@zteam/models
+→ mostra modelos atuais + defaults → pergunta SA/TA/SE/QA/fallback → grava .zteam/config.json
+
 @zteam/config
-→ pergunta modelos / escopo → grava .zteam/config.json (+ .gitignore para config)
+→ pergunta modelos / escopo / maxTokens → grava .zteam/config.json (+ .gitignore para config)
 
 @zteam/documentation samples/pacman — canvas TS, infinite lives
 → workflow=docs, projectRoot=samples/pacman
@@ -195,6 +209,21 @@ Evita o footgun de pipelines a escrever noutro repo (ex. \`pacman-z2\`).
 \`\`\`
 
 Credenciais (\`NINEROUTER_*\`) ficam só no env do MCP — nunca neste JSON.
+
+## Playbook operador (greenfield / resume)
+
+1. Garantir \`.zteam/config.json\` (\`@zteam/models\` ou \`@zteam/config\`) + 9router saudável.
+2. Após patch no orchestrator: **reiniciar MCP** \`user-zteam\` (sem hot-reload). Discovery deve listar \`get_zteam_config\`, \`write_zteam_config\`, \`run_development_pipeline\`, …
+3. Evitar re-rodar \`full\`/\`docs\` após requirements bons — o bootstrap **preserva** \`.docs/requirements.md\` com seções \`##\` (use \`ZTEAM_FORCE_BOOTSTRAP=1\` só para recomeçar de propósito).
+4. Antes de \`resume\`: cada \`[ ]\` no todo precisa de \`.docs/specs/{slug}.spec.md\`. Órfãos → \`workflow=feature\`.
+5. Modelos free no 9router: default \`ZTEAM_SE_BATCH=1\`. Se \`IN 0 · OUT 0\` / empty SE → configure \`models.fallback\` no config.
+6. Healthcheck falhou: aguardar ~20s ou reiniciar MCP / verificar túnel Cloudflare; não spamar retries com \`(cached)\`.
+
+| Env | Default | Nota |
+|-----|---------|------|
+| \`ZTEAM_FORCE_BOOTSTRAP\` | off | Força stub novo de requirements |
+| \`ZTEAM_SE_BATCH\` | \`1\` (\`punch\`→3) | Lotes SE |
+| \`MODEL_FALLBACK\` | — | Fallback após empty LLM |
 `;
 
 export async function ensureZteamReadme(
@@ -355,7 +384,8 @@ async function pathExists(abs: string): Promise<boolean> {
 
 async function readConfigFile(abs: string): Promise<ZteamConfigFile | null> {
   if (!(await pathExists(abs))) return null;
-  const raw = await readFile(abs, "utf8");
+  // Strip UTF-8 BOM (Windows editors) so resume/full don't fail JSON.parse
+  const raw = (await readFile(abs, "utf8")).replace(/^\uFEFF/, "");
   const parsed = JSON.parse(raw) as unknown;
   return zteamConfigFileSchema.parse(parsed);
 }
@@ -434,6 +464,21 @@ export async function loadTeamConfig(
 
 export function hasAnyTeamConfig(cfg: ResolvedTeamConfig): boolean {
   return cfg.exists.workspace || cfg.exists.app;
+}
+
+/** True when operator already set MODEL_* in env (resume without interactive config). */
+export function hasExplicitEnvModels(): boolean {
+  return Boolean(
+    process.env.MODEL_SYSTEM_ARCHITECT?.trim() ||
+      process.env.MODEL_TECHNOLOGY_ARCHITECT?.trim() ||
+      process.env.MODEL_SOFTWARE_ENGINEER?.trim() ||
+      process.env.MODEL_QA_ENGINEER?.trim()
+  );
+}
+
+/** Config gate open: file present OR explicit env models (A7). */
+export function configGateSatisfied(cfg: ResolvedTeamConfig): boolean {
+  return hasAnyTeamConfig(cfg) || hasExplicitEnvModels();
 }
 
 export function diagnoseWorkspace(
@@ -559,18 +604,22 @@ export function needsConfigPayload(opts: {
 }): Record<string, unknown> {
   const paths = resolveConfigPaths(opts.workspaceRoot, opts.appRoot);
   const defaults = envDefaultsTeamConfig();
+  const envModels = hasExplicitEnvModels();
   return {
     ok: false,
     failureKind: "needsConfig",
     needsConfig: true,
+    envModelsPresent: envModels,
     questions: [...SETUP_QUESTIONS],
+    modelQuestions: [...MODEL_QUESTIONS],
     suggestedDefaults: defaults,
     suggestedPaths: {
       workspace: paths.workspaceConfig,
       app: paths.appConfig,
     },
     workspace: opts.workspace,
-    resumeHint:
-      "Answer setup questions, call write_zteam_config, then re-run pipeline",
+    resumeHint: envModels
+      ? "MODEL_* env already set — re-run with skipConfigGate=true or write .zteam/config.json"
+      : "Answer setup questions, call write_zteam_config, then re-run pipeline",
   };
 }

@@ -113,6 +113,7 @@ try {
     assert(cfg.maxTokens.softwareEngineer === 9999, "app maxTokens");
     const readme = await readFile(join(ws, ".zteam", "README.MD"), "utf8");
     assert(readme.includes("@zteam/config"), "README documents @zteam/config");
+    assert(readme.includes("@zteam/models"), "README documents @zteam/models");
     assert(
       readme.includes("@zteam/documentation"),
       "README documents @zteam/documentation"
@@ -123,8 +124,8 @@ try {
       "utf8"
     );
     assert(
-      skillText.includes("@zteam/config") || skillText.includes("zteam"),
-      "skill copied under .zteam/skills/"
+      skillText.includes("@zteam/models") && skillText.includes("@zteam/config"),
+      "skill documents @zteam/models"
     );
   }
 

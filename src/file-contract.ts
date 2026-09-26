@@ -76,12 +76,38 @@ export function repairFileContract(raw: string): string {
   return text.trim();
 }
 
-/** Detect JSX-like tags that require .tsx/.jsx extension. */
+/** Paths that must stay .ts even if content has angle brackets (generics, etc.). */
+export function shouldSkipTsxCoercion(relPath: string): boolean {
+  const p = relPath.replace(/\\/g, "/");
+  const base = p.split("/").pop() || "";
+  if (/\.d\.ts$/i.test(p)) return true;
+  if (/^types\.ts$/i.test(base)) return true;
+  if (/Store\.ts$/i.test(base)) return true;
+  return false;
+}
+
+/**
+ * Detect real JSX that requires .tsx/.jsx — not TypeScript generics like Array<string>.
+ * Prefer return/arrow JSX expressions or PascalCase component pairs.
+ */
 export function bodyLooksLikeJsx(content: string): boolean {
-  return (
-    /<[A-Za-z][A-Za-z0-9.]*(\s|>|\/>)/.test(content) ||
-    /<\/[A-Za-z]/.test(content)
-  );
+  if (/React\.createElement\s*\(/.test(content)) return true;
+  // return ( <Tag  or  => ( <Tag  or  => <Tag
+  if (
+    /(return\s*\(|=>\s*\(|=>\s*)[\s\S]{0,240}<[A-Za-z][A-Za-z0-9.]*(\s|>|\/>)/.test(
+      content
+    )
+  ) {
+    return true;
+  }
+  // Matched PascalCase open/close tags (components, not HTML)
+  if (
+    /<[A-Z][A-Za-z0-9.]*(\s|>|\/>)/.test(content) &&
+    /<\/[A-Z][A-Za-z0-9.]*>/.test(content)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /** Prose / agent notes that must not land in source/test files (P0-5). */
@@ -113,6 +139,7 @@ export function coercePathForContent(
   content: string
 ): string {
   if (!isCodeOrTestPath(relPath)) return relPath;
+  if (shouldSkipTsxCoercion(relPath)) return relPath;
   if (bodyLooksLikeJsx(content) && /\.ts$/i.test(relPath) && !/\.tsx$/i.test(relPath)) {
     return relPath.replace(/\.ts$/i, ".tsx");
   }

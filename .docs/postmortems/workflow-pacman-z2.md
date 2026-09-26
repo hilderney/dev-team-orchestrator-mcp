@@ -1,10 +1,12 @@
 # Review — Pipeline zTeam na entrega Pac-Man z2
 
+> Archived postmortem (2026-09-24). Sibling agents write-up: [agents-pacman-z2.md](./agents-pacman-z2.md).
+
 **Data:** 2026-09-24  
 **Workspace:** `C:\GIT\ZAPFCOORP\pacman-z2`  
 **MCP:** `user-zteam` → `C:\Users\htzc\mcp-servers\dev-team-orchestrator`  
-**Plano de melhorias (fonte):** [`zteam_mcp_improvements_22be0156.plan.md`](c:\Users\htzc\.cursor\plans\zteam_mcp_improvements_22be0156.plan.md)  
-**Postmortem irmão (MCP):** `C:\Users\htzc\mcp-servers\dev-team-orchestrator\agents-review.MD`
+**Plano de melhorias (fonte histórica):** Cursor plan `zteam_mcp_improvements_22be0156` (may live under `~/.cursor/plans/`)  
+**Postmortem irmão:** [agents-pacman-z2.md](./agents-pacman-z2.md)
 
 **Pedido:** clone Pac-Man (TypeScript + Canvas), WASD, pellets, fantasmas, energizers, vidas infinitas + contador de mortes, teleporte, hooks de som documentados — via `@zteam`.  
 **Resultado:** jogo jogável em `samples/pacman`, mas **não** como saída limpa e autônoma da pipeline. Docs/scaffold parciais vieram do zTeam; implementação/estabilidade exigiram recuperação manual e correção de corrupção gerada pelo próprio pipe.
@@ -200,7 +202,7 @@ Fonte: [`zteam_mcp_improvements_22be0156.plan.md`](c:\Users\htzc\.cursor\plans\z
 - `src/orchestrator.ts`  
 - `scripts/run-pipeline.mjs` + `scripts/workflows/run.mjs`  
 - `.env.example`  
-- `agents-review.MD` / README / skill  
+- [agents-pacman-z2.md](./agents-pacman-z2.md) / README / skill  
 
 **Fora de escopo imediato:** trocar 9router/modelos paid (só documentar fallback).
 
@@ -336,7 +338,7 @@ Wave 4 (cuidado):    render ∥ main            → Integrator resolve imports
 
 ### 8.9 Entregáveis de desenho (junto ao P1+)
 
-- ADR: `docs/adr-multiagent-flow.md` no repo do orchestrator.  
+- ADR: `.docs/adr-multiagent-flow.md` no repo do orchestrator.  
 - Schema de `pipeline-state.json` e `dependsOn` no todo.  
 - Skill zteam: `full` com gates, `resume`, `approve`.  
 - Smoke simulando reject do FidelityCritic e resume após SE fail.
@@ -385,7 +387,7 @@ Sem os dois eixos, `@zteam` continua a exigir o agente Cursor como rede de segur
 | Orchestrator | `C:\Users\htzc\mcp-servers\dev-team-orchestrator\src\orchestrator.ts` |
 | CLI full/docs | `...\scripts\run-pipeline.mjs` |
 | CLI feature/punch/fix | `...\scripts\workflows\run.mjs` |
-| Postmortem MCP | `...\agents-review.MD` |
+| Postmortem MCP | [agents-pacman-z2.md](./agents-pacman-z2.md) |
 | Skill zteam | `...\ .cursor\skills\zteam\SKILL.md` |
 
 ## Apêndice B — Artefato entregue

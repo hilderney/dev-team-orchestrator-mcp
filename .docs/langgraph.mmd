@@ -13,16 +13,17 @@ graph TD;
 	fidelityCriticRequirements(fidelityCriticRequirements)
 	technologyArchitect(technologyArchitect)
 	systemArchitectSpecs(systemArchitectSpecs)
+	deliveryCriticArchitecture(deliveryCriticArchitecture)
 	scaffoldPrepare(scaffoldPrepare)
 	bootstrapFix(bootstrapFix)
 	softwareEngineer(softwareEngineer)
+	deliveryCriticDelivery(deliveryCriticDelivery)
 	softwareEngineerFix(softwareEngineerFix)
 	qaEngineer(qaEngineer)
 	orchestratorFinalize(orchestratorFinalize)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> workflowRouter;
 	bootstrapFix --> qaEngineer;
-	fidelityCriticRequirements --> technologyArchitect;
 	fixPrepare --> softwareEngineerFix;
 	orchestratorBootstrapReadme --> systemArchitectReqItem;
 	orchestratorCleanReadme --> fidelityCriticRequirements;
@@ -39,11 +40,17 @@ graph TD;
 	workflowRouter -.-> resumePrepare;
 	orchestratorAfterPreReq -.-> systemArchitectReqItem;
 	orchestratorAfterPreReq -.-> orchestratorCleanReadme;
-	systemArchitectSpecs -.-> scaffoldPrepare;
-	systemArchitectSpecs -.-> orchestratorFinalize;
+	fidelityCriticRequirements -.-> systemArchitectReqItem;
+	fidelityCriticRequirements -.-> technologyArchitect;
+	systemArchitectSpecs -.-> deliveryCriticArchitecture;
+	deliveryCriticArchitecture -.-> technologyArchitect;
+	deliveryCriticArchitecture -.-> scaffoldPrepare;
+	deliveryCriticArchitecture -.-> orchestratorFinalize;
 	resumePrepare -.-> scaffoldPrepare;
 	resumePrepare -.-> orchestratorFinalize;
-	softwareEngineer -.-> qaEngineer;
+	softwareEngineer -.-> deliveryCriticDelivery;
+	deliveryCriticDelivery -.-> softwareEngineer;
+	deliveryCriticDelivery -.-> qaEngineer;
 	qaEngineer -.-> softwareEngineerFix;
 	qaEngineer -.-> bootstrapFix;
 	qaEngineer -.-> orchestratorFinalize;

@@ -13,6 +13,7 @@ const {
   assertSafeAppRoot,
   PACKAGE_ROOT,
   resolveAppRoot,
+  shouldWriteRequirementsStub,
 } = await import("../src/orchestrator.ts");
 
 function assert(cond, msg) {
@@ -61,12 +62,44 @@ assert(threw, "assertSafeAppRoot should refuse package root + projectRoot=.");
 const other = resolveAppRoot("samples/smoke-app");
 assertSafeAppRoot(other, "samples/smoke-app");
 
+// --- bootstrap preserve requirements ---
+{
+  const prev = process.env.ZTEAM_FORCE_BOOTSTRAP;
+  delete process.env.ZTEAM_FORCE_BOOTSTRAP;
+  assert(
+    shouldWriteRequirementsStub(""),
+    "empty → write stub"
+  );
+  assert(
+    shouldWriteRequirementsStub(
+      "# Requirements\n\n_Sections are filled one pré-requirement at a time._\n"
+    ),
+    "stub-only → write stub"
+  );
+  const rich = `# Requirements
+
+## Feature A
+
+Detailed requirements text that is long enough to clear the eighty character floor for preservation.
+`;
+  assert(!shouldWriteRequirementsStub(rich), "rich ## → preserve");
+  assert(
+    shouldWriteRequirementsStub(rich, true),
+    "force=true → wipe"
+  );
+  process.env.ZTEAM_FORCE_BOOTSTRAP = "1";
+  assert(shouldWriteRequirementsStub(rich), "env force → wipe");
+  if (prev === undefined) delete process.env.ZTEAM_FORCE_BOOTSTRAP;
+  else process.env.ZTEAM_FORCE_BOOTSTRAP = prev;
+}
+
 console.log(
   JSON.stringify(
     {
       ok: true,
       preReqs: parsed.preRequirements.length,
       resumeWords: countWords(parsed.resume),
+      bootstrapPreserve: true,
     },
     null,
     2
