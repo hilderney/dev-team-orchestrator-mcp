@@ -1,6 +1,6 @@
 # Skill — QA TDD verify (screen-flow)
 
-**Role:** qaEngineer · **Phase:** tdd-verify · **projectType:** webgame | webapp
+**Role:** qaEngineer · **Phase:** tdd-verify · **projectType:** webgame | webapp · **Status:** pilot
 
 ## Mission
 After SE green: run the suite, close gaps, and mark `[x]` only when tests pass (incl. screen-flow / overlay exclusivity).

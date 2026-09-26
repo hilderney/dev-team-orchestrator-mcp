@@ -1,6 +1,6 @@
 # Skill — QA TDD red (API / contract)
 
-**Role:** qaEngineer · **Phase:** tdd-red · **projectType:** api | crud
+**Role:** qaEngineer · **Phase:** tdd-red · **projectType:** api | crud · **needsUiFlow:** false · **Status:** pilot
 
 ## Mission
 Write failing contract/integration tests for API or CRUD ACs before SE implements (`needsUiFlow=false`).

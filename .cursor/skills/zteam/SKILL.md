@@ -48,7 +48,7 @@ If GetDynamicTools shows only an old `run_development_pipeline` schema (no `work
 | Análise (time ou 1 papel) | `workflow: "analyze"` + `scope` + optional `role` | `.docs/reviews/**` |
 | Pipeline completo | `workflow: "full"` / omit | app + docs |
 
-**Role skills** (`.zteam/skills/roles/`): pick by `(role, phase, projectType)` — e.g. `qa-tdd-red-screenflow` + `se-implement-tdd-green` + `qa-tdd-verify-screenflow` for webgame; `qa-tdd-red-api-contract` when `needsUiFlow=false`. **Hosts:** `.zteam/skills/hosts/{copilot,opencode}.md`.
+**Role skills** (`.zteam/skills/roles/`): pick by `(role, phase, projectType)` — see [`.docs/todo-skills.md`](../../.docs/todo-skills.md) and [roles/README](../../.zteam/skills/roles/README.md). Examples: `qa-tdd-red-screenflow` + `se-implement-tdd-green` + `qa-tdd-verify-screenflow` for webgame; `qa-tdd-red-api-contract` when `needsUiFlow=false`. **Hosts:** `.zteam/skills/hosts/{copilot,opencode}.md`.
 
 ## Dual runtime (config is absolute truth)
 

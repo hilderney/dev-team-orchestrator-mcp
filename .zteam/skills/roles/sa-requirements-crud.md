@@ -1,6 +1,6 @@
 # Skill — SA requirements (CRUD)
 
-**Role:** systemArchitect · **Phase:** requirements · **projectType:** crud · **needsUiFlow:** false
+**Role:** systemArchitect · **Phase:** requirements · **projectType:** crud · **needsUiFlow:** false · **Status:** pilot
 
 ## Mission
 Capture entities, list/detail flows, validation, and authz lightly — not arcade juice. Chunks must be testable → `.docs/todo.md`.

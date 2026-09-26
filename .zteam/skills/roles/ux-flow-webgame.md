@@ -1,6 +1,6 @@
 # Skill — UX flow (webgame)
 
-**Role:** uiUxDesigner · **Phase:** spec-flow · **projectType:** webgame · **needsUiFlow:** true
+**Role:** uiUxDesigner · **Phase:** spec-flow · **projectType:** webgame · **needsUiFlow:** true · **Status:** pilot
 
 ## Mission
 Define exclusive screen/overlay states and juice for game loops (title → play → pause → death → ranking).

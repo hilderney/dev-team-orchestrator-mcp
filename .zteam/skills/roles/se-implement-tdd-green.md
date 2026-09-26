@@ -1,6 +1,6 @@
 # Skill — SE implement (TDD green)
 
-**Role:** softwareEngineer · **Phase:** tdd-green · **projectType:** webgame | webapp | crud | api
+**Role:** softwareEngineer · **Phase:** tdd-green · **projectType:** webgame | webapp | crud | api · **Status:** pilot
 
 ## Mission
 Make QA-red tests pass. Implement product code only — do not own `[x]` on todos.

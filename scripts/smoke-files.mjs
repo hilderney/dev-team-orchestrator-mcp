@@ -116,4 +116,28 @@ function assert(cond, msg) {
   }
 }
 
+// --- Phase 9 skill stubs on disk (todo-skills ON_DISK_SKILLS) ---
+{
+  const { access } = await import("node:fs/promises");
+  const { dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const catalog = await readFile(join(root, ".docs", "todo-skills.md"), "utf8");
+  const block = catalog.match(/```\r?\n# ON_DISK_SKILLS\r?\n([\s\S]*?)```/);
+  assert(block, "ON_DISK_SKILLS fence in todo-skills.md");
+  const names = block[1]
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+  assert(names.length >= 40, `expected >=40 on-disk skills, got ${names.length}`);
+  const rolesDir = join(root, ".zteam", "skills", "roles");
+  for (const name of names) {
+    try {
+      await access(join(rolesDir, name));
+    } catch {
+      throw new Error(`missing skill file: ${name}`);
+    }
+  }
+}
+
 console.log(JSON.stringify({ ok: true, smoke: "files" }, null, 2));

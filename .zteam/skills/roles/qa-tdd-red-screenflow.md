@@ -1,6 +1,6 @@
 # Skill — QA TDD red (screen-flow)
 
-**Role:** qaEngineer · **Phase:** tdd-red · **projectType:** webgame | webapp
+**Role:** qaEngineer · **Phase:** tdd-red · **projectType:** webgame | webapp · **Status:** pilot
 
 ## Mission
 Write failing tests for screen transitions and overlay exclusivity before SE implements.
