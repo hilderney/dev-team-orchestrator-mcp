@@ -91,6 +91,55 @@ import {
 } from "./sandbox.js";
 import { getRunContext, withRunContext } from "./run-context.js";
 import {
+  ROLE_PROMPT_DUTIES,
+  consultAdvisorPrompt,
+  qaEngineerPrompt,
+  softwareEngineerFixPrompt,
+  softwareEngineerImplementPrompt,
+  validateSeImplementSelfCheck,
+  validateQaSelfCheck,
+  stripSeQaTrailMarkers,
+  parseTechDebtSection,
+  appendTechDebtMarkdown,
+  TECH_DEBT_PATH,
+  systemArchitectProjectSummaryPrompt,
+  systemArchitectTechDebtReviewPrompt,
+  parseProjectSummaryResponse,
+  validateProjectSummarySelfCheck,
+  parseTechDebtReviewResponse,
+  validateTechDebtReviewSelfCheck,
+  buildUserReportMarkdown,
+  PROJECT_SUMMARY_PATH,
+  TECH_DEBT_PLAN_PATH,
+  USER_REPORT_PATH,
+  parseUiUxRequirementsResponse,
+  validateUiUxRequirementsResponse,
+  upsertRequirementsUxAddendum,
+  uiUxRequirementsPrompt,
+  uiUxDesignSystemPrompt,
+  parseUiUxDesignSystemResponse,
+  validateUiUxDesignSystemResponse,
+  UI_UX_DOC_PATH,
+  splitSelfCheck,
+  systemArchitectBootstrapPrompt,
+  systemArchitectReqItemPrompt,
+  systemArchitectTodoPlanPrompt,
+  systemArchitectSpecItemPrompt,
+  uiUxSpecEnrichPrompt,
+  technologyArchitectSpecEnrichPrompt,
+  parseTodoPlanResponse,
+  parseSingleSpecResponse,
+  SA_TODO_PLAN_SELF_CHECK_KEYS,
+  SA_SPEC_ITEM_SELF_CHECK_KEYS,
+  UX_SPEC_ENRICH_SELF_CHECK_KEYS,
+  TA_SPEC_ENRICH_SELF_CHECK_KEYS,
+  assertSpecUseCasesMinimum,
+  technologyArchitectPrompt,
+  validateKeyedSelfCheck,
+  validateSaRequirementsSelfCheck,
+  TA_SELF_CHECK_KEYS,
+} from "./role-prompts.js";
+import {
   DEFAULT_MAX_TOKENS,
   DEFAULT_MODELS,
   diagnoseWorkspace,
@@ -100,9 +149,9 @@ import {
   envDefaultsTeamConfig,
   loadTeamConfig,
   needsConfigPayload,
+  needsWorkspaceRootPayload,
   MODEL_QUESTIONS,
   SETUP_QUESTIONS,
-  ROLE_DUTIES,
   ROLE_MODEL_SUGGESTIONS,
   resolveRoleFallbackModel,
   writeTeamConfig,
@@ -137,6 +186,7 @@ export const PROJECT_ROOT = PACKAGE_ROOT;
 
 const REQUIREMENTS_PATH = ".docs/requirements.md";
 const TECHNOLOGIES_PATH = ".docs/technologies.md";
+const UI_UX_PATH = UI_UX_DOC_PATH;
 const TODO_PATH = ".docs/todo.md";
 const SPECS_DIR = ".docs/specs";
 const README_PATH = "README.md";
@@ -151,8 +201,9 @@ export type WorkspaceResolveResult = {
 };
 
 /**
- * Resolve workspace root: MCP/CLI arg (absolute) > env WORKSPACE_ROOT > cwd.
+ * Resolve workspace root: MCP/CLI arg (absolute) > ALS run context > env WORKSPACE_ROOT > cwd.
  * Prefer passing the Cursor-open folder as `workspaceRoot` on every tool call.
+ * CLI may use env; MCP tools must use {@link requireMcpWorkspaceRoot} (no env fallback).
  */
 export function resolveWorkspaceRoot(
   override?: string | null
@@ -177,6 +228,57 @@ export function resolveWorkspaceRoot(
   return { root: process.cwd(), source: "cwd" };
 }
 
+/**
+ * MCP-only: require absolute workspaceRoot arg. Never reads WORKSPACE_ROOT env
+ * (avoids sticky wrong-repo from mcp.json).
+ */
+export function requireMcpWorkspaceRoot(
+  override?: string | null
+): WorkspaceResolveResult {
+  const raw = (override ?? "").trim();
+  if (!raw) {
+    const err = new Error(
+      "workspaceRoot is required (absolute Cursor open folder). MCP does not use sticky WORKSPACE_ROOT env."
+    );
+    (err as Error & { failureKind?: string }).failureKind =
+      "needs_workspace_root";
+    throw err;
+  }
+  if (!isAbsolute(raw)) {
+    throw new Error(
+      `workspaceRoot must be an absolute path (Cursor open folder), got: ${raw}`
+    );
+  }
+  return { root: resolve(raw), source: "arg" };
+}
+
+function mcpNeedsWorkspaceRootResult() {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(needsWorkspaceRootPayload(), null, 2),
+      },
+    ],
+    isError: true as const,
+  };
+}
+
+/** Resolve MCP workspace or return needs_workspace_root error payload. */
+function mcpResolveWorkspace(override?: string | null):
+  | { ok: true; ws: WorkspaceResolveResult }
+  | { ok: false; result: ReturnType<typeof mcpNeedsWorkspaceRootResult> } {
+  try {
+    return { ok: true, ws: requireMcpWorkspaceRoot(override) };
+  } catch (err) {
+    const kind = (err as Error & { failureKind?: string }).failureKind;
+    if (kind === "needs_workspace_root") {
+      return { ok: false, result: mcpNeedsWorkspaceRootResult() };
+    }
+    throw err;
+  }
+}
+
 function getWorkspaceRoot(): string {
   return resolveWorkspaceRoot().root;
 }
@@ -195,7 +297,7 @@ export function resolveGraphRecursionLimit(pendingSpecsEstimate = 0): number {
   const fromEnv = Number.parseInt(process.env.GRAPH_RECURSION_LIMIT ?? "", 10);
   if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
   if (pendingSpecsEstimate > 0) {
-    return Math.max(100, 10 + 4 * pendingSpecsEstimate);
+    return Math.max(100, 10 + 8 * pendingSpecsEstimate);
   }
   return DEFAULT_GRAPH_RECURSION_LIMIT;
 }
@@ -241,9 +343,9 @@ export function assertSafeAppRoot(
 
 const workspaceRootArg = z
   .string()
-  .optional()
+  .min(1)
   .describe(
-    "Absolute path of the Cursor-open workspace folder. Prefer over sticky WORKSPACE_ROOT env in mcp.json."
+    "REQUIRED. Absolute path of the Cursor-open workspace folder. MCP never falls back to sticky WORKSPACE_ROOT in mcp.json."
   );
 
 function parseMaxTokens(envValue: string | undefined, fallback: number): number {
@@ -1101,7 +1203,12 @@ function assertHasFileSections(text: string, stage: string): void {
 /** QA may return SUMMARY-only (run tests) or FILE sections (write tests). */
 function assertQaResponse(text: string, stage: string): void {
   assertUsableLlmText(text, stage);
-  const files = parseFileSections(text);
+  const sc = validateQaSelfCheck(text);
+  if (!sc.ok) {
+    throw new LlmContentError(stage, "parse_failed", sc.message);
+  }
+  const payload = stripSeQaTrailMarkers(text);
+  const files = parseFileSections(payload);
   if (files.length > 0) {
     for (const file of files) {
       if (!sanitizeFileBody(file.content).trim()) {
@@ -1118,7 +1225,7 @@ function assertQaResponse(text: string, stage: string): void {
     throw new LlmContentError(
       stage,
       "no_file_sections",
-      "expected ===FILE:=== and/or ===SUMMARY==="
+      "expected ===FILE:=== and/or ===SUMMARY=== plus ===SELF_CHECK==="
     );
   }
 }
@@ -1535,12 +1642,7 @@ async function consultTeammate(opts: {
       llm,
       [
         new SystemMessage(
-          [
-            `You are the team's ${opts.advisor}.`,
-            `Duties: ${ROLE_DUTIES[opts.advisor]}.`,
-            `Answer briefly for the ${opts.asker}.`,
-            "Stay in your lane. Max ~200 words. No ===FILE=== unless asked.",
-          ].join(" ")
+          consultAdvisorPrompt(opts.advisor, opts.asker)
         ),
         new HumanMessage(
           [
@@ -1687,6 +1789,12 @@ const OrchestratorState = Annotation.Root({
     reducer: (_left, right) => right ?? [],
     default: () => [],
   }),
+  /** Slugs still needing SA → UX → TA draft pipeline (shrinks after TA enrich). */
+  pendingSpecDrafts: Annotation<string[]>({
+    reducer: (_left, right) => right ?? [],
+    default: () => [],
+  }),
+  currentSpecSlug: Annotation<string>(),
   completedSpecs: Annotation<string[]>({
     reducer: (left, right) => [...new Set([...(left ?? []), ...(right ?? [])])],
     default: () => [],
@@ -1725,6 +1833,16 @@ const OrchestratorState = Annotation.Root({
   }),
   failureKind: Annotation<string>(),
   resumeHint: Annotation<string>(),
+  /** SA post-dev summary for the human owner */
+  projectSummary: Annotation<string>(),
+  /** SA disposition of QA tech debt */
+  techDebtDisposition: Annotation<string>(),
+  /** Plan-mode action plan for the user to decide */
+  techDebtActionPlan: Annotation<string>(),
+  /** Combined markdown report presented to the user */
+  userReport: Annotation<string>(),
+  /** After summary: whether SA should review tech-debt.md */
+  pendingTechDebtReview: Annotation<boolean>(),
 });
 
 type OrchestratorStateType = typeof OrchestratorState.State;
@@ -1905,20 +2023,7 @@ async function orchestratorBootstrapReadmeNode(
 
     const sa = roleLlm("systemArchitect");
     const messages = [
-      new SystemMessage(
-        [
-          "You are the Orchestrator preparing the project charter.",
-          "Reply using EXACTLY this structure (no outer code fence):",
-          "===RESUME===",
-          `A project resume in plain language, maximum ${MAX_RESUME_WORDS} words.`,
-          "Describe what the product is and who it serves. No tech stack, no code.",
-          "===PRE_REQUIREMENTS===",
-          "A numbered list (1. 2. 3. …) of pré-requirements: user needs and functionalities",
-          "from the idea only. Each item one short line. No technology, libraries, or code.",
-          "Stay faithful to the user idea — do not invent features that contradict it",
-          "(e.g. do not add limited lives if the user asked for infinite lives).",
-        ].join(" ")
-      ),
+      new SystemMessage(systemArchitectBootstrapPrompt(MAX_RESUME_WORDS)),
       new HumanMessage(
         [
           `Project root (relative): ${state.projectRoot || "."}`,
@@ -2072,20 +2177,7 @@ async function systemArchitectReqItemNode(
 
       const sa = roleLlm("systemArchitect");
       const messages = [
-        new SystemMessage(
-          [
-            "You are a System Architect.",
-            "Expand ONE pré-requirement into requirements Markdown.",
-            "Reply with ONLY the section body (no outer code fence), starting with:",
-            `## ${index}. <short title>`,
-            "Then cover: goal, functional requirements, non-functional notes,",
-            "acceptance criteria for this pré-req only.",
-            "FIDELITY (critical): Stay strictly aligned with the original user idea",
-            "and the Resume. Do NOT invent contradicting rules (lives, game-over,",
-            "stack, audio, etc.). No application code, shell, JSON, or tool calls.",
-            "No technology choices — those come later.",
-          ].join(" ")
-        ),
+        new SystemMessage(systemArchitectReqItemPrompt(String(index))),
         new HumanMessage(
           [
             "## Original user idea (source of truth)",
@@ -2109,16 +2201,30 @@ async function systemArchitectReqItemNode(
           stage: "systemArchitectReqItem",
           validate: (c) => {
             assertUsableLlmText(c, "systemArchitectReqItem");
-            if (!/^##\s+/m.test(c.trim())) {
+            const { body, check } = splitSelfCheck(
+              stripOuterMarkdownFence(c)
+            );
+            const sc = validateSaRequirementsSelfCheck(check);
+            if (!sc.ok) {
               throw new LlmContentError(
                 "systemArchitectReqItem",
                 "parse_failed",
-                "expected a ## heading section"
+                sc.message
+              );
+            }
+            if (!/^##\s+/m.test(body.trim())) {
+              throw new LlmContentError(
+                "systemArchitectReqItem",
+                "parse_failed",
+                "expected a ## heading section before ===SELF_CHECK==="
               );
             }
           },
         });
-        section = stripOuterMarkdownFence(String(res.content ?? "")).trim();
+        const split = splitSelfCheck(
+          stripOuterMarkdownFence(String(res.content ?? ""))
+        );
+        section = split.body.trim();
       } catch (err) {
         if (
           !(err instanceof LlmRetriesExhaustedError) &&
@@ -2256,9 +2362,9 @@ async function orchestratorCleanReadmeNode(
       (s, m) => notify(s, m),
       appRoot,
       "orchestratorCleanReadme",
-      `requirements phase DONE (${n} pré-reqs) → fidelity`,
+      `requirements phase DONE (${n} pré-reqs) → UI/UX juice`,
       {
-        phase: "fidelity",
+        phase: "requirements",
         preReqs: {
           total: state.preReqTotal ?? n,
           completed: n,
@@ -2276,6 +2382,98 @@ async function orchestratorCleanReadmeNode(
   });
 }
 
+async function uiUxRequirementsNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("uiUxRequirements", async () => {
+    const appRoot = appRootOf(state);
+    const [readme, requirementsFromDisk] = await Promise.all([
+      readDoc(appRoot, README_PATH),
+      readDoc(appRoot, REQUIREMENTS_PATH),
+    ]);
+    const requirements = requirementsFromDisk.startsWith("[Document missing:")
+      ? ""
+      : requirementsFromDisk;
+
+    const messages = [
+      new SystemMessage(uiUxRequirementsPrompt()),
+      new HumanMessage(
+        [
+          "## Original user idea (source of truth)",
+          state.userIdea,
+          "",
+          "## README.md",
+          readme,
+          "",
+          "## .docs/requirements.md",
+          requirements || "(empty — still score and propose juice guidance)",
+        ].join("\n")
+      ),
+    ];
+
+    let parsed;
+    try {
+      const res = await invokeRoleLlm("uiUxDesigner", messages, {
+        stage: "uiUxRequirements",
+        validate: (c) => {
+          assertUsableLlmText(c, "uiUxRequirements");
+          const p = parseUiUxRequirementsResponse(c);
+          const v = validateUiUxRequirementsResponse(p);
+          if (!v.ok) {
+            throw new LlmContentError(
+              "uiUxRequirements",
+              "parse_failed",
+              v.message
+            );
+          }
+        },
+      });
+      parsed = parseUiUxRequirementsResponse(String(res.content ?? ""));
+      const v = validateUiUxRequirementsResponse(parsed);
+      if (!parsed || !v.ok) {
+        throw new LlmContentError(
+          "uiUxRequirements",
+          "parse_failed",
+          v.message
+        );
+      }
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
+      }
+      recordLlmEmpty();
+      throw classifiedError(
+        `[uiUxRequirements] llm_empty after retries (${contentKindOf(err)}): ${errorText(err)}`,
+        "llm_empty",
+        "workflow=docs — UX juice addendum failed; re-run after SA requirements"
+      );
+    }
+
+    const nextReqs = upsertRequirementsUxAddendum(
+      requirements || "# Requirements\n",
+      parsed!.addendum
+    );
+    await writeDoc(appRoot, REQUIREMENTS_PATH, nextReqs.endsWith("\n") ? nextReqs : nextReqs + "\n");
+
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "uiUxRequirements",
+      `UX juice ${parsed!.scoreBefore}→${parsed!.scoreAfter}/10 (addendum written)`,
+      {
+        phase: "requirements",
+      }
+    );
+
+    return {
+      requirements: nextReqs,
+    };
+  });
+}
+
 async function technologyArchitectNode(
   state: OrchestratorStateType
 ): Promise<Partial<OrchestratorStateType>> {
@@ -2289,27 +2487,7 @@ async function technologyArchitectNode(
     const ta = roleLlm("technologyArchitect");
     void ta;
     const messages = [
-      new SystemMessage(
-        [
-          "You are a Technology Architect.",
-          "Treat README.md as the source of truth for project goals.",
-          "Reply using EXACTLY this structure (no outer code fence):",
-          "===SUMMARY===",
-          "2–4 sentences summarizing key technology decisions (for the README).",
-          "===TECH===",
-          "A Markdown technology design document with EXACTLY these level-2 headings (in order):",
-          "## Technology decisions",
-          "## Folder architecture",
-          "## Stacks",
-          "## Schemas / API exposure",
-          "## Security",
-          "## Development standards",
-          "Under Folder architecture: define the project folder layout agents must create and use",
-          "(including .docs/, specs, source layout).",
-          "Under Development standards: require clean code, semantic naming, and human-readable code.",
-          "No thinking aloud, no shell commands, no tool calls.",
-        ].join(" ")
-      ),
+      new SystemMessage(technologyArchitectPrompt()),
       new HumanMessage(
         [
           "## README.md",
@@ -2337,10 +2515,20 @@ async function technologyArchitectNode(
     try {
       const res = await invokeRoleLlm("technologyArchitect", messages, {
         stage: "technologyArchitect",
-        validate: (c) =>
-          assertParsedTechSummaryAndBody(c, "technologyArchitect"),
+        validate: (c) => {
+          const { body, check } = splitSelfCheck(c);
+          const sc = validateKeyedSelfCheck(check, TA_SELF_CHECK_KEYS);
+          if (!sc.ok) {
+            throw new LlmContentError(
+              "technologyArchitect",
+              "parse_failed",
+              sc.message
+            );
+          }
+          assertParsedTechSummaryAndBody(body, "technologyArchitect");
+        },
       });
-      raw = String(res.content ?? "");
+      raw = splitSelfCheck(String(res.content ?? "")).body;
     } catch (err) {
       if (
         !(err instanceof LlmRetriesExhaustedError) &&
@@ -2412,10 +2600,10 @@ async function technologyArchitectNode(
   });
 }
 
-async function systemArchitectSpecsNode(
+async function uiUxDesignSystemNode(
   state: OrchestratorStateType
 ): Promise<Partial<OrchestratorStateType>> {
-  return timedStage("systemArchitectSpecs", async () => {
+  return timedStage("uiUxDesignSystem", async () => {
     const appRoot = appRootOf(state);
     const [readme, requirements, technologies] = await Promise.all([
       readDoc(appRoot, README_PATH),
@@ -2423,27 +2611,13 @@ async function systemArchitectSpecsNode(
       readDoc(appRoot, TECHNOLOGIES_PATH),
     ]);
 
-    const sa = roleLlm("systemArchitect");
-    void sa;
     const messages = [
-      new SystemMessage(
-        [
-          "You are a System Architect doing spec-driven planning.",
-          "Break requirements into small deliverable tasks.",
-          "Reply using EXACTLY this structure (no outer code fence):",
-          "===TODO===",
-          "A Markdown checklist. Each line MUST be:",
-          "- [ ] slug: Short title",
-          "where slug is lowercase kebab-case (letters, digits, hyphens) and matches the spec file name.",
-          "===SPEC: slug===",
-          "One Markdown spec per todo item (same slug), suitable for spec-driven development:",
-          "goal, acceptance criteria, files to touch, out of scope.",
-          "Emit one ===SPEC: slug=== block per todo line. Keep specs concise.",
-          "No application source code, no shell commands.",
-        ].join(" ")
-      ),
+      new SystemMessage(uiUxDesignSystemPrompt()),
       new HumanMessage(
         [
+          "## Original user idea",
+          state.userIdea,
+          "",
           "## README.md",
           readme,
           "",
@@ -2456,25 +2630,33 @@ async function systemArchitectSpecsNode(
       ),
     ];
 
-    let todoMd: string;
-    let specs: { slug: string; content: string }[];
-
+    let designMd: string;
     try {
-      const res = await invokeRoleLlm("systemArchitect", messages, {
-        stage: "systemArchitectSpecs",
-        validate: (c) => assertParsedTodoAndSpecs(c, "systemArchitectSpecs"),
+      const res = await invokeRoleLlm("uiUxDesigner", messages, {
+        stage: "uiUxDesignSystem",
+        validate: (c) => {
+          assertUsableLlmText(c, "uiUxDesignSystem");
+          const p = parseUiUxDesignSystemResponse(c);
+          const v = validateUiUxDesignSystemResponse(p);
+          if (!v.ok) {
+            throw new LlmContentError(
+              "uiUxDesignSystem",
+              "parse_failed",
+              v.message
+            );
+          }
+        },
       });
-      const raw = String(res.content ?? "");
-      const parsed = parseTodoAndSpecs(raw);
-      if (!parsed) {
+      const parsed = parseUiUxDesignSystemResponse(String(res.content ?? ""));
+      const v = validateUiUxDesignSystemResponse(parsed);
+      if (!parsed || !v.ok) {
         throw new LlmContentError(
-          "systemArchitectSpecs",
+          "uiUxDesignSystem",
           "parse_failed",
-          "parse returned null after validate"
+          v.message
         );
       }
-      todoMd = parsed.todo;
-      specs = parsed.specs;
+      designMd = parsed.design;
     } catch (err) {
       if (
         !(err instanceof LlmRetriesExhaustedError) &&
@@ -2484,58 +2666,168 @@ async function systemArchitectSpecsNode(
       }
       recordLlmEmpty();
       throw classifiedError(
-        `[systemArchitectSpecs] llm_empty after retries (${contentKindOf(err)}): ${errorText(err)}`,
+        `[uiUxDesignSystem] llm_empty after retries (${contentKindOf(err)}): ${errorText(err)}`,
         "llm_empty",
-        `workflow=feature — specs failed; refuse implement-core stub`
+        "workflow=docs — UI/UX look-and-feel doc failed after technologies"
       );
     }
 
-    await writeDoc(appRoot, TODO_PATH, todoMd.endsWith("\n") ? todoMd : todoMd + "\n");
-    for (const spec of specs) {
-      try {
-        assertFilesToTouchClean(spec.content, spec.slug);
-      } catch (err) {
-        throw classifiedError(
-          `[systemArchitectSpecs] ${errorText(err)}`,
-          "spec_incomplete",
-          `workflow=feature — fix Files to touch in ${spec.slug}`
+    await writeDoc(
+      appRoot,
+      UI_UX_PATH,
+      designMd.endsWith("\n") ? designMd : designMd + "\n"
+    );
+
+    let readmeNext = await readDoc(appRoot, README_PATH);
+    const uxLink = `- [UI/UX look and feel](${UI_UX_PATH}) — style, palette, sensory behavior, emotion strategies`;
+    if (!readmeNext.includes(`[UI/UX look and feel](${UI_UX_PATH})`)) {
+      if (readmeNext.includes(`[Technology decisions](${TECHNOLOGIES_PATH})`)) {
+        readmeNext = readmeNext.replace(
+          `- [Technology decisions](${TECHNOLOGIES_PATH}) — stack, folder architecture, standards`,
+          [
+            `- [Technology decisions](${TECHNOLOGIES_PATH}) — stack, folder architecture, standards`,
+            uxLink,
+          ].join("\n")
+        );
+      } else if (readmeNext.includes("## Documentation")) {
+        readmeNext = upsertReadmeSection(
+          readmeNext,
+          "Documentation",
+          [
+            `- [Requirements](${REQUIREMENTS_PATH}) — functional and non-functional requirements`,
+            `- [Technology decisions](${TECHNOLOGIES_PATH}) — stack, folder architecture, standards`,
+            uxLink,
+          ].join("\n")
+        );
+      } else {
+        readmeNext = `${readmeNext.trimEnd()}\n\n## Documentation\n\n${uxLink}\n`;
+      }
+      await writeDoc(appRoot, README_PATH, readmeNext);
+    }
+
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "uiUxDesignSystem",
+      `wrote ${UI_UX_PATH} (look-and-feel + evidence-based emotion strategies)`,
+      { phase: "technology" }
+    );
+
+    return {};
+  });
+}
+
+async function systemArchitectTodoPlanNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("systemArchitectTodoPlan", async () => {
+    const appRoot = appRootOf(state);
+    const [readme, requirements, technologies, uiUx] = await Promise.all([
+      readDoc(appRoot, README_PATH),
+      readDoc(appRoot, REQUIREMENTS_PATH),
+      readDoc(appRoot, TECHNOLOGIES_PATH),
+      readDoc(appRoot, UI_UX_PATH),
+    ]);
+
+    const messages = [
+      new SystemMessage(systemArchitectTodoPlanPrompt()),
+      new HumanMessage(
+        [
+          "## Original user idea",
+          state.userIdea,
+          "",
+          "## README.md",
+          readme,
+          "",
+          "## .docs/requirements.md",
+          requirements,
+          "",
+          "## .docs/technologies.md",
+          technologies,
+          "",
+          "## .docs/ui-ux.md",
+          uiUx.startsWith("[Document missing:")
+            ? "(optional context)"
+            : uiUx,
+        ].join("\n")
+      ),
+    ];
+
+    let todoMd: string;
+    let planNotes: string;
+    try {
+      const res = await invokeRoleLlm("systemArchitect", messages, {
+        stage: "systemArchitectTodoPlan",
+        validate: (c) => {
+          assertUsableLlmText(c, "systemArchitectTodoPlan");
+          const p = parseTodoPlanResponse(c);
+          const sc = validateKeyedSelfCheck(
+            p?.check ?? null,
+            SA_TODO_PLAN_SELF_CHECK_KEYS
+          );
+          if (!p || !sc.ok) {
+            throw new LlmContentError(
+              "systemArchitectTodoPlan",
+              "parse_failed",
+              sc.message || "expected ===PLAN=== + ===TODO=== + SELF_CHECK"
+            );
+          }
+        },
+      });
+      const parsed = parseTodoPlanResponse(String(res.content ?? ""));
+      const sc = validateKeyedSelfCheck(
+        parsed?.check ?? null,
+        SA_TODO_PLAN_SELF_CHECK_KEYS
+      );
+      if (!parsed || !sc.ok) {
+        throw new LlmContentError(
+          "systemArchitectTodoPlan",
+          "parse_failed",
+          sc.message
         );
       }
-      await writeDoc(appRoot, specPath(spec.slug), spec.content + "\n");
-    }
-
-    const pendingFromTodo = parseTodoChecklist(todoMd)
-      .filter((t) => !t.done)
-      .map((t) => t.slug);
-    const pendingSpecs =
-      pendingFromTodo.length > 0 ? pendingFromTodo : specs.map((s) => s.slug);
-
-    const missingOnDisk: string[] = [];
-    for (const slug of pendingSpecs) {
-      if (!(await pathExists(join(appRoot, specPath(slug))))) {
-        missingOnDisk.push(slug);
+      todoMd = parsed.todo;
+      planNotes = parsed.plan;
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
       }
-    }
-    if (missingOnDisk.length > 0) {
+      recordLlmEmpty();
       throw classifiedError(
-        `[systemArchitectSpecs] missing .spec.md on disk for: ${missingOnDisk.join(", ")}`,
-        "spec_incomplete",
-        `workflow=feature — regenerate specs for ${missingOnDisk.join(",")}`
+        `[systemArchitectTodoPlan] llm_empty after retries (${contentKindOf(err)}): ${errorText(err)}`,
+        "llm_empty",
+        "workflow=feature — todo plan failed"
       );
     }
 
-    getProgress().setPending({
-      pendingSpecs,
-      pendingQaSpecs: [...pendingSpecs],
-      pendingPreReqs: [],
-    });
+    const withPlan =
+      planNotes.trim().length > 0
+        ? `# Todo\n\n## Plan notes\n\n${planNotes.trim()}\n\n## Checklist\n\n${todoMd.trim()}\n`
+        : todoMd.endsWith("\n")
+          ? todoMd
+          : todoMd + "\n";
+    await writeDoc(appRoot, TODO_PATH, withPlan.endsWith("\n") ? withPlan : withPlan + "\n");
+
+    const pending = parseTodoChecklist(withPlan)
+      .filter((t) => !t.done)
+      .map((t) => t.slug);
+    if (pending.length === 0) {
+      throw classifiedError(
+        "[systemArchitectTodoPlan] todo checklist empty",
+        "spec_incomplete",
+        "workflow=feature — SA must emit at least one - [ ] slug: title"
+      );
+    }
 
     let readmeUpdated = await readDoc(appRoot, README_PATH);
     readmeUpdated = upsertReadmeSection(
       readmeUpdated,
       "Implementation plan",
       [
-        "Tasks and specs for spec-driven development:",
+        "Tasks and specs for spec-driven development (SA → UI/UX → TA per slug):",
         "",
         `- [Todo](${TODO_PATH}) — deliverable checklist`,
         `- Specs in [\`${SPECS_DIR}/\`](${SPECS_DIR}/) — one \`.spec.md\` per todo item`,
@@ -2543,27 +2835,397 @@ async function systemArchitectSpecsNode(
     );
     await writeDoc(appRoot, README_PATH, readmeUpdated);
 
-    const slugs =
-      pendingSpecs.length > 0
-        ? pendingSpecs
-        : listSpecSlugsFromTodo(todoMd);
-    const docsOnly = state.workflow === "docs" || state.docsOnly;
+    getProgress().setPending({
+      pendingSpecs: pending,
+      pendingQaSpecs: [...pending],
+      pendingPreReqs: [],
+    });
+
     await archNotify(
       (s, m) => notify(s, m),
       appRoot,
-      "systemArchitectSpecs",
-      `specs ready: ${slugs.length} tasks — ${formatSlugList(slugs)}`,
+      "systemArchitectTodoPlan",
+      `todo planned: ${pending.length} specs — ${formatSlugList(pending)}`,
       {
-        phase: docsOnly ? "done" : "specs",
-        specs: { count: slugs.length, slugs },
+        phase: "specs",
+        specs: { count: pending.length, slugs: pending },
       }
     );
 
     return {
-      todo: todoMd,
-      pendingSpecs,
-      pendingQaSpecs: [...pendingSpecs],
+      todo: withPlan,
+      pendingSpecs: pending,
+      pendingSpecDrafts: pending,
+      pendingQaSpecs: [...pending],
+      currentSpecSlug: pending[0] || "",
       completedSpecs: [],
+    };
+  });
+}
+
+async function systemArchitectSpecItemNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("systemArchitectSpecItem", async () => {
+    const appRoot = appRootOf(state);
+    const drafts = [...(state.pendingSpecDrafts ?? [])];
+    const slug = drafts[0] || state.currentSpecSlug || "";
+    if (!slug) {
+      notify("systemArchitectSpecItem", "No pending spec drafts; skipping");
+      return { pendingSpecDrafts: [] };
+    }
+
+    const [requirements, todo, technologies] = await Promise.all([
+      readDoc(appRoot, REQUIREMENTS_PATH),
+      readDoc(appRoot, TODO_PATH),
+      readDoc(appRoot, TECHNOLOGIES_PATH),
+    ]);
+    const todoItem = parseTodoChecklist(todo).find((t) => t.slug === slug);
+
+    const messages = [
+      new SystemMessage(systemArchitectSpecItemPrompt(slug)),
+      new HumanMessage(
+        [
+          `## Current todo item: ${slug}`,
+          todoItem ? `${todoItem.slug}: ${todoItem.title}` : slug,
+          "",
+          "## .docs/todo.md",
+          todo,
+          "",
+          "## .docs/requirements.md",
+          requirements,
+          "",
+          "## .docs/technologies.md (context only — TA will deepen tech later)",
+          technologies.startsWith("[Document missing:")
+            ? "(missing)"
+            : technologies.slice(0, 4000),
+        ].join("\n")
+      ),
+    ];
+
+    let content: string;
+    try {
+      const res = await invokeRoleLlm("systemArchitect", messages, {
+        stage: "systemArchitectSpecItem",
+        validate: (c) => {
+          assertUsableLlmText(c, "systemArchitectSpecItem");
+          const p = parseSingleSpecResponse(c, slug);
+          const sc = validateKeyedSelfCheck(
+            p?.check ?? null,
+            SA_SPEC_ITEM_SELF_CHECK_KEYS
+          );
+          if (!p || !sc.ok) {
+            throw new LlmContentError(
+              "systemArchitectSpecItem",
+              "parse_failed",
+              sc.message || `expected ===SPEC: ${slug}=== + SELF_CHECK`
+            );
+          }
+          try {
+            assertFilesToTouchClean(p.content, slug);
+            assertSpecUseCasesMinimum(p.content, "systemArchitectSpecItem");
+          } catch (err) {
+            throw new LlmContentError(
+              "systemArchitectSpecItem",
+              "parse_failed",
+              errorText(err)
+            );
+          }
+        },
+      });
+      const parsed = parseSingleSpecResponse(String(res.content ?? ""), slug);
+      const sc = validateKeyedSelfCheck(
+        parsed?.check ?? null,
+        SA_SPEC_ITEM_SELF_CHECK_KEYS
+      );
+      if (!parsed || !sc.ok) {
+        throw new LlmContentError(
+          "systemArchitectSpecItem",
+          "parse_failed",
+          sc.message
+        );
+      }
+      content = parsed.content;
+      try {
+        assertFilesToTouchClean(content, slug);
+        assertSpecUseCasesMinimum(content, "systemArchitectSpecItem");
+      } catch (err) {
+        throw new LlmContentError(
+          "systemArchitectSpecItem",
+          "parse_failed",
+          errorText(err)
+        );
+      }
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
+      }
+      recordLlmEmpty();
+      throw classifiedError(
+        `[systemArchitectSpecItem] ${slug} failed (${contentKindOf(err)}): ${errorText(err)}`,
+        "llm_empty",
+        `workflow=feature — regenerate spec ${slug}`
+      );
+    }
+
+    await writeDoc(appRoot, specPath(slug), content.endsWith("\n") ? content : content + "\n");
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "systemArchitectSpecItem",
+      `SA draft spec: ${slug}`,
+      { phase: "specs", specs: { current: slug } }
+    );
+    return { currentSpecSlug: slug };
+  });
+}
+
+async function uiUxSpecEnrichNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("uiUxSpecEnrich", async () => {
+    const appRoot = appRootOf(state);
+    const slug =
+      state.currentSpecSlug ||
+      (state.pendingSpecDrafts ?? [])[0] ||
+      "";
+    if (!slug) {
+      notify("uiUxSpecEnrich", "No current spec; skipping");
+      return {};
+    }
+
+    const [specBody, requirements, uiUx] = await Promise.all([
+      readDoc(appRoot, specPath(slug)),
+      readDoc(appRoot, REQUIREMENTS_PATH),
+      readDoc(appRoot, UI_UX_PATH),
+    ]);
+
+    const messages = [
+      new SystemMessage(uiUxSpecEnrichPrompt(slug)),
+      new HumanMessage(
+        [
+          `## Current spec (${slug})`,
+          specBody,
+          "",
+          "## .docs/ui-ux.md",
+          uiUx.startsWith("[Document missing:")
+            ? "(missing — apply general juice/usability)"
+            : uiUx,
+          "",
+          "## .docs/requirements.md",
+          requirements.slice(0, 6000),
+        ].join("\n")
+      ),
+    ];
+
+    let content: string;
+    try {
+      const res = await invokeRoleLlm("uiUxDesigner", messages, {
+        stage: "uiUxSpecEnrich",
+        validate: (c) => {
+          assertUsableLlmText(c, "uiUxSpecEnrich");
+          const p = parseSingleSpecResponse(c, slug);
+          const sc = validateKeyedSelfCheck(
+            p?.check ?? null,
+            UX_SPEC_ENRICH_SELF_CHECK_KEYS
+          );
+          if (!p || !sc.ok) {
+            throw new LlmContentError(
+              "uiUxSpecEnrich",
+              "parse_failed",
+              sc.message || `expected ===SPEC: ${slug}=== + SELF_CHECK`
+            );
+          }
+          try {
+            assertSpecUseCasesMinimum(p.content, "uiUxSpecEnrich");
+          } catch (err) {
+            throw new LlmContentError(
+              "uiUxSpecEnrich",
+              "parse_failed",
+              errorText(err)
+            );
+          }
+        },
+      });
+      const parsed = parseSingleSpecResponse(String(res.content ?? ""), slug);
+      const sc = validateKeyedSelfCheck(
+        parsed?.check ?? null,
+        UX_SPEC_ENRICH_SELF_CHECK_KEYS
+      );
+      if (!parsed || !sc.ok) {
+        throw new LlmContentError(
+          "uiUxSpecEnrich",
+          "parse_failed",
+          sc.message
+        );
+      }
+      content = parsed.content;
+      try {
+        assertSpecUseCasesMinimum(content, "uiUxSpecEnrich");
+      } catch (err) {
+        throw new LlmContentError(
+          "uiUxSpecEnrich",
+          "parse_failed",
+          errorText(err)
+        );
+      }
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
+      }
+      recordLlmEmpty();
+      throw classifiedError(
+        `[uiUxSpecEnrich] ${slug} failed (${contentKindOf(err)}): ${errorText(err)}`,
+        "llm_empty",
+        `workflow=feature — UX enrich ${slug}`
+      );
+    }
+
+    await writeDoc(appRoot, specPath(slug), content.endsWith("\n") ? content : content + "\n");
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "uiUxSpecEnrich",
+      `UX enriched spec: ${slug}`,
+      { phase: "specs", specs: { current: slug } }
+    );
+    return { currentSpecSlug: slug };
+  });
+}
+
+async function technologyArchitectSpecEnrichNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("technologyArchitectSpecEnrich", async () => {
+    const appRoot = appRootOf(state);
+    const slug =
+      state.currentSpecSlug ||
+      (state.pendingSpecDrafts ?? [])[0] ||
+      "";
+    if (!slug) {
+      notify("technologyArchitectSpecEnrich", "No current spec; skipping");
+      return { pendingSpecDrafts: [] };
+    }
+
+    const [specBody, technologies, uiUx] = await Promise.all([
+      readDoc(appRoot, specPath(slug)),
+      readDoc(appRoot, TECHNOLOGIES_PATH),
+      readDoc(appRoot, UI_UX_PATH),
+    ]);
+
+    const messages = [
+      new SystemMessage(technologyArchitectSpecEnrichPrompt(slug)),
+      new HumanMessage(
+        [
+          `## Current spec (${slug})`,
+          specBody,
+          "",
+          "## .docs/technologies.md",
+          technologies,
+          "",
+          "## .docs/ui-ux.md",
+          uiUx.startsWith("[Document missing:") ? "(missing)" : uiUx,
+        ].join("\n")
+      ),
+    ];
+
+    let content: string;
+    try {
+      const res = await invokeRoleLlm("technologyArchitect", messages, {
+        stage: "technologyArchitectSpecEnrich",
+        validate: (c) => {
+          assertUsableLlmText(c, "technologyArchitectSpecEnrich");
+          const p = parseSingleSpecResponse(c, slug);
+          const sc = validateKeyedSelfCheck(
+            p?.check ?? null,
+            TA_SPEC_ENRICH_SELF_CHECK_KEYS
+          );
+          if (!p || !sc.ok) {
+            throw new LlmContentError(
+              "technologyArchitectSpecEnrich",
+              "parse_failed",
+              sc.message || `expected ===SPEC: ${slug}=== + SELF_CHECK`
+            );
+          }
+          try {
+            assertFilesToTouchClean(p.content, slug);
+            assertSpecUseCasesMinimum(
+              p.content,
+              "technologyArchitectSpecEnrich"
+            );
+          } catch (err) {
+            throw new LlmContentError(
+              "technologyArchitectSpecEnrich",
+              "parse_failed",
+              errorText(err)
+            );
+          }
+        },
+      });
+      const parsed = parseSingleSpecResponse(String(res.content ?? ""), slug);
+      const sc = validateKeyedSelfCheck(
+        parsed?.check ?? null,
+        TA_SPEC_ENRICH_SELF_CHECK_KEYS
+      );
+      if (!parsed || !sc.ok) {
+        throw new LlmContentError(
+          "technologyArchitectSpecEnrich",
+          "parse_failed",
+          sc.message
+        );
+      }
+      content = parsed.content;
+      assertFilesToTouchClean(content, slug);
+      assertSpecUseCasesMinimum(content, "technologyArchitectSpecEnrich");
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
+      }
+      recordLlmEmpty();
+      throw classifiedError(
+        `[technologyArchitectSpecEnrich] ${slug} failed (${contentKindOf(err)}): ${errorText(err)}`,
+        err instanceof LlmContentError &&
+          (/Files to touch/i.test(errorText(err)) ||
+            /Use cases/i.test(errorText(err)))
+          ? "spec_incomplete"
+          : "llm_empty",
+        `workflow=feature — TA enrich ${slug}`
+      );
+    }
+
+    await writeDoc(appRoot, specPath(slug), content.endsWith("\n") ? content : content + "\n");
+
+    const remaining = (state.pendingSpecDrafts ?? []).filter((s) => s !== slug);
+    const next = remaining[0] || "";
+
+    await archNotify(
+      (s, m) => notify(s, m),
+      appRoot,
+      "technologyArchitectSpecEnrich",
+      `TA finalized spec: ${slug} (${remaining.length} drafts left)`,
+      {
+        phase: remaining.length > 0 ? "specs" : "specs",
+        specs: {
+          current: next,
+          count: (state.pendingSpecs ?? []).length,
+          slugs: state.pendingSpecs ?? [],
+        },
+      }
+    );
+
+    return {
+      currentSpecSlug: next,
+      pendingSpecDrafts: remaining,
+      completedSpecs: [slug],
     };
   });
 }
@@ -2784,11 +3446,12 @@ async function softwareEngineerNode(
         },
       }
     );
-    const [readme, requirements, technologies, todo] = await Promise.all([
+    const [readme, requirements, technologies, todo, uiUx] = await Promise.all([
       readDoc(appRoot, README_PATH),
       readDoc(appRoot, REQUIREMENTS_PATH),
       readDoc(appRoot, TECHNOLOGIES_PATH),
       readDoc(appRoot, TODO_PATH),
+      readDoc(appRoot, UI_UX_PATH),
     ]);
     const specBodies = await Promise.all(
       batch.map(
@@ -2804,17 +3467,7 @@ async function softwareEngineerNode(
       const res = await invokeRoleLlm(
         "softwareEngineer",
         [
-          new SystemMessage(
-            [
-              "You are a Software Engineer.",
-              "Implement ONLY the current spec(s). Follow README, technologies.md folder layout, and the spec.",
-              "Write clean, semantic, human-readable, production-quality code.",
-              "Prefer calling write_file(path, content) for each file.",
-              "Fallback: ===FILE: relative/path=== then contents.",
-              "Paths relative to project root. No markdown fences. Use .tsx when file has JSX.",
-              "Cover EVERY file listed under Files to touch in each spec.",
-            ].join(" ")
-          ),
+          new SystemMessage(softwareEngineerImplementPrompt()),
           new HumanMessage(
             [
               `## Current spec batch (${batch.join(", ")})`,
@@ -2836,6 +3489,11 @@ async function softwareEngineerNode(
               "",
               "## .docs/technologies.md",
               technologies,
+              "",
+              "## .docs/ui-ux.md",
+              uiUx.startsWith("[Document missing:")
+                ? "(follow usability/emotion notes inside the spec)"
+                : uiUx,
             ]
               .filter(Boolean)
               .join("\n")
@@ -2846,7 +3504,17 @@ async function softwareEngineerNode(
           attempts: SE_INVOKE_ATTEMPTS,
           fileOnlyReprompt: true,
           useWriteFileTool: true,
-          validate: (c) => assertHasFileSections(c, "softwareEngineer"),
+          validate: (c) => {
+            const seCheck = validateSeImplementSelfCheck(c);
+            if (!seCheck.ok) {
+              throw new LlmContentError(
+                "softwareEngineer",
+                "parse_failed",
+                seCheck.message
+              );
+            }
+            assertHasFileSections(stripSeQaTrailMarkers(c), "softwareEngineer");
+          },
         }
       );
       rawContent = String(res.content ?? "");
@@ -2885,7 +3553,8 @@ async function softwareEngineerNode(
       throw err;
     }
 
-    const written = await writeParsedFiles(appRoot, rawContent, projectRoot);
+    const contentForWrite = stripSeQaTrailMarkers(rawContent);
+    const written = await writeParsedFiles(appRoot, contentForWrite, projectRoot);
     const smoke = await runTscSmoke(appRoot, "softwareEngineer");
 
     const specBodiesMap: Record<string, string> = {};
@@ -3048,15 +3717,7 @@ async function softwareEngineerFixNode(
     const res = await invokeRoleLlm(
       "softwareEngineer",
       [
-        new SystemMessage(
-          [
-            "You are a Software Engineer fixing failing tests.",
-            "Apply the minimal fix. Prefer write_file(path, content).",
-            "Fallback: Output ONLY ===FILE: path=== sections for files you change.",
-            "Paths are relative to the project root. Do not prefix with the project folder name.",
-            "No markdown fences around file bodies. Use .tsx for JSX.",
-          ].join(" ")
-        ),
+        new SystemMessage(softwareEngineerFixPrompt()),
         new HumanMessage(
           [
             `## Spec under fix: ${slug || "(unknown)"}`,
@@ -3078,12 +3739,26 @@ async function softwareEngineerFixNode(
         attempts: SE_INVOKE_ATTEMPTS,
         fileOnlyReprompt: true,
         useWriteFileTool: true,
-        validate: (c) => assertHasFileSections(c, "softwareEngineerFix"),
+        validate: (c) => {
+          const seCheck = validateSeImplementSelfCheck(c);
+          if (!seCheck.ok) {
+            throw new LlmContentError(
+              "softwareEngineerFix",
+              "parse_failed",
+              seCheck.message
+            );
+          }
+          assertHasFileSections(stripSeQaTrailMarkers(c), "softwareEngineerFix");
+        },
       }
     );
 
     const rawContent = String(res.content ?? "");
-    const written = await writeParsedFiles(appRoot, rawContent, projectRoot);
+    const written = await writeParsedFiles(
+      appRoot,
+      stripSeQaTrailMarkers(rawContent),
+      projectRoot
+    );
     const round = (state.qaFixRound ?? 0) + 1;
 
     await implNotify(
@@ -3154,27 +3829,18 @@ async function qaEngineerNode(
       }
     );
 
-    const [readme, todo, technologies, specBody] = await Promise.all([
+    const [readme, todo, technologies, requirements, specBody] = await Promise.all([
       readDoc(appRoot, README_PATH),
       readDoc(appRoot, TODO_PATH),
       readDoc(appRoot, TECHNOLOGIES_PATH),
+      readDoc(appRoot, REQUIREMENTS_PATH),
       slug ? readDoc(appRoot, specPath(slug)) : Promise.resolve(""),
     ]);
 
     const res = await invokeRoleLlm(
       "qaEngineer",
       [
-        new SystemMessage(
-          [
-            "You are a QA Engineer. Be concise.",
-            "Validate or create tests for the CURRENT spec only.",
-            "Prefer vitest (npx vitest run) matching technologies.md / package.json scripts.test.",
-            "Output ONE of:",
-            "A) ===SUMMARY=== short notes (no new files) when existing tests suffice — then the runner will execute tests; OR",
-            "B) ===SUMMARY=== optional notes PLUS one or more ===FILE: relative/path=== test files when you must create/update tests.",
-            "Test files with JSX must use .tsx. FORBIDDEN: re-implementing the app, essays, FILE-only without markers.",
-          ].join(" ")
-        ),
+        new SystemMessage(qaEngineerPrompt()),
         new HumanMessage(
           [
             `## Current spec: ${slug}`,
@@ -3185,6 +3851,9 @@ async function qaEngineerNode(
             "",
             "## .docs/todo.md",
             todo,
+            "",
+            "## .docs/requirements.md",
+            requirements,
             "",
             "## .docs/technologies.md",
             technologies,
@@ -3197,13 +3866,25 @@ async function qaEngineerNode(
       }
     );
 
-    const tests = String(res.content ?? "");
+    const testsRaw = String(res.content ?? "");
+    const tests = stripSeQaTrailMarkers(testsRaw);
     const projectRoot = state.projectRoot || ".";
     let written: WriteParsedResult = { count: 0, filesWritten: [] };
     if (parseFileSections(tests).length > 0) {
       written = await writeParsedFiles(appRoot, tests, projectRoot);
     } else {
       notify("qaEngineer", `SUMMARY-only for '${slug}' — running existing tests`);
+    }
+
+    const debtBody = parseTechDebtSection(testsRaw);
+    if (debtBody) {
+      const existingDebt = await readDoc(appRoot, TECH_DEBT_PATH);
+      const nextDebt = appendTechDebtMarkdown(existingDebt, slug || "unknown", debtBody);
+      await writeDoc(appRoot, TECH_DEBT_PATH, nextDebt);
+      notify(
+        "qaEngineer",
+        `appended tech debt for '${slug}' → ${TECH_DEBT_PATH}`
+      );
     }
 
     const result = await runProjectTests(appRoot, "qaEngineer");
@@ -3346,6 +4027,261 @@ async function qaEngineerNode(
   );
 }
 
+async function systemArchitectProjectSummaryNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("systemArchitectProjectSummary", async () => {
+    const appRoot = appRootOf(state);
+    const [readme, requirements] = await Promise.all([
+      readDoc(appRoot, README_PATH),
+      readDoc(appRoot, REQUIREMENTS_PATH),
+    ]);
+
+    let summary = "";
+    try {
+      const res = await invokeRoleLlm(
+        "systemArchitect",
+        [
+          new SystemMessage(systemArchitectProjectSummaryPrompt()),
+          new HumanMessage(
+            [
+              "## README.md",
+              readme,
+              "",
+              "## .docs/requirements.md",
+              requirements,
+              "",
+              "## Original user idea (context only)",
+              state.userIdea || "(none)",
+            ].join("\n")
+          ),
+        ],
+        {
+          stage: "systemArchitectProjectSummary",
+          validate: (c) => {
+            assertUsableLlmText(c, "systemArchitectProjectSummary");
+            const parsed = parseProjectSummaryResponse(c);
+            const sc = validateProjectSummarySelfCheck(parsed?.check ?? null);
+            if (!parsed || !sc.ok) {
+              throw new LlmContentError(
+                "systemArchitectProjectSummary",
+                "parse_failed",
+                sc.message || "expected ===SUMMARY=== + ===SELF_CHECK==="
+              );
+            }
+          },
+        }
+      );
+      const parsed = parseProjectSummaryResponse(String(res.content ?? ""));
+      const sc = validateProjectSummarySelfCheck(parsed?.check ?? null);
+      if (!parsed || !sc.ok) {
+        throw new LlmContentError(
+          "systemArchitectProjectSummary",
+          "parse_failed",
+          sc.message || "expected ===SUMMARY==="
+        );
+      }
+      summary = parsed.summary;
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
+      }
+      recordLlmEmpty();
+      throw classifiedError(
+        `[systemArchitectProjectSummary] failed (${contentKindOf(err)}): ${errorText(err)}`,
+        "llm_empty",
+        "workflow=resume — regenerate project summary"
+      );
+    }
+
+    await writeDoc(
+      appRoot,
+      PROJECT_SUMMARY_PATH,
+      summary.endsWith("\n") ? summary : summary + "\n"
+    );
+    const userReport = buildUserReportMarkdown(summary, null);
+    await writeDoc(appRoot, USER_REPORT_PATH, userReport);
+
+    notify(
+      "systemArchitectProjectSummary",
+      `USER REPORT — project summary ready (${PROJECT_SUMMARY_PATH})`
+    );
+    // Emit the summary body so MCP/CLI surfaces it to the human
+    for (const line of summary.split(/\r?\n/).slice(0, 40)) {
+      if (line.trim()) notify("systemArchitectProjectSummary", line.slice(0, 240));
+    }
+
+    const needsDebtReview = await hasTechDebtDoc(appRoot);
+    if (needsDebtReview) {
+      notify(
+        "systemArchitectProjectSummary",
+        `tech debt found → SA review (${TECH_DEBT_PATH})`
+      );
+    }
+
+    return {
+      appRoot,
+      projectSummary: summary,
+      userReport,
+      pendingTechDebtReview: needsDebtReview,
+    };
+  });
+}
+
+async function hasTechDebtDoc(appRoot: string): Promise<boolean> {
+  const debt = await readDoc(appRoot, TECH_DEBT_PATH);
+  if (debt.startsWith("[Document missing:")) return false;
+  const stripped = debt
+    .replace(/^#\s*Technical debt[^\n]*\n*/i, "")
+    .replace(/Issues found in specs[^\n]*\n*/i, "")
+    .trim();
+  return stripped.length > 40;
+}
+
+async function systemArchitectTechDebtReviewNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("systemArchitectTechDebtReview", async () => {
+    const appRoot = appRootOf(state);
+    const projectRoot = state.projectRoot || ".";
+    const [readme, requirements, techDebt, summaryExisting] = await Promise.all([
+      readDoc(appRoot, README_PATH),
+      readDoc(appRoot, REQUIREMENTS_PATH),
+      readDoc(appRoot, TECH_DEBT_PATH),
+      readDoc(appRoot, PROJECT_SUMMARY_PATH),
+    ]);
+
+    let disposition = "";
+    let actionPlan = "";
+    let writtenCount = 0;
+    try {
+      const res = await invokeRoleLlm(
+        "systemArchitect",
+        [
+          new SystemMessage(systemArchitectTechDebtReviewPrompt()),
+          new HumanMessage(
+            [
+              "## .docs/tech-debt.md",
+              techDebt,
+              "",
+              "## .docs/requirements.md",
+              requirements,
+              "",
+              "## README.md",
+              readme,
+              "",
+              "## Project summary (if any)",
+              summaryExisting.startsWith("[Document missing:")
+                ? state.projectSummary || "(none)"
+                : summaryExisting,
+              "",
+              "## Original user idea (spirit context)",
+              state.userIdea || "(none)",
+            ].join("\n")
+          ),
+        ],
+        {
+          stage: "systemArchitectTechDebtReview",
+          fileOnlyReprompt: false,
+          useWriteFileTool: true,
+          validate: (c) => {
+            assertUsableLlmText(c, "systemArchitectTechDebtReview");
+            const parsed = parseTechDebtReviewResponse(c);
+            const sc = validateTechDebtReviewSelfCheck(parsed?.check ?? null);
+            if (!parsed || !sc.ok) {
+              throw new LlmContentError(
+                "systemArchitectTechDebtReview",
+                "parse_failed",
+                sc.message ||
+                  "expected ===DISPOSITION=== + ===ACTION_PLAN=== + ===SELF_CHECK==="
+              );
+            }
+          },
+        }
+      );
+      const raw = String(res.content ?? "");
+      const parsed = parseTechDebtReviewResponse(raw);
+      const sc = validateTechDebtReviewSelfCheck(parsed?.check ?? null);
+      if (!parsed || !sc.ok) {
+        throw new LlmContentError(
+          "systemArchitectTechDebtReview",
+          "parse_failed",
+          sc.message || "expected DISPOSITION + ACTION_PLAN"
+        );
+      }
+      disposition = parsed.disposition;
+      actionPlan = parsed.actionPlan;
+
+      if (parseFileSections(parsed.payloadForFiles).length > 0) {
+        const written = await writeParsedFiles(
+          appRoot,
+          parsed.payloadForFiles,
+          projectRoot
+        );
+        writtenCount = written.count;
+      }
+    } catch (err) {
+      if (
+        !(err instanceof LlmRetriesExhaustedError) &&
+        !(err instanceof LlmContentError)
+      ) {
+        throw err;
+      }
+      recordLlmEmpty();
+      throw classifiedError(
+        `[systemArchitectTechDebtReview] failed (${contentKindOf(err)}): ${errorText(err)}`,
+        "llm_empty",
+        "workflow=resume — regenerate tech-debt review"
+      );
+    }
+
+    const debtUpdated = [
+      techDebt.startsWith("[Document missing:")
+        ? "# Technical debt (from QA)\n\n"
+        : techDebt.trimEnd() + "\n\n",
+      "## SA disposition (post-development)\n\n",
+      disposition.trim(),
+      "\n",
+    ].join("");
+    await writeDoc(appRoot, TECH_DEBT_PATH, debtUpdated);
+
+    await writeDoc(
+      appRoot,
+      TECH_DEBT_PLAN_PATH,
+      actionPlan.endsWith("\n") ? actionPlan : actionPlan + "\n"
+    );
+
+    const summary =
+      (state.projectSummary || "").trim() ||
+      (summaryExisting.startsWith("[Document missing:")
+        ? ""
+        : summaryExisting);
+    const userReport = buildUserReportMarkdown(summary || "(summary pending)", actionPlan);
+    await writeDoc(appRoot, USER_REPORT_PATH, userReport);
+
+    notify(
+      "systemArchitectTechDebtReview",
+      `USER REPORT — tech-debt plan ready (${TECH_DEBT_PLAN_PATH}); docs updated: ${writtenCount}`
+    );
+    for (const line of actionPlan.split(/\r?\n/).slice(0, 30)) {
+      if (line.trim())
+        notify("systemArchitectTechDebtReview", line.slice(0, 240));
+    }
+
+    return {
+      appRoot,
+      techDebtDisposition: disposition,
+      techDebtActionPlan: actionPlan,
+      userReport,
+      projectSummary: summary || state.projectSummary || "",
+      pendingTechDebtReview: false,
+    };
+  });
+}
+
 async function orchestratorFinalizeNode(
   state: OrchestratorStateType
 ): Promise<Partial<OrchestratorStateType>> {
@@ -3399,6 +4335,55 @@ async function orchestratorFinalizeNode(
       );
     }
 
+    const techDebtDoc = await readDoc(appRoot, TECH_DEBT_PATH);
+    if (
+      !techDebtDoc.startsWith("[Document missing:") &&
+      techDebtDoc.trim().length > 0
+    ) {
+      statusLines.push(
+        `QA reported technical debt — see [${TECH_DEBT_PATH}](${TECH_DEBT_PATH}).`
+      );
+      if (
+        !readme.includes(`[${TECH_DEBT_PATH}](${TECH_DEBT_PATH})`) &&
+        !readme.includes(TECH_DEBT_PATH)
+      ) {
+        readme = upsertReadmeSection(
+          readme,
+          "Technical debt",
+          `Issues flagged by QA for the orchestrator: [${TECH_DEBT_PATH}](${TECH_DEBT_PATH}).`
+        );
+      }
+    }
+
+    if ((state.projectSummary || "").trim()) {
+      statusLines.push(
+        `Project summary for owner: [${PROJECT_SUMMARY_PATH}](${PROJECT_SUMMARY_PATH}).`
+      );
+    }
+    if ((state.techDebtActionPlan || "").trim()) {
+      statusLines.push(
+        `Tech-debt action plan (decide): [${TECH_DEBT_PLAN_PATH}](${TECH_DEBT_PLAN_PATH}).`
+      );
+    }
+    if ((state.userReport || "").trim()) {
+      statusLines.push(
+        `Full user report: [${USER_REPORT_PATH}](${USER_REPORT_PATH}).`
+      );
+      readme = upsertReadmeSection(
+        readme,
+        "Owner report",
+        [
+          "Post-development summary and optional tech-debt plan for your decision:",
+          `- [${USER_REPORT_PATH}](${USER_REPORT_PATH})`,
+          state.techDebtActionPlan
+            ? `- [${TECH_DEBT_PLAN_PATH}](${TECH_DEBT_PLAN_PATH}) — plan mode; choose what to do`
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+    }
+
     readme = upsertReadmeSection(
       readme,
       "Pipeline status",
@@ -3425,12 +4410,24 @@ async function orchestratorFinalizeNode(
       resumeHint: resumeHint || null,
       testsPassed: state.testsPassed ?? null,
       deliveryFixRound: state.deliveryFixRound ?? 0,
+      projectSummary: state.projectSummary || null,
+      techDebtDisposition: state.techDebtDisposition || null,
+      techDebtActionPlan: state.techDebtActionPlan || null,
+      userReport: state.userReport || null,
+      userReportPath: (state.userReport || "").trim() ? USER_REPORT_PATH : null,
     });
 
     if (state.workflow === "docs" || state.docsOnly) {
       await setArchitecturePhase(appRoot, "done");
     } else {
       await setImplementationPhase(appRoot, "done");
+    }
+
+    if ((state.userReport || "").trim()) {
+      notify(
+        "orchestratorFinalize",
+        "PRESENT TO USER — open .docs/user-report.md (summary + optional tech-debt plan)"
+      );
     }
 
     notify(
@@ -3443,6 +4440,9 @@ async function orchestratorFinalizeNode(
     return {
       appRoot,
       resumeHint,
+      projectSummary: state.projectSummary || "",
+      techDebtActionPlan: state.techDebtActionPlan || "",
+      userReport: state.userReport || "",
     };
   });
 }
@@ -3924,11 +4924,10 @@ function routeAfterFidelity(state: OrchestratorStateType): string {
   return "technologyArchitect";
 }
 
-function routeAfterSpecs(state: OrchestratorStateType): string {
-  if (state.workflow === "docs" || state.docsOnly) {
-    return "deliveryCriticArchitecture";
-  }
-  return "deliveryCriticArchitecture";
+function routeAfterSpecEnrich(state: OrchestratorStateType): string {
+  return (state.pendingSpecDrafts ?? []).length > 0
+    ? "systemArchitectSpecItem"
+    : "deliveryCriticArchitecture";
 }
 
 function routeAfterArchitectureCritic(state: OrchestratorStateType): string {
@@ -3974,7 +4973,13 @@ function routeAfterQa(state: OrchestratorStateType): string {
   if ((state.pendingQaSpecs ?? []).length > 0) {
     return "qaEngineer";
   }
-  return "orchestratorFinalize";
+  return "systemArchitectProjectSummary";
+}
+
+function routeAfterProjectSummary(state: OrchestratorStateType): string {
+  return state.pendingTechDebtReview
+    ? "systemArchitectTechDebtReview"
+    : "orchestratorFinalize";
 }
 
 const fullGraph = new StateGraph(OrchestratorState)
@@ -3986,9 +4991,14 @@ const fullGraph = new StateGraph(OrchestratorState)
   .addNode("systemArchitectReqItem", systemArchitectReqItemNode)
   .addNode("orchestratorAfterPreReq", orchestratorAfterPreReqNode)
   .addNode("orchestratorCleanReadme", orchestratorCleanReadmeNode)
+  .addNode("uiUxRequirements", uiUxRequirementsNode)
   .addNode("fidelityCriticRequirements", fidelityCriticRequirementsNode)
   .addNode("technologyArchitect", technologyArchitectNode)
-  .addNode("systemArchitectSpecs", systemArchitectSpecsNode)
+  .addNode("uiUxDesignSystem", uiUxDesignSystemNode)
+  .addNode("systemArchitectTodoPlan", systemArchitectTodoPlanNode)
+  .addNode("systemArchitectSpecItem", systemArchitectSpecItemNode)
+  .addNode("uiUxSpecEnrich", uiUxSpecEnrichNode)
+  .addNode("technologyArchitectSpecEnrich", technologyArchitectSpecEnrichNode)
   .addNode("deliveryCriticArchitecture", deliveryCriticArchitectureNode)
   .addNode("scaffoldPrepare", scaffoldPrepareNode)
   .addNode("bootstrapFix", bootstrapFixNode)
@@ -3996,11 +5006,13 @@ const fullGraph = new StateGraph(OrchestratorState)
   .addNode("deliveryCriticDelivery", deliveryCriticDeliveryNode)
   .addNode("softwareEngineerFix", softwareEngineerFixNode)
   .addNode("qaEngineer", qaEngineerNode)
+  .addNode("systemArchitectProjectSummary", systemArchitectProjectSummaryNode)
+  .addNode("systemArchitectTechDebtReview", systemArchitectTechDebtReviewNode)
   .addNode("orchestratorFinalize", orchestratorFinalizeNode)
   .addEdge(START, "workflowRouter")
   .addConditionalEdges("workflowRouter", routeFromWorkflow, {
     orchestratorBootstrapReadme: "orchestratorBootstrapReadme",
-    systemArchitectSpecs: "systemArchitectSpecs",
+    systemArchitectTodoPlan: "systemArchitectTodoPlan",
     punchPrepare: "punchPrepare",
     fixPrepare: "fixPrepare",
     resumePrepare: "resumePrepare",
@@ -4011,15 +5023,25 @@ const fullGraph = new StateGraph(OrchestratorState)
     systemArchitectReqItem: "systemArchitectReqItem",
     orchestratorCleanReadme: "orchestratorCleanReadme",
   })
-  .addEdge("orchestratorCleanReadme", "fidelityCriticRequirements")
+  .addEdge("orchestratorCleanReadme", "uiUxRequirements")
+  .addEdge("uiUxRequirements", "fidelityCriticRequirements")
   .addConditionalEdges("fidelityCriticRequirements", routeAfterFidelity, {
     systemArchitectReqItem: "systemArchitectReqItem",
     technologyArchitect: "technologyArchitect",
   })
-  .addEdge("technologyArchitect", "systemArchitectSpecs")
-  .addConditionalEdges("systemArchitectSpecs", routeAfterSpecs, {
-    deliveryCriticArchitecture: "deliveryCriticArchitecture",
-  })
+  .addEdge("technologyArchitect", "uiUxDesignSystem")
+  .addEdge("uiUxDesignSystem", "systemArchitectTodoPlan")
+  .addEdge("systemArchitectTodoPlan", "systemArchitectSpecItem")
+  .addEdge("systemArchitectSpecItem", "uiUxSpecEnrich")
+  .addEdge("uiUxSpecEnrich", "technologyArchitectSpecEnrich")
+  .addConditionalEdges(
+    "technologyArchitectSpecEnrich",
+    routeAfterSpecEnrich,
+    {
+      systemArchitectSpecItem: "systemArchitectSpecItem",
+      deliveryCriticArchitecture: "deliveryCriticArchitecture",
+    }
+  )
   .addConditionalEdges(
     "deliveryCriticArchitecture",
     routeAfterArchitectureCritic,
@@ -4048,8 +5070,17 @@ const fullGraph = new StateGraph(OrchestratorState)
     softwareEngineerFix: "softwareEngineerFix",
     bootstrapFix: "bootstrapFix",
     qaEngineer: "qaEngineer",
-    orchestratorFinalize: "orchestratorFinalize",
+    systemArchitectProjectSummary: "systemArchitectProjectSummary",
   })
+  .addConditionalEdges(
+    "systemArchitectProjectSummary",
+    routeAfterProjectSummary,
+    {
+      systemArchitectTechDebtReview: "systemArchitectTechDebtReview",
+      orchestratorFinalize: "orchestratorFinalize",
+    }
+  )
+  .addEdge("systemArchitectTechDebtReview", "orchestratorFinalize")
   .addEdge("softwareEngineerFix", "qaEngineer")
   .addEdge("bootstrapFix", "qaEngineer")
   .addEdge("orchestratorFinalize", END);
@@ -4078,13 +5109,12 @@ server.tool(
   [
     "Runs a spec-driven LangGraph development pipeline under a project root.",
     "START → workflowRouter picks a route (or use workflow override), then:",
-    "full/docs: bootstrap → SA pré-reqs → clean README → fidelity → TA → specs → (SE/QA if full);",
-    "feature: specs → SE* → QA*; punch: prepare → SE → QA; fix: prepare → SE fix → QA;",
-    "resume: pending [ ] todos with existing specs → SE* → QA*.",
+    "full/docs: bootstrap → SA pré-reqs → clean README → fidelity → TA → specs → (SE/QA if full) → SA project summary → optional tech-debt plan → finalize;",
+    "feature: specs → SE* → QA* → SA summary → optional tech-debt plan; punch/fix/resume: … → QA → SA summary → optional tech-debt plan;",
     `Workflows: ${workflowCatalogText()}.`,
     "Set workflow to full|docs|feature|punch|fix|resume to force a route; omit to auto-classify.",
     "docsOnly=true is an alias for workflow=docs (deprecated).",
-    "Pass workspaceRoot = absolute path of the Cursor-open folder (required by skill; preferred over WORKSPACE_ROOT env).",
+    "Pass workspaceRoot = absolute path of the Cursor-open folder (REQUIRED; MCP never uses sticky WORKSPACE_ROOT env).",
     "Set projectRoot to a relative folder under that workspace (default '.') treated as the app root for all writes.",
     "Requires .zteam/config.json (workspace and/or app) unless skipConfigGate=true.",
     "Config models are absolute truth: cursor aliases (inherit/auto/cursor/cursor-auto) → returns delegationPlaybook for Cursor Task (no 9router LLM); any other id → ChatOpenAI literal via 9router (validated against GET /models).",
@@ -4127,7 +5157,9 @@ server.tool(
   ) => {
     const root = projectRoot || ".";
     const started = Date.now();
-    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const resolved = mcpResolveWorkspace(workspaceRoot);
+    if (!resolved.ok) return resolved.result;
+    const ws = resolved.ws;
     const appRoot = resolveAppRoot(root, ws.root);
     const recursionLimit = resolveGraphRecursionLimit();
     const metrics = createMetrics();
@@ -4428,7 +5460,9 @@ server.tool(
     projectRoot: z.string().optional().default("."),
   },
   async ({ workspaceRoot, projectRoot }) => {
-    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const resolved = mcpResolveWorkspace(workspaceRoot);
+    if (!resolved.ok) return resolved.result;
+    const ws = resolved.ws;
     const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
     const bootstrap = await ensureZteamBootstrapRoots(ws.root, appRoot);
     const teamConfig = await loadTeamConfig(ws.root, appRoot);
@@ -4484,11 +5518,17 @@ server.tool(
     models: z.object({
       systemArchitect: z.string().min(1),
       technologyArchitect: z.string().min(1),
+      uiUxDesigner: z
+        .string()
+        .min(1)
+        .optional()
+        .default(DEFAULT_MODELS.uiUxDesigner),
       softwareEngineer: z.string().min(1),
       qaEngineer: z.string().min(1),
       fallback: z.string().optional().default(""),
       systemArchitectFallback: z.string().optional().default(""),
       technologyArchitectFallback: z.string().optional().default(""),
+      uiUxDesignerFallback: z.string().optional().default(""),
       softwareEngineerFallback: z.string().optional().default(""),
       qaEngineerFallback: z.string().optional().default(""),
     }),
@@ -4496,6 +5536,7 @@ server.tool(
       .object({
         systemArchitect: z.number().int().positive().optional(),
         technologyArchitect: z.number().int().positive().optional(),
+        uiUxDesigner: z.number().int().positive().optional(),
         softwareEngineer: z.number().int().positive().optional(),
         qaEngineer: z.number().int().positive().optional(),
       })
@@ -4514,7 +5555,9 @@ server.tool(
     maxTokens,
     gitignoreIgnore,
   }) => {
-    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const resolved = mcpResolveWorkspace(workspaceRoot);
+    if (!resolved.ok) return resolved.result;
+    const ws = resolved.ws;
     const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
     const written: string[] = [];
     const gitignore: Record<string, unknown>[] = [];
@@ -4581,7 +5624,9 @@ server.tool(
       .describe("Relative project folder under workspaceRoot"),
   },
   async ({ workspaceRoot, projectRoot }) => {
-    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const resolved = mcpResolveWorkspace(workspaceRoot);
+    if (!resolved.ok) return resolved.result;
+    const ws = resolved.ws;
     const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
     assertSafeAppRoot(appRoot, projectRoot || ".");
     const state = await readPipelineState(appRoot);
@@ -4615,7 +5660,9 @@ server.tool(
     redirectHint: z.string().optional(),
   },
   async ({ workspaceRoot, projectRoot, decision, redirectHint }) => {
-    const ws = resolveWorkspaceRoot(workspaceRoot);
+    const resolved = mcpResolveWorkspace(workspaceRoot);
+    if (!resolved.ok) return resolved.result;
+    const ws = resolved.ws;
     const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
     const result = await applyHitlDecision(appRoot, decision, redirectHint);
     return {

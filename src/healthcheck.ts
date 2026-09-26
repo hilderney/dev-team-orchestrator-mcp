@@ -174,10 +174,12 @@ export function missingNineRouterModels(
   const keys = [
     "systemArchitect",
     "technologyArchitect",
+    "uiUxDesigner",
     "softwareEngineer",
     "qaEngineer",
     "systemArchitectFallback",
     "technologyArchitectFallback",
+    "uiUxDesignerFallback",
     "softwareEngineerFallback",
     "qaEngineerFallback",
     "fallback",

@@ -12,6 +12,7 @@ import { join, resolve } from "node:path";
 const {
   resolveWorkspaceRoot,
   resolveAppRoot,
+  requireMcpWorkspaceRoot,
 } = await import("../src/orchestrator.ts");
 const {
   loadTeamConfig,
@@ -25,6 +26,8 @@ const {
   isCursorModelAlias,
   buildCursorDelegationPlaybook,
   defaultsOnlyTeamConfig,
+  diagnoseWorkspace,
+  needsWorkspaceRootPayload,
 } = await import("../src/zteam-config.ts");
 const { missingNineRouterModels } = await import("../src/healthcheck.ts");
 const { withRunContext } = await import("../src/run-context.ts");
@@ -76,6 +79,57 @@ try {
         );
       }
     );
+  }
+
+  // --- MCP requireMcpWorkspaceRoot: ignores sticky env ---
+  {
+    const sticky = join(base, "sticky-ws");
+    const argWs = join(base, "mcp-arg-ws");
+    await mkdir(sticky, { recursive: true });
+    await mkdir(argWs, { recursive: true });
+    process.env.WORKSPACE_ROOT = sticky;
+
+    const withArg = requireMcpWorkspaceRoot(argWs);
+    assert(withArg.root === resolve(argWs), `MCP arg wins over sticky: ${withArg.root}`);
+    assert(withArg.source === "arg", "MCP source is arg");
+    assert(
+      withArg.root !== resolve(sticky),
+      "MCP must not resolve to sticky env path"
+    );
+
+    let threw = false;
+    let kind = "";
+    try {
+      requireMcpWorkspaceRoot(null);
+    } catch (e) {
+      threw = true;
+      kind = e.failureKind || "";
+    }
+    assert(threw && kind === "needs_workspace_root", "MCP missing arg fails closed");
+
+    let emptyThrew = false;
+    try {
+      requireMcpWorkspaceRoot("   ");
+    } catch (e) {
+      emptyThrew = e.failureKind === "needs_workspace_root";
+    }
+    assert(emptyThrew, "MCP empty arg fails closed");
+
+    // CLI still may use env when no arg
+    const cli = resolveWorkspaceRoot(null);
+    assert(cli.source === "env" && cli.root === resolve(sticky), "CLI still uses env");
+
+    const diag = diagnoseWorkspace(argWs, "arg");
+    assert(diag.stickyEnvValue === sticky, "diag exposes sticky value");
+    assert(
+      typeof diag.stickyEnvWarning === "string" &&
+        diag.stickyEnvWarning.includes("ignores"),
+      "diag stickyEnvWarning"
+    );
+
+    const payload = needsWorkspaceRootPayload();
+    assert(payload.failureKind === "needs_workspace_root", "payload kind");
+    assert(payload.stickyEnvPresent === true, "payload sticky present");
   }
 
   // --- needsConfig when no files ---
@@ -225,6 +279,7 @@ try {
       models: {
         systemArchitect: "inherit",
         technologyArchitect: "inherit",
+        uiUxDesigner: "inherit",
         softwareEngineer: "inherit",
         qaEngineer: "inherit",
       },
@@ -248,11 +303,13 @@ try {
       models: {
         systemArchitect: "inherit",
         technologyArchitect: "9RTA-technology-architect-free",
+        uiUxDesigner: "inherit",
         softwareEngineer: "inherit",
         qaEngineer: "inherit",
         fallback: "",
         systemArchitectFallback: "",
         technologyArchitectFallback: "",
+        uiUxDesignerFallback: "",
         softwareEngineerFallback: "",
         qaEngineerFallback: "",
       },
@@ -273,13 +330,14 @@ try {
         ...defaultsOnlyTeamConfig().models,
         systemArchitect: "inherit",
         technologyArchitect: "inherit",
+        uiUxDesigner: "inherit",
         softwareEngineer: "inherit",
         qaEngineer: "inherit",
       },
       maxTokens: defaultsOnlyTeamConfig().maxTokens,
     });
     assert(pb.llmRuntime === "cursor", "playbook cursor");
-    assert(pb.stages.length >= 2, "docs has SA+TA");
+    assert(pb.stages.length >= 5, "docs has SA req+UX+TA+UX design+todo/specs");
     assert(
       pb.stages.every((s) => s.model === "inherit"),
       "stage models inherit"

@@ -290,6 +290,7 @@ Enough content here to exceed eighty characters for the length gate.
     models: {
       systemArchitect: "a",
       technologyArchitect: "b",
+      uiUxDesigner: "ux",
       softwareEngineer: "c",
       qaEngineer: "d",
       fallback: "",
@@ -297,6 +298,7 @@ Enough content here to exceed eighty characters for the length gate.
     maxTokens: {
       systemArchitect: 1,
       technologyArchitect: 1,
+      uiUxDesigner: 1,
       softwareEngineer: 1,
       qaEngineer: 1,
     },

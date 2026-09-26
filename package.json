@@ -1,7 +1,7 @@
 {
   "name": "dev-team-orchestrator-mcp",
   "version": "1.0.0",
-  "description": "MCP server: spec-driven LangGraph pipeline (SA → TA → specs → SE → QA) via 9router",
+  "description": "MCP server: spec-driven LangGraph pipeline (SA → TA → specs → SE → QA → SA summary / tech-debt plan) via 9router",
   "main": "src/orchestrator.ts",
   "scripts": {
     "start": "tsx src/orchestrator.ts",
@@ -21,9 +21,10 @@
     "smoke:architecture": "tsx scripts/smoke-architecture-progress.mjs",
     "smoke:implementation": "tsx scripts/smoke-implementation-progress.mjs",
     "smoke:zteam-config": "tsx scripts/smoke-zteam-config.mjs",
+    "smoke:role-prompts": "tsx scripts/smoke-role-prompts.mjs",
     "smoke:verify": "tsx scripts/smoke-verify-delivery.mjs",
     "zteam:bootstrap": "tsx scripts/copy-zteam-skill.mjs",
-    "smoke:all": "npm run smoke && npm run smoke:workflows && npm run smoke:reqs && npm run smoke:files && npm run smoke:improvements && npm run smoke:architecture && npm run smoke:implementation && npm run smoke:zteam-config && npm run smoke:verify"
+    "smoke:all": "npm run smoke && npm run smoke:workflows && npm run smoke:reqs && npm run smoke:files && npm run smoke:improvements && npm run smoke:architecture && npm run smoke:implementation && npm run smoke:zteam-config && npm run smoke:role-prompts && npm run smoke:verify"
   },
   "keywords": ["mcp", "langgraph", "9router"],
   "author": "",

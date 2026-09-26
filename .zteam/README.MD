@@ -107,10 +107,10 @@ No `@zteam/config` / `@zteam/models`, pergunta primary+fallback por papel e most
 
 A pasta raiz **não** fica sticky no `mcp.json`. Em cada chamada o agent passa:
 
-- **`workspaceRoot`** — path absoluto da pasta aberta no Cursor
+- **`workspaceRoot`** — path absoluto da pasta aberta no Cursor (**obrigatório** no MCP; sem arg → `failureKind=needs_workspace_root`; o MCP **ignora** `WORKSPACE_ROOT` no env)
 - **`projectRoot`** — pasta relativa da app (ex. `samples/my-app` ou `.` se a app for a raiz do workspace)
 
-Evita o footgun de pipelines a escrever noutro repo (ex. `pacman-z2`).
+Evita o footgun de pipelines a escrever noutro repo (ex. `pacman-z2` / `mypokecards`).
 
 ## Precedência de modelos
 

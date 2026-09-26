@@ -15,7 +15,7 @@ export type WorkflowMeta = {
   /** First LangGraph node after workflowRouter */
   entry:
     | "orchestratorBootstrapReadme"
-    | "systemArchitectSpecs"
+    | "systemArchitectTodoPlan"
     | "punchPrepare"
     | "fixPrepare"
     | "resumePrepare";
@@ -29,38 +29,42 @@ export const WORKFLOW_CATALOG: Record<WorkflowId, WorkflowMeta> = {
     entry: "orchestratorBootstrapReadme",
     summary: "Greenfield / projeto novo",
     route:
-      "bootstrap README → SA pré-reqs* → clean README → fidelity → TA → specs → scaffold → SE* → QA* → finalize",
+      "bootstrap → SA pré-reqs* → juice → fidelity → TA → UI/UX look-and-feel → SA todo plan → (SA→UX→TA spec)* → arch critic → scaffold → SE* → QA* → SA summary → optional tech-debt plan → finalize",
   },
   docs: {
     id: "docs",
     entry: "orchestratorBootstrapReadme",
     summary: "Só planejar (sem SE/QA)",
     route:
-      "bootstrap README → SA pré-reqs* → clean README → fidelity → TA → specs → finalize",
+      "bootstrap → SA pré-reqs* → juice → fidelity → TA → UI/UX look-and-feel → SA todo plan → (SA→UX→TA spec)* → arch critic → finalize",
   },
   feature: {
     id: "feature",
-    entry: "systemArchitectSpecs",
+    entry: "systemArchitectTodoPlan",
     summary: "Feature em app com docs existentes",
-    route: "SA specs → scaffold → SE* → QA* → finalize",
+    route:
+      "SA todo plan → (SA→UX→TA spec)* → arch critic → scaffold → SE* → QA* → SA summary → optional tech-debt plan → finalize",
   },
   punch: {
     id: "punch",
     entry: "punchPrepare",
     summary: "Mudança pontual (cor, copy, tweak)",
-    route: "punch prepare → SE → QA → finalize",
+    route:
+      "punch prepare → SE → QA → SA summary → optional tech-debt plan → finalize",
   },
   fix: {
     id: "fix",
     entry: "fixPrepare",
     summary: "Bug / teste falhando",
-    route: "fix prepare → SE fix → QA → finalize",
+    route:
+      "fix prepare → SE fix → QA → SA summary → optional tech-debt plan → finalize",
   },
   resume: {
     id: "resume",
     entry: "resumePrepare",
     summary: "Retomar todos [ ] com spec existente",
-    route: "resume prepare → scaffold → SE* → QA* → finalize",
+    route:
+      "resume prepare → scaffold → SE* → QA* → SA summary → optional tech-debt plan → finalize",
   },
 };
 

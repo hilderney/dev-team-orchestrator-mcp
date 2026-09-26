@@ -130,6 +130,10 @@ export function stageBudgetMs(stage: string): number {
     softwareEngineer: 10 * 60_000,
     softwareEngineerFix: 5 * 60_000,
     qaEngineer: 5 * 60_000,
+    systemArchitectTodoPlan: 8 * 60_000,
+    systemArchitectSpecItem: 6 * 60_000,
+    uiUxSpecEnrich: 5 * 60_000,
+    technologyArchitectSpecEnrich: 6 * 60_000,
     systemArchitectSpecs: 8 * 60_000,
   };
   return defaults[stage] ?? 15 * 60_000;

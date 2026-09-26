@@ -24,12 +24,15 @@ export const ZTEAM_SKILL_SOURCE = join(
 export const DEFAULT_MODELS = {
   systemArchitect: "9RSA-system-architect-free",
   technologyArchitect: "9RTA-technology-architect-free",
+  /** Defaults to SA free combo until a dedicated 9RUX tunnel exists. */
+  uiUxDesigner: "9RSA-system-architect-free",
   softwareEngineer: "9RSE-software-engineer-free",
   qaEngineer: "9RQA-qa-free",
   /** @deprecated Prefer per-role *Fallback; kept as SE legacy alias. */
   fallback: "",
   systemArchitectFallback: "",
   technologyArchitectFallback: "",
+  uiUxDesignerFallback: "",
   softwareEngineerFallback: "",
   qaEngineerFallback: "",
 } as const;
@@ -37,6 +40,7 @@ export const DEFAULT_MODELS = {
 export const DEFAULT_MAX_TOKENS = {
   systemArchitect: 1600,
   technologyArchitect: 2500,
+  uiUxDesigner: 2000,
   softwareEngineer: 8000,
   qaEngineer: 2000,
 } as const;
@@ -44,6 +48,7 @@ export const DEFAULT_MAX_TOKENS = {
 export type TeamRole =
   | "systemArchitect"
   | "technologyArchitect"
+  | "uiUxDesigner"
   | "softwareEngineer"
   | "qaEngineer";
 
@@ -60,12 +65,14 @@ export type LlmRuntime = "cursor" | "ninerouter";
 export type CursorSubagentType =
   | "system-architect"
   | "technology-architect"
+  | "generalPurpose"
   | "software-engineer"
   | "qa-engineer";
 
 export const ROLE_TO_SUBAGENT: Record<TeamRole, CursorSubagentType> = {
   systemArchitect: "system-architect",
   technologyArchitect: "technology-architect",
+  uiUxDesigner: "generalPurpose",
   softwareEngineer: "software-engineer",
   qaEngineer: "qa-engineer",
 };
@@ -73,6 +80,7 @@ export const ROLE_TO_SUBAGENT: Record<TeamRole, CursorSubagentType> = {
 export const TEAM_ROLES: TeamRole[] = [
   "systemArchitect",
   "technologyArchitect",
+  "uiUxDesigner",
   "softwareEngineer",
   "qaEngineer",
 ];
@@ -196,13 +204,18 @@ export function buildCursorDelegationPlaybook(opts: {
       stage(
         "sa-requirements",
         "systemArchitect",
-        "System Architect — requirements / specs",
-        "Produce or update .docs/requirements.md (## sections), .docs/todo.md checklist, and any missing .docs/specs/{slug}.spec.md. Do not write implementation code.",
-        [
-          ".docs/requirements.md",
-          ".docs/todo.md",
-          ".docs/specs/*.spec.md",
-        ]
+        "System Architect — requirements",
+        "Produce or update .docs/requirements.md (## sections with goals, functional/non-functional, normal+alt flows; technology-agnostic). Do not write implementation code or specs yet.",
+        [".docs/requirements.md"]
+      )
+    );
+    stages.push(
+      stage(
+        "ux-juice",
+        "uiUxDesigner",
+        "UI/UX — juice addendum",
+        "Score requirements UX 1–10, write ## UX / Juice addendum (action/reaction feedback). Raise score to ≥7 vs before. Do not invent contradicting features or pick stacks.",
+        [".docs/requirements.md"]
       )
     );
     stages.push(
@@ -210,8 +223,26 @@ export function buildCursorDelegationPlaybook(opts: {
         "ta-stack",
         "technologyArchitect",
         "Technology Architect — stack / structure",
-        "Produce or update .docs/technologies.md and technical decisions from approved requirements. Do not write full feature implementations.",
+        "Produce or update .docs/technologies.md covering stack, folder layout, hosting, persistence, scalability, cost-benefit services, and standards from approved requirements. Do not write full feature implementations.",
         [".docs/technologies.md"]
+      )
+    );
+    stages.push(
+      stage(
+        "ux-design-system",
+        "uiUxDesigner",
+        "UI/UX — look and feel",
+        "From requirements.md + technologies.md write .docs/ui-ux.md: look-and-feel, hierarchy, color palette, visual/sound/sensory behavior, evidence-based emotion strategies. No invented statistics.",
+        [".docs/ui-ux.md"]
+      )
+    );
+    stages.push(
+      stage(
+        "sa-todo-and-specs",
+        "systemArchitect",
+        "System Architect — todo + three-handed specs",
+        "Plan .docs/todo.md (testable chunks from pré-reqs). For each slug: SA writes detailed spec, UI/UX enriches usability/narrative, TA adds technical how-to on the same .docs/specs/{slug}.spec.md.",
+        [".docs/todo.md", ".docs/specs/*.spec.md"]
       )
     );
   }
@@ -310,6 +341,28 @@ export const ROLE_MODEL_SUGGESTIONS: Record<TeamRole, RoleModelSuggestion[]> = {
       label: "TA pago pro",
     },
   ],
+  uiUxDesigner: [
+    {
+      id: "9RSA-system-architect-free",
+      tier: "free",
+      label: "UX via SA free (padrão seguro)",
+    },
+    {
+      id: "9RUX-ui-ux-free",
+      tier: "free",
+      label: "UX free dedicado (se existir no túnel)",
+    },
+    {
+      id: "9RSA-system-architect",
+      tier: "paid",
+      label: "UX via SA pago",
+    },
+    {
+      id: "9RUX-ui-ux",
+      tier: "paid",
+      label: "UX pago dedicado (se existir)",
+    },
+  ],
   softwareEngineer: [
     {
       id: "9RSE-software-engineer-free",
@@ -341,25 +394,19 @@ export const ROLE_MODEL_SUGGESTIONS: Record<TeamRole, RoleModelSuggestion[]> = {
 };
 
 /** Short duty lines for cross-role consult prompts. */
-export const ROLE_DUTIES: Record<TeamRole, string> = {
-  systemArchitect:
-    "requirements, pré-reqs, specs, Files to touch, fidelity to userIdea — no implementation code",
-  technologyArchitect:
-    "stack, folder layout, schemas, technologies.md — no feature code",
-  softwareEngineer:
-    "implement specs via ===FILE=== / write_file; respect Files to touch and tsc",
-  qaEngineer: "tests, vitest, classify bootstrap vs logic failures",
-};
+export { ROLE_PROMPT_DUTIES as ROLE_DUTIES } from "./role-prompts.js";
 
 const modelsSchema = z
   .object({
     systemArchitect: z.string().min(1).optional(),
     technologyArchitect: z.string().min(1).optional(),
+    uiUxDesigner: z.string().min(1).optional(),
     softwareEngineer: z.string().min(1).optional(),
     qaEngineer: z.string().min(1).optional(),
     fallback: z.string().optional(),
     systemArchitectFallback: z.string().optional(),
     technologyArchitectFallback: z.string().optional(),
+    uiUxDesignerFallback: z.string().optional(),
     softwareEngineerFallback: z.string().optional(),
     qaEngineerFallback: z.string().optional(),
   })
@@ -369,6 +416,7 @@ const maxTokensSchema = z
   .object({
     systemArchitect: z.number().int().positive().optional(),
     technologyArchitect: z.number().int().positive().optional(),
+    uiUxDesigner: z.number().int().positive().optional(),
     softwareEngineer: z.number().int().positive().optional(),
     qaEngineer: z.number().int().positive().optional(),
   })
@@ -390,18 +438,21 @@ export type ResolvedTeamConfig = {
   models: {
     systemArchitect: string;
     technologyArchitect: string;
+    uiUxDesigner: string;
     softwareEngineer: string;
     qaEngineer: string;
     /** Legacy global fallback (SE alias if softwareEngineerFallback empty). */
     fallback: string;
     systemArchitectFallback: string;
     technologyArchitectFallback: string;
+    uiUxDesignerFallback: string;
     softwareEngineerFallback: string;
     qaEngineerFallback: string;
   };
   maxTokens: {
     systemArchitect: number;
     technologyArchitect: number;
+    uiUxDesigner: number;
     softwareEngineer: number;
     qaEngineer: number;
   };
@@ -419,6 +470,9 @@ export type WorkspaceDiagnosis = {
   active: string;
   source: "arg" | "env" | "cwd";
   mcpJsonHint: string;
+  /** Set when process.env.WORKSPACE_ROOT is present (MCP ignores it). */
+  stickyEnvWarning: string | null;
+  stickyEnvValue: string | null;
 };
 
 export const SETUP_QUESTIONS = [
@@ -427,6 +481,8 @@ export const SETUP_QUESTIONS = [
   "System Architect — fallback model (segundo agente SA se o primary esgotar; vazio = sem handoff)",
   "Technology Architect — primary (ver modelSuggestions.technologyArchitect)",
   "Technology Architect — fallback",
+  "UI/UX Designer — primary (ver modelSuggestions.uiUxDesigner)",
+  "UI/UX Designer — fallback",
   "Software Engineer — primary (ver modelSuggestions.softwareEngineer)",
   "Software Engineer — fallback (recomendado se usares SE free)",
   "QA Engineer — primary (ver modelSuggestions.qaEngineer)",
@@ -437,11 +493,13 @@ export const SETUP_QUESTIONS = [
 
 /** Focused questions for `@zteam/models` (LLM ids only). */
 export const MODEL_QUESTIONS = [
-  "Para CADA papel (SA/TA/SE/QA): escolhe primary + fallback. Família homogénea: aliases Cursor (inherit/auto/cursor/cursor-auto) OU ids 9router (modelSuggestions). Não misturar.",
+  "Para CADA papel (SA/TA/UX/SE/QA): escolhe primary + fallback. Família homogénea: aliases Cursor (inherit/auto/cursor/cursor-auto) OU ids 9router (modelSuggestions). Não misturar.",
   "System Architect — primary",
   "System Architect — fallback (vazio ok; só ninerouter)",
   "Technology Architect — primary",
   "Technology Architect — fallback",
+  "UI/UX Designer — primary",
+  "UI/UX Designer — fallback",
   "Software Engineer — primary",
   "Software Engineer — fallback",
   "QA Engineer — primary",
@@ -470,9 +528,13 @@ export function resolveRoleFallbackModel(
       ? "MODEL_SYSTEM_ARCHITECT_FALLBACK"
       : role === "technologyArchitect"
         ? "MODEL_TECHNOLOGY_ARCHITECT_FALLBACK"
-        : role === "qaEngineer"
-          ? "MODEL_QA_ENGINEER_FALLBACK"
-          : "";
+        : role === "uiUxDesigner"
+          ? "MODEL_UI_UX_DESIGNER_FALLBACK"
+          : role === "qaEngineer"
+            ? "MODEL_QA_ENGINEER_FALLBACK"
+            : role === "softwareEngineer"
+              ? "MODEL_SOFTWARE_ENGINEER_FALLBACK"
+              : "";
   if (envKey && process.env[envKey]?.trim()) return process.env[envKey]!.trim();
   return "";
 }
@@ -587,10 +649,10 @@ No \`@zteam/config\` / \`@zteam/models\`, pergunta primary+fallback por papel e 
 
 A pasta raiz **não** fica sticky no \`mcp.json\`. Em cada chamada o agent passa:
 
-- **\`workspaceRoot\`** — path absoluto da pasta aberta no Cursor
+- **\`workspaceRoot\`** — path absoluto da pasta aberta no Cursor (**obrigatório** no MCP; sem arg → \`failureKind=needs_workspace_root\`; o MCP **ignora** \`WORKSPACE_ROOT\` no env)
 - **\`projectRoot\`** — pasta relativa da app (ex. \`samples/my-app\` ou \`.\` se a app for a raiz do workspace)
 
-Evita o footgun de pipelines a escrever noutro repo (ex. \`pacman-z2\`).
+Evita o footgun de pipelines a escrever noutro repo (ex. \`pacman-z2\` / \`mypokecards\`).
 
 ## Precedência de modelos
 
@@ -706,7 +768,12 @@ export async function ensureZteamBootstrapRoots(
 }
 
 const MCP_JSON_HINT =
-  "Prefer passing workspaceRoot (Cursor open folder); avoid sticky WORKSPACE_ROOT in ~/.cursor/mcp.json";
+  "MCP requires workspaceRoot arg (absolute Cursor open folder); remove sticky WORKSPACE_ROOT from ~/.cursor/mcp.json and restart MCP";
+
+export function stickyWorkspaceEnv(): string | null {
+  const v = process.env.WORKSPACE_ROOT?.trim();
+  return v || null;
+}
 
 function parseMaxTokensEnv(envValue: string | undefined, fallback: number): number {
   const n = Number.parseInt(envValue ?? "", 10);
@@ -725,6 +792,9 @@ export function envDefaultsTeamConfig(): Omit<
       technologyArchitect:
         process.env.MODEL_TECHNOLOGY_ARCHITECT?.trim() ||
         DEFAULT_MODELS.technologyArchitect,
+      uiUxDesigner:
+        process.env.MODEL_UI_UX_DESIGNER?.trim() ||
+        DEFAULT_MODELS.uiUxDesigner,
       softwareEngineer:
         process.env.MODEL_SOFTWARE_ENGINEER?.trim() ||
         DEFAULT_MODELS.softwareEngineer,
@@ -740,6 +810,9 @@ export function envDefaultsTeamConfig(): Omit<
       technologyArchitectFallback:
         process.env.MODEL_TECHNOLOGY_ARCHITECT_FALLBACK?.trim() ||
         DEFAULT_MODELS.technologyArchitectFallback,
+      uiUxDesignerFallback:
+        process.env.MODEL_UI_UX_DESIGNER_FALLBACK?.trim() ||
+        DEFAULT_MODELS.uiUxDesignerFallback,
       softwareEngineerFallback:
         process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK?.trim() ||
         DEFAULT_MODELS.softwareEngineerFallback,
@@ -755,6 +828,10 @@ export function envDefaultsTeamConfig(): Omit<
       technologyArchitect: parseMaxTokensEnv(
         process.env.MAX_TOKENS_TECHNOLOGY_ARCHITECT,
         DEFAULT_MAX_TOKENS.technologyArchitect
+      ),
+      uiUxDesigner: parseMaxTokensEnv(
+        process.env.MAX_TOKENS_UI_UX_DESIGNER,
+        DEFAULT_MAX_TOKENS.uiUxDesigner
       ),
       softwareEngineer: parseMaxTokensEnv(
         process.env.MAX_TOKENS_SOFTWARE_ENGINEER,
@@ -818,6 +895,8 @@ function mergeLayer(
       technologyArchitect:
         layer.models?.technologyArchitect?.trim() ||
         base.models.technologyArchitect,
+      uiUxDesigner:
+        layer.models?.uiUxDesigner?.trim() || base.models.uiUxDesigner,
       softwareEngineer:
         layer.models?.softwareEngineer?.trim() || base.models.softwareEngineer,
       qaEngineer: layer.models?.qaEngineer?.trim() || base.models.qaEngineer,
@@ -833,6 +912,10 @@ function mergeLayer(
         layer.models?.technologyArchitectFallback !== undefined
           ? String(layer.models.technologyArchitectFallback).trim()
           : base.models.technologyArchitectFallback,
+      uiUxDesignerFallback:
+        layer.models?.uiUxDesignerFallback !== undefined
+          ? String(layer.models.uiUxDesignerFallback).trim()
+          : base.models.uiUxDesignerFallback,
       softwareEngineerFallback:
         layer.models?.softwareEngineerFallback !== undefined
           ? String(layer.models.softwareEngineerFallback).trim()
@@ -848,6 +931,8 @@ function mergeLayer(
       technologyArchitect:
         layer.maxTokens?.technologyArchitect ??
         base.maxTokens.technologyArchitect,
+      uiUxDesigner:
+        layer.maxTokens?.uiUxDesigner ?? base.maxTokens.uiUxDesigner,
       softwareEngineer:
         layer.maxTokens?.softwareEngineer ?? base.maxTokens.softwareEngineer,
       qaEngineer: layer.maxTokens?.qaEngineer ?? base.maxTokens.qaEngineer,
@@ -906,6 +991,7 @@ export function hasExplicitEnvModels(): boolean {
   return Boolean(
     process.env.MODEL_SYSTEM_ARCHITECT?.trim() ||
       process.env.MODEL_TECHNOLOGY_ARCHITECT?.trim() ||
+      process.env.MODEL_UI_UX_DESIGNER?.trim() ||
       process.env.MODEL_SOFTWARE_ENGINEER?.trim() ||
       process.env.MODEL_QA_ENGINEER?.trim()
   );
@@ -920,10 +1006,35 @@ export function diagnoseWorkspace(
   active: string,
   source: "arg" | "env" | "cwd"
 ): WorkspaceDiagnosis {
+  const sticky = stickyWorkspaceEnv();
   return {
     active: resolve(active),
     source,
     mcpJsonHint: MCP_JSON_HINT,
+    stickyEnvValue: sticky,
+    stickyEnvWarning: sticky
+      ? `WORKSPACE_ROOT env is set (${sticky}) but MCP ignores it — pass workspaceRoot arg; remove sticky from ~/.cursor/mcp.json and restart MCP`
+      : null,
+  };
+}
+
+/** MCP fail-closed when workspaceRoot arg is missing / empty. */
+export function needsWorkspaceRootPayload(): Record<string, unknown> {
+  const sticky = stickyWorkspaceEnv();
+  return {
+    ok: false,
+    failureKind: "needs_workspace_root",
+    stickyEnvPresent: Boolean(sticky),
+    stickyEnvValue: sticky,
+    workspace: {
+      mcpJsonHint: MCP_JSON_HINT,
+      stickyEnvWarning: sticky
+        ? `WORKSPACE_ROOT env is set (${sticky}) but MCP ignores it — pass workspaceRoot arg; remove sticky from ~/.cursor/mcp.json and restart MCP`
+        : null,
+      stickyEnvValue: sticky,
+    },
+    resumeHint:
+      "Pass workspaceRoot = absolute path of the Cursor-open folder on every MCP call. Remove sticky WORKSPACE_ROOT from ~/.cursor/mcp.json and restart the zteam MCP server.",
   };
 }
 
@@ -931,11 +1042,13 @@ export type WriteTeamConfigInput = {
   models: {
     systemArchitect: string;
     technologyArchitect: string;
+    uiUxDesigner?: string;
     softwareEngineer: string;
     qaEngineer: string;
     fallback?: string;
     systemArchitectFallback?: string;
     technologyArchitectFallback?: string;
+    uiUxDesignerFallback?: string;
     softwareEngineerFallback?: string;
     qaEngineerFallback?: string;
   };
@@ -966,6 +1079,9 @@ export async function writeTeamConfig(
     models: {
       systemArchitect: input.models.systemArchitect.trim(),
       technologyArchitect: input.models.technologyArchitect.trim(),
+      uiUxDesigner: (
+        input.models.uiUxDesigner ?? DEFAULT_MODELS.uiUxDesigner
+      ).trim(),
       softwareEngineer: input.models.softwareEngineer.trim(),
       qaEngineer: input.models.qaEngineer.trim(),
       fallback: (input.models.fallback ?? "").trim(),
@@ -977,6 +1093,7 @@ export async function writeTeamConfig(
         input.models.technologyArchitectFallback ??
         ""
       ).trim(),
+      uiUxDesignerFallback: (input.models.uiUxDesignerFallback ?? "").trim(),
       softwareEngineerFallback: (
         input.models.softwareEngineerFallback ??
         ""
@@ -989,6 +1106,8 @@ export async function writeTeamConfig(
       technologyArchitect:
         input.maxTokens?.technologyArchitect ??
         DEFAULT_MAX_TOKENS.technologyArchitect,
+      uiUxDesigner:
+        input.maxTokens?.uiUxDesigner ?? DEFAULT_MAX_TOKENS.uiUxDesigner,
       softwareEngineer:
         input.maxTokens?.softwareEngineer ?? DEFAULT_MAX_TOKENS.softwareEngineer,
       qaEngineer:
@@ -1002,6 +1121,7 @@ export async function writeTeamConfig(
   for (const key of [
     "systemArchitect",
     "technologyArchitect",
+    "uiUxDesigner",
     "softwareEngineer",
     "qaEngineer",
   ] as const) {

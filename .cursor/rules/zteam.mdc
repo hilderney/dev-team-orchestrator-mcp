@@ -20,7 +20,7 @@ When this rule is attached (`@zteam`) or the user says **zteam** / **/zteam** / 
 ## Always
 
 1. Call MCP on **`user-zteam`** (not Cursor Task subagents).
-2. Pass **`workspaceRoot`** = absolute Cursor-open folder (not sticky `mcp.json` `WORKSPACE_ROOT`).
+2. Pass **`workspaceRoot`** = absolute Cursor-open folder (required; MCP never uses sticky `mcp.json` `WORKSPACE_ROOT`).
 3. Pass rich `userIdea` + **`projectRoot`** (prefer `samples/…`).
 4. **Before any `run_development_pipeline`:** call **`get_zteam_config`**. If `needsConfig === true`, do **not** start the pipeline — run `@zteam/models` or `@zteam/config` (`write_zteam_config`) first, then re-check. Exceptions: `@zteam/config` / `@zteam/models` (they are the setup).
 5. Report `workspaceRoot`, `appRoot`, `filesWritten`, `failureKind`, `resumeHint`; never silently copy sibling projects.

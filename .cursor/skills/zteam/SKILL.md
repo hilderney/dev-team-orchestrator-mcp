@@ -95,7 +95,7 @@ Help the user choose models for **this** project (Cursor aliases **or** 9router 
 ## Shared instructions (all commands)
 
 1. Call MCP tools on **`user-zteam`** (may also appear as `zteam`).
-2. **Always** pass **`workspaceRoot`** = absolute path of the **Cursor-open folder**.
+2. **Always** pass **`workspaceRoot`** = absolute path of the **Cursor-open folder** (MCP required; fails with `needs_workspace_root` if omitted — never uses sticky `WORKSPACE_ROOT` from mcp.json).
 3. Always set **`projectRoot`** when the app is not the workspace root.
 4. Put hard constraints in **`userIdea`**.
 5. **Before any pipeline**: always `get_zteam_config` first until `needsConfig === false`.
@@ -115,7 +115,7 @@ Help the user choose models for **this** project (Cursor aliases **or** 9router 
 
 | Arg | Required | Notes |
 |-----|----------|--------|
-| `workspaceRoot` | **yes** (skill) | Absolute Cursor open folder |
+| `workspaceRoot` | **yes** (MCP + skill) | Absolute Cursor open folder; omit → `needs_workspace_root` |
 | `userIdea` | yes (pipeline) | Idea **plus** non-negotiable constraints |
 | `projectRoot` | strongly yes | Relative under `workspaceRoot` |
 | `workflow` | no | `full` \| `docs` \| `feature` \| `punch` \| `fix` \| `resume` |
@@ -146,3 +146,4 @@ Help the user choose models for **this** project (Cursor aliases **or** 9router 
 1. Report: `workflow`, `llmRuntime`, `workspaceRoot`, `appRoot`, `failureKind`, `resumeHint`.
 2. If cursor: list Task stages run + artefacts.
 3. If ninerouter: quote MCP `filesWritten` / notifications.
+4. **Owner report (after SE/QA):** if `userReport` / `.docs/user-report.md` exists — **present the full summary to the user** (what the project does). If `.docs/tech-debt-plan.md` / `techDebtActionPlan` exists — present it as a **plan-mode decision** (do not implement until the user chooses).
