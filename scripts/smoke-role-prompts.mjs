@@ -67,9 +67,13 @@ assert.match(softwareEngineerImplementPrompt(), /covers_all_use_cases/);
 assert.match(softwareEngineerImplementPrompt(), /follows_usability_and_emotions/);
 assert.match(ROLE_PERSONAS.softwareEngineer, /Clean Code/i);
 assert.match(ROLE_PERSONAS.qaEngineer, /must work/i);
-assert.match(qaEngineerPrompt(), /TECH_DEBT|tests_cover_all_use_cases/);
+assert.match(qaEngineerPrompt(), /TECH_DEBT|tests_cover_all_use_cases|TDD VERIFY/);
 assert.match(qaEngineerPrompt(), /tests_cover_all_use_cases/);
 assert.match(qaEngineerPrompt(), /no_unresolved_spec_conflicts/);
+{
+  const { qaEngineerTddRedPrompt } = await import("../src/role-prompts.ts");
+  assert.match(qaEngineerTddRedPrompt(), /TDD RED|failing/i);
+}
 
 {
   const raw = `## 1. Login

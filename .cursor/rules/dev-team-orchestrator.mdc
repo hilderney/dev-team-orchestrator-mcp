@@ -1,5 +1,5 @@
 ---
-description: Route team work through MCP LangGraph + 9router models, not Cursor Task
+description: Route team work through MCP LangGraph + dual runtime (9router or Cursor Task playbook)
 alwaysApply: true
 ---
 
@@ -9,8 +9,8 @@ When the user asks for team/feature work via **zteam**, **@zteam**, **/zteam**, 
 
 1. **Before the pipeline:** call MCP `get_zteam_config` with `workspaceRoot` (+ `projectRoot`). If `needsConfig`, do **not** call `run_development_pipeline` — run `@zteam/models` / `@zteam/config` first.
 2. Call the MCP tool `run_development_pipeline` on **`user-zteam`** (MCP server key `zteam`).
-3. Do **not** use Cursor `Task` with `software-engineer`, `qa-engineer`, `system-architect`, or `technology-architect` for that work.
-4. Those Cursor Task subagents use Cursor models and **never** hit 9router.
+3. **Dual runtime:** if `llmRuntime=ninerouter`, do **not** use Cursor `Task` for team roles — MCP drives 9router. If `llmRuntime=cursor`, MCP returns `delegationPlaybook` — run stages via Cursor Task in order (do **not** also call 9router). Never mix families in one config.
+4. Cursor Task subagents use Cursor models and **never** hit 9router (cursor path only).
 
 Prefer the project skill **`zteam`** (`/zteam` or `@zteam`) for the short trigger; this rule still applies when the user uses the long name.
 
@@ -18,11 +18,11 @@ Prefer the project skill **`zteam`** (`/zteam` or `@zteam`) for the short trigge
 
 The MCP tool runs LangGraph. **Always pass `workspaceRoot`** = absolute path of the Cursor-open folder (skill contract). Optional `projectRoot` (default `"."`) is resolved under that workspace. Prefer `projectRoot` like `samples/my-app` so the MCP package README is not overwritten. Writes into the orchestrator package root with `projectRoot: "."` are rejected.
 
-**Subcommands (skill):** `@zteam/config` (full setup), `@zteam/models` (LLM ids → `.zteam/config.json`), `@zteam/documentation` (`workflow=docs`), `@zteam/tests` (QA-focused). See [`.zteam/README.MD`](../../.zteam/README.MD).
+**Subcommands (skill):** `@zteam/config` (full setup), `@zteam/models` (LLM ids → `.zteam/config.json`), `@zteam/documentation` (`workflow=docs`), `@zteam/tests` (`workflow=tests` + `slug`). See [`.zteam/README.MD`](../../.zteam/README.MD).
 
 Team models: `.zteam/config.json` (app → workspace → env `MODEL_*` → defaults). Config gate opens if a config file exists **or** explicit `MODEL_*` env is set (`configGateSatisfied`). Otherwise `failureKind=needsConfig` — use `@zteam/models` / `@zteam/config` / `get_zteam_config` / `write_zteam_config`. Prefer **not** setting sticky `WORKSPACE_ROOT` in `mcp.json`.
 
-**Requirements (full/docs):** iterative — bootstrap Resume + Pré Requirements → SA expands one pré-req at a time → clean README → UI/UX juice addendum (score ≥7) → fidelity → TA → UI/UX look-and-feel (`.docs/ui-ux.md`) → SA todo plan → per-slug SA→UI/UX→TA specs (+ architecture critic) → (scaffold → SE verify loop → delivery critic → QA if not docs-only).
+**Requirements (full/docs):** iterative — bootstrap Resume + Pré Requirements → SA expands one pré-req at a time → clean README → UI/UX juice addendum (score ≥7) → fidelity → TA → UI/UX look-and-feel (`.docs/ui-ux.md`) → SA todo plan → per-slug SA→UI/UX→TA specs (+ architecture critic) → (scaffold → **QA TDD red** → **SE TDD green** → delivery critic → **QA TDD verify** / `markTodoDone` if not docs-only).
 
 | Stage | Env var | Default | Writes / reads |
 |---|---|---|---|
@@ -32,9 +32,10 @@ Team models: `.zteam/config.json` (app → workspace → env `MODEL_*` → defau
 | System Architect (specs) | `MODEL_SYSTEM_ARCHITECT` | same | `.docs/todo.md` + `.docs/specs/*.spec.md` + README |
 | Delivery critic (architecture) | (heurística) | — | gaps idea ↔ tech/specs; may reopen TA |
 | Scaffold | (no LLM) | — | vite+vitest template / augment missing shell files |
-| Software Engineer | `MODEL_SOFTWARE_ENGINEER` | `9RSE-software-engineer-free` | Batch specs in order; Clean Code + `===SELF_CHECK===` (functionalities / use cases / usability-emotions); `verifyDelivery` + `tsc` before `markTodoDone`; redo with `deliveryFixRound` |
+| QA TDD red | `MODEL_QA_ENGINEER` | `9RQA-qa-free` | Failing tests from specs (use cases / screen-flow); **does not** mark `[x]` |
+| Software Engineer | `MODEL_SOFTWARE_ENGINEER` | `9RSE-software-engineer-free` | TDD green; Clean Code + `===SELF_CHECK===`; `verifyDelivery` + `tsc`; redo with `deliveryFixRound`; **does not** `markTodoDone` |
 | Delivery critic (delivery) | (heurística) | — | reopen incomplete slugs after SE |
-| QA Engineer | `MODEL_QA_ENGINEER` | `9RQA-qa-free` | Priorities: work → as described → all use cases; `===SELF_CHECK===`; optional `===TECH_DEBT===` → `.docs/tech-debt.md`; bootstrapFix vs SE fix by error class |
+| QA TDD verify | `MODEL_QA_ENGINEER` | same | Run suite + gaps; **`markTodoDone` when tests pass**; optional `===TECH_DEBT===` → `.docs/tech-debt.md`; bootstrapFix vs SE fix by error class |
 | System Architect (post-dev) | `MODEL_SYSTEM_ARCHITECT` | same | Summary from requirements+README → `.docs/user-report.md`; if tech debt: judge vs spirit, update docs if necessary, plan-mode `.docs/tech-debt-plan.md` for user decision |
 | Orchestrator finalize | (no LLM) | — | README status + `.docs/pipeline-result.json` (metrics: retries, `llmEmpty`, `userReport`, …) |
 
@@ -42,15 +43,16 @@ Team models: `.zteam/config.json` (app → workspace → env `MODEL_*` → defau
 
 **Docs-only:** pass `workflow: "docs"` (or deprecated `docsOnly: true` / CLI `--docs-only` / `--workflow=docs`).
 
-**Workflows:** omit `workflow` for auto-routing, or set `full` | `docs` | `feature` | `punch` | `fix` | `resume`. See [`src/workflows/`](../../src/workflows/). Resume reopens phantom `[x]` todos whose Files to touch are missing on disk.
+**Workflows:** omit `workflow` for auto-routing, or set `full` | `docs` | `feature` | `punch` | `fix` | `resume` | `tests` | `analyze`. Optional `slug` (feature/tests), `role` + `scope` (analyze). See [`src/workflows/`](../../src/workflows/). Resume reopens phantom `[x]` todos whose Files to touch are missing on disk.
 
 **CLI:** `npm run pipeline -- --workflow punch --project-root samples/foo "idea…"` and `pipeline:docs` / `pipeline:resume`.
 
 **Graph viz:** `npm run graph` prints Mermaid and writes `.docs/langgraph.mmd`. Mid-failure: prefer `workflow=resume` (not copying sibling projects).
 
 ```text
-❌ BAD:  Task(subagent_type="qa-engineer")
-✅ GOOD: CallDynamicTool(user-zteam.run_development_pipeline)
+❌ BAD (ninerouter):  Task(subagent_type="qa-engineer") instead of MCP
+✅ GOOD (ninerouter): CallDynamicTool(user-zteam.run_development_pipeline)
+✅ GOOD (cursor):     run_development_pipeline → execute delegationPlaybook via Task in order (QA-red → SE → delivery critic → QA-verify)
 ```
 
 Exception: editing **this** MCP server's own source (e.g. `src/orchestrator.ts`) may use normal tools; still prefer not to fake team roles via Task when the user expected a 9router pipeline run.

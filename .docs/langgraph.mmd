@@ -1,4 +1,5 @@
-%% spec-driven pipeline (workflowRouter → full|docs|feature|punch|fix)
+%% spec-driven pipeline (workflowRouter → full|docs|feature|punch|fix|resume|tests|analyze)
+%% Dump via `npm run graph` — edges include TDD: scaffoldPrepare → qaTddRed → softwareEngineer → deliveryCriticDelivery → qaEngineer
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 graph TD;
 	__start__([<p>__start__</p>]):::first
@@ -21,6 +22,8 @@ graph TD;
 	deliveryCriticArchitecture(deliveryCriticArchitecture)
 	scaffoldPrepare(scaffoldPrepare)
 	bootstrapFix(bootstrapFix)
+	qaTddRed(qaTddRed)
+	analyzePrepare(analyzePrepare)
 	softwareEngineer(softwareEngineer)
 	deliveryCriticDelivery(deliveryCriticDelivery)
 	softwareEngineerFix(softwareEngineerFix)
@@ -30,13 +33,14 @@ graph TD;
 	orchestratorFinalize(orchestratorFinalize)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> workflowRouter;
+	analyzePrepare --> orchestratorFinalize;
 	bootstrapFix --> qaEngineer;
 	fixPrepare --> softwareEngineerFix;
 	orchestratorBootstrapReadme --> systemArchitectReqItem;
 	orchestratorCleanReadme --> uiUxRequirements;
 	orchestratorFinalize --> __end__;
-	punchPrepare --> softwareEngineer;
-	scaffoldPrepare --> softwareEngineer;
+	punchPrepare --> qaTddRed;
+	scaffoldPrepare --> qaTddRed;
 	softwareEngineerFix --> qaEngineer;
 	systemArchitectReqItem --> orchestratorAfterPreReq;
 	systemArchitectSpecItem --> uiUxSpecEnrich;
@@ -51,6 +55,8 @@ graph TD;
 	workflowRouter -.-> punchPrepare;
 	workflowRouter -.-> fixPrepare;
 	workflowRouter -.-> resumePrepare;
+	workflowRouter -.-> qaTddRed;
+	workflowRouter -.-> analyzePrepare;
 	orchestratorAfterPreReq -.-> systemArchitectReqItem;
 	orchestratorAfterPreReq -.-> orchestratorCleanReadme;
 	fidelityCriticRequirements -.-> systemArchitectReqItem;
@@ -62,6 +68,8 @@ graph TD;
 	deliveryCriticArchitecture -.-> orchestratorFinalize;
 	resumePrepare -.-> scaffoldPrepare;
 	resumePrepare -.-> orchestratorFinalize;
+	qaTddRed -.-> softwareEngineer;
+	qaTddRed -.-> qaEngineer;
 	softwareEngineer -.-> deliveryCriticDelivery;
 	deliveryCriticDelivery -.-> softwareEngineer;
 	deliveryCriticDelivery -.-> qaEngineer;
@@ -70,6 +78,7 @@ graph TD;
 	qaEngineer -.-> systemArchitectProjectSummary;
 	systemArchitectProjectSummary -.-> systemArchitectTechDebtReview;
 	systemArchitectProjectSummary -.-> orchestratorFinalize;
+	qaTddRed -.-> qaTddRed;
 	softwareEngineer -.-> softwareEngineer;
 	qaEngineer -.-> qaEngineer;
 	classDef default fill:#f2f0ff,line-height:1.2;

@@ -2,7 +2,7 @@
  * Deterministic delivery verification (DoD) — no LLM.
  * Pattern: deliver → verifyDelivery → redo with feedback | advance.
  */
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 export type VerifyStage =
@@ -298,6 +298,63 @@ export async function verifyDelivery(
           `spec '${slug}' has no parseable Files to touch and batch wrote no src/ files`
         );
         if (!reopenSlugs.includes(slug)) reopenSlugs.push(slug);
+      }
+
+      // Anti false-green: UI flow specs need tests. SE stage is soft (any *.test.*
+      // from QA-red is enough); strict path hints belong to QA-verify prompts.
+      const needsFlowTests =
+        /##\s*Flow\s*&\s*states/i.test(body || "") ||
+        /screen[- ]?flow|overlay\s+exclus|busy.*pause|SF-\d+/i.test(body || "");
+      if (needsFlowTests) {
+        const isTestPath = (w: string) =>
+          /\.(test|spec)\.(ts|tsx|js|jsx)$/i.test(w);
+        const softAnyTest = written.some(isTestPath);
+        const testHint =
+          /screen|overlay|flow|router|busy|pause/i;
+        const hasFlowTest = written.some(
+          (w) => isTestPath(w) && testHint.test(w)
+        );
+        const anyUiTest = written.some(
+          (w) =>
+            /\.(test|spec)\./i.test(w) &&
+            /screen|overlay|flow|router|play|busy|pause/i.test(w)
+        );
+        if (!hasFlowTest && !anyUiTest && !softAnyTest) {
+          let diskHit = false;
+          let diskAnyTest = false;
+          try {
+            const walk = async (dir: string, depth = 0): Promise<void> => {
+              if (depth > 4 || (diskHit && diskAnyTest)) return;
+              const entries = await readdir(dir, { withFileTypes: true });
+              for (const e of entries) {
+                if (diskHit && diskAnyTest) return;
+                if (e.name === "node_modules" || e.name === ".git") continue;
+                const p = join(dir, e.name);
+                if (e.isDirectory()) await walk(p, depth + 1);
+                else if (/\.(test|spec)\.(ts|tsx|js|jsx)$/i.test(e.name)) {
+                  diskAnyTest = true;
+                  if (
+                    /screen|overlay|flow|router|play|busy|pause/i.test(e.name)
+                  ) {
+                    diskHit = true;
+                  }
+                }
+              }
+            };
+            await walk(input.appRoot);
+          } catch {
+            /* ignore */
+          }
+          // SE TDD green: accept any on-disk test suite from QA-red
+          const okSoft =
+            input.stage === "softwareEngineer" && (diskAnyTest || softAnyTest);
+          if (!diskHit && !okSoft) {
+            reasons.push(
+              `spec '${slug}' requires screen-flow / Flow & states tests but none found (path hint: *screen*|overlay|flow|busy|pause*.test.*)`
+            );
+            if (!reopenSlugs.includes(slug)) reopenSlugs.push(slug);
+          }
+        }
       }
     }
 

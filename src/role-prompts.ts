@@ -307,6 +307,8 @@ export function uiUxSpecEnrichPrompt(slug: string): string {
     "ADD/expand sections as needed, e.g.:",
     "## Usability & juice",
     "## Narrative / emotion intent",
+    "## Flow & states",
+    "(REQUIRED when the feature has UI chrome: list screens/overlays/modals; mutual exclusion e.g. busy ⊥ paused ⊥ playing; transitions + testable ACs.)",
     "Do not remove Files to touch or acceptance criteria — refine them if UX requires concrete UI files.",
     "No invented product features that contradict requirements. No stacks.",
     "===SELF_CHECK===",
@@ -336,6 +338,7 @@ export function technologyArchitectSpecEnrichPrompt(slug: string): string {
     "## Stack / APIs / patterns to use",
     "## Implementation notes for SE",
     "Files to touch must stay concrete relative paths.",
+    "UI chrome: safe DOM pattern — do not combine permanent display:flex with [hidden] toggles; prefer .is-open or [hidden]{display:none!important}.",
     "No dumping full source code files — guidance only.",
     "===SELF_CHECK===",
     "tech_helps_development: yes|no",
@@ -522,6 +525,7 @@ export function uiUxRequirementsPrompt(): string {
     "===ADDENDUM===",
     "Markdown body (WITHOUT repeating the H2 title) explaining the main UX/juice points that must be worked so the user has a good experience in this context.",
     "Cover: feedback for every meaningful action, intentional no-op signalling, loading/empty/error states, clarity of controls, delight/juice where it fits the product.",
+    "Call out exclusive chrome when relevant (loading ⊥ modal ⊥ main interaction).",
     "Do NOT invent product features that contradict userIdea or the existing requirements — refine interaction quality.",
     "Do NOT choose technology stacks.",
     "===SCORE_AFTER===",
@@ -717,14 +721,16 @@ export function validateUiUxDesignSystemResponse(
 export function softwareEngineerImplementPrompt(): string {
   return joinPrompt([
     ROLE_PERSONAS.softwareEngineer,
-    "Stage: implement the CURRENT spec(s) in todo order, exactly as described in each .spec.md.",
+    "Stage: implement the CURRENT spec(s) in todo order (TDD green) — tests already exist from QA red.",
     "Follow README, technologies.md, .docs/ui-ux.md (if present), folder layout, and the spec",
     "(functionalities, ## Use cases, usability/juice, narrative/emotion intent).",
+    "Make the existing failing tests pass. Do NOT delete, skip, or weaken tests.",
     "Prefer calling write_file(path, content) for each file.",
     "Fallback: ===FILE: relative/path=== then contents.",
     "Paths relative to project root. No markdown fences. Use .tsx when file has JSX.",
     "Cover EVERY file listed under Files to touch. Prefer clear names, small functions, readable control flow",
     "(Clean Code; light SOLID where it helps comprehension — not ceremony).",
+    "If the spec has ## Flow & states or screen-flow ACs: ensure exclusive chrome (e.g. busy ⊥ pause ⊥ playing); never leave stuck overlays.",
     "After all FILE/write_file output, you MUST answer:",
     "===SELF_CHECK===",
     "covers_all_functionalities: yes|no",
@@ -769,22 +775,35 @@ export const QA_SELF_CHECK_KEYS = [
 ] as const;
 
 export function qaEngineerPrompt(): string {
+  return qaEngineerVerifyPrompt();
+}
+
+/** TDD red: write failing tests before SE implements. */
+export function qaEngineerTddRedPrompt(): string {
   return joinPrompt([
     ROLE_PERSONAS.qaEngineer,
-    "Stage: tests for the CURRENT spec only, in this priority order:",
-    "(1) everything must WORK;",
-    "(2) everything must work AS DESCRIBED in the spec;",
-    "(3) everything must work AS DESCRIBED for EVERY use-case scenario in the spec.",
-    "Prefer vitest (npx vitest run) matching technologies.md / package.json scripts.test.",
-    "Output structure (no outer code fence):",
-    "===SUMMARY===",
-    "Short notes on coverage vs use cases.",
-    "Then EITHER no files (existing tests suffice) OR one or more ===FILE: relative/path=== test files.",
-    "If you notice conflicting or incomplete functionality/use-case descriptions, ALSO emit:",
-    "===TECH_DEBT===",
-    "Markdown bullets for the orchestrator: what conflicts / is incomplete, which slug, suggested clarification.",
-    "(Omit ===TECH_DEBT=== only when you found no conflicts/incompleteness.)",
-    "Test files with JSX must use .tsx. FORBIDDEN: re-implementing the app, essays, FILE-only without markers.",
+    "Stage: TDD RED — write automated tests for the CURRENT spec BEFORE implementation exists.",
+    "Priority: (1) use cases / ACs must be asserted; (2) screen-flow / ## Flow & states / overlay exclusivity when the spec has UI chrome;",
+    "(3) happy + at least one alternate path per major scenario.",
+    "Prefer vitest. Output ===FILE:=== test files that FAIL until the product is implemented (or clearly assert missing behavior).",
+    "Do NOT implement product code under src/ (except tiny testability hooks if unavoidable — prefer pure tests).",
+    "Do NOT mark todos [x]. Omit running a green suite requirement — red is expected.",
+    "===SUMMARY=== short plan of what will fail until SE lands.",
+    "===SELF_CHECK===",
+    "tests_cover_all_use_cases: yes|no",
+    "no_unresolved_spec_conflicts: yes|no",
+  ]);
+}
+
+/** TDD verify: run suite + gaps after SE green. */
+export function qaEngineerVerifyPrompt(): string {
+  return joinPrompt([
+    ROLE_PERSONAS.qaEngineer,
+    "Stage: TDD VERIFY — run/strengthen tests for the CURRENT spec after implementation.",
+    "Priority: (1) everything must WORK; (2) AS DESCRIBED; (3) every use-case scenario.",
+    "Prefer vitest (npx vitest run). Add only gap/regression tests; do not replace the red suite with weaker coverage.",
+    "If the spec has screen-flow / Flow & states: you MUST cover chrome exclusivity / transitions — suite green without them is FAIL.",
+    "Output: ===SUMMARY=== then optional ===FILE:=== ; optional ===TECH_DEBT=== for incomplete specs.",
     "===SELF_CHECK===",
     "tests_cover_all_use_cases: yes|no",
     "no_unresolved_spec_conflicts: yes|no",

@@ -24,14 +24,15 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
 | **`@zteam/config`** | Setup completo: `.zteam/config.json` (modelos, maxTokens, escopo workspace/app, gitignore). | `get_zteam_config` → perguntas → `write_zteam_config` |
 | **`@zteam/models`** | Só LLMs por papel — perguntas guiadas → atualiza `models` em `.zteam/config.json` neste projeto. | `get_zteam_config` → `modelQuestions` → `write_zteam_config` |
 | **`@zteam/documentation`** | Só documentação / arquitetura (requirements, technologies, todo, specs). Sem SE/QA. | `run_development_pipeline` com `workflow: "docs"` |
-| **`@zteam/tests`** | Analisa o app/specs e cria ou reforça testes (QA + fix loop se falhar). | `run_development_pipeline` com foco em testes (`workflow: "fix"` ou `"feature"` / `"resume"` conforme o estado) |
-| **`@zteam`** / **`/zteam`** | Pipeline completo ou o workflow que pedires (full, feature, punch, resume, …). | `run_development_pipeline` (ou Task playbook se runtime=cursor) |
+| **`@zteam/tests`** | Só testes (TDD red → verify) para um requisito. | `run_development_pipeline` com `workflow: "tests"` + `slug` |
+| **`@zteam`** / **`/zteam`** | Pipeline completo ou o workflow que pedires (`full` \| `docs` \| `feature` \| `punch` \| `fix` \| `resume` \| `tests` \| `analyze`). | `run_development_pipeline` (ou Task playbook se runtime=cursor) |
+| **`ensure_zteam_setup`** | Stubs skill + `.docs` (+ template config opcional), sem LLM. | MCP `ensure_zteam_setup` |
 
 ### Exemplos
 
 ```text
 @zteam/models
-→ mostra modelos atuais + defaults → pergunta SA/TA/SE/QA/fallback → grava .zteam/config.json
+→ mostra modelos atuais + defaults → pergunta SA/TA/UX/SE/QA/fallback → grava .zteam/config.json
 
 @zteam/config
 → pergunta modelos / escopo / maxTokens → grava .zteam/config.json (+ .gitignore para config)
@@ -39,12 +40,14 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
 @zteam/documentation samples/pacman — canvas TS, infinite lives
 → workflow=docs, projectRoot=samples/pacman
 
-@zteam/tests samples/pacman
-→ analisa specs/código e corre pipeline de testes
+@zteam/tests samples/pacman — slug=screens-flow
+→ workflow=tests + slug, projectRoot=samples/pacman
 
 @zteam build a todo API in samples/todo-api
 → auto ou full/feature conforme contexto
 ```
+
+**TDD (implementação):** QA-red (testes a falhar) → SE green (sem `[x]`) → delivery critic → QA-verify (`markTodoDone` só aqui).
 
 ## Ficheiros
 
@@ -65,6 +68,8 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
     "systemArchitectFallback": "9RSA-system-architect",
     "technologyArchitect": "9RTA-technology-architect-free",
     "technologyArchitectFallback": "",
+    "uiUxDesigner": "9RUX-ui-ux-designer-free",
+    "uiUxDesignerFallback": "",
     "softwareEngineer": "9RSE-software-engineer-free",
     "softwareEngineerFallback": "9RSE-software-engineer",
     "qaEngineer": "9RQA-qa-free",
@@ -74,6 +79,7 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
   "maxTokens": {
     "systemArchitect": 1600,
     "technologyArchitect": 2500,
+    "uiUxDesigner": 2000,
     "softwareEngineer": 8000,
     "qaEngineer": 2000
   }
@@ -90,6 +96,8 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
     "systemArchitectFallback": "",
     "technologyArchitect": "inherit",
     "technologyArchitectFallback": "",
+    "uiUxDesigner": "inherit",
+    "uiUxDesignerFallback": "",
     "softwareEngineer": "inherit",
     "softwareEngineerFallback": "",
     "qaEngineer": "inherit",

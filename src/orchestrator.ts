@@ -94,6 +94,7 @@ import {
   ROLE_PROMPT_DUTIES,
   consultAdvisorPrompt,
   qaEngineerPrompt,
+  qaEngineerTddRedPrompt,
   softwareEngineerFixPrompt,
   softwareEngineerImplementPrompt,
   validateSeImplementSelfCheck,
@@ -145,6 +146,8 @@ import {
   diagnoseWorkspace,
   ensureGitignoreIgnoresZteam,
   ensureZteamBootstrapRoots,
+  ensureZteamSetup,
+  ensureDocsDirs,
   configGateSatisfied,
   envDefaultsTeamConfig,
   loadTeamConfig,
@@ -999,6 +1002,14 @@ async function listSpecSlugs(appRoot: string): Promise<string[]> {
   }
 }
 
+/** When MCP `slug` / focusSlug is set, keep only that slug (never expand to all). */
+function applyFocusSlug(slugs: string[], focusSlug?: string): string[] {
+  const focus = (focusSlug || "").trim();
+  if (!focus) return slugs;
+  const hit = slugs.filter((s) => s === focus);
+  return hit.length > 0 ? hit : [focus];
+}
+
 function specPath(slug: string): string {
   return `${SPECS_DIR}/${slug}.spec.md`;
 }
@@ -1796,13 +1807,28 @@ const OrchestratorState = Annotation.Root({
   }),
   currentSpecSlug: Annotation<string>(),
   completedSpecs: Annotation<string[]>({
-    reducer: (left, right) => [...new Set([...(left ?? []), ...(right ?? [])])],
+    // Empty array = explicit clear (VERIFY FAIL / reopen). Non-empty = merge-add.
+    reducer: (left, right) => {
+      if (right == null) return left ?? [];
+      if (Array.isArray(right) && right.length === 0) return [];
+      return [...new Set([...(left ?? []), ...right])];
+    },
     default: () => [],
   }),
   pendingQaSpecs: Annotation<string[]>({
     reducer: (_left, right) => right ?? [],
     default: () => [],
   }),
+  /** Slugs still needing TDD-red tests before SE (Wave 3). */
+  pendingTddRedSpecs: Annotation<string[]>({
+    reducer: (_left, right) => right ?? [],
+    default: () => [],
+  }),
+  /** Optional focus slug (feature/tests). */
+  focusSlug: Annotation<string>(),
+  /** analyze workflow: optional single role */
+  analyzeRole: Annotation<string>(),
+  analyzeScope: Annotation<string>(),
   currentSpec: Annotation<string>(),
   qaFailureLog: Annotation<string>(),
   qaFixRound: Annotation<number>(),
@@ -2811,9 +2837,12 @@ async function systemArchitectTodoPlanNode(
           : todoMd + "\n";
     await writeDoc(appRoot, TODO_PATH, withPlan.endsWith("\n") ? withPlan : withPlan + "\n");
 
-    const pending = parseTodoChecklist(withPlan)
-      .filter((t) => !t.done)
-      .map((t) => t.slug);
+    const pending = applyFocusSlug(
+      parseTodoChecklist(withPlan)
+        .filter((t) => !t.done)
+        .map((t) => t.slug),
+      state.focusSlug
+    );
     if (pending.length === 0) {
       throw classifiedError(
         "[systemArchitectTodoPlan] todo checklist empty",
@@ -3368,10 +3397,204 @@ async function bootstrapFixNode(
   );
 }
 
+async function analyzePrepareNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  return timedStage("analyzePrepare", async () => {
+    const appRoot = appRootOf(state);
+    await ensureDocsDirs(appRoot).catch(() => undefined);
+    const scope =
+      (state.analyzeScope || state.focusSlug || "project").replace(
+        /[^a-zA-Z0-9._-]+/g,
+        "-"
+      ) || "project";
+    const roleRaw = (state.analyzeRole || "").trim();
+    const roles: TeamRole[] = roleRaw
+      ? ([roleRaw] as TeamRole[]).filter((r) =>
+          [
+            "systemArchitect",
+            "technologyArchitect",
+            "uiUxDesigner",
+            "softwareEngineer",
+            "qaEngineer",
+          ].includes(r)
+        )
+      : [
+          "systemArchitect",
+          "technologyArchitect",
+          "uiUxDesigner",
+          "softwareEngineer",
+          "qaEngineer",
+        ];
+
+    const [readme, requirements, technologies, todo] = await Promise.all([
+      readDoc(appRoot, README_PATH),
+      readDoc(appRoot, REQUIREMENTS_PATH),
+      readDoc(appRoot, TECHNOLOGIES_PATH),
+      readDoc(appRoot, TODO_PATH),
+    ]);
+
+    const sections: string[] = [
+      `# Analysis — ${scope}`,
+      "",
+      `Idea: ${state.userIdea || "(none)"}`,
+      `Roles: ${roles.join(", ")}`,
+      "",
+    ];
+
+    for (const role of roles) {
+      notify("analyzePrepare", `analyze role=${role} scope=${scope}`);
+      try {
+        const res = await invokeRoleLlm(
+          role,
+          [
+            new SystemMessage(
+              [
+                `You are analyzing (read-only) scope "${scope}". Do NOT implement code or mark todos done.`,
+                "Write a short markdown opinion: risks, gaps vs requirements/specs, DoD weaknesses.",
+                "Output ONLY the markdown body (no FILE markers).",
+              ].join("\n")
+            ),
+            new HumanMessage(
+              [
+                "## Scope",
+                scope,
+                "",
+                "## README",
+                readme.slice(0, 4000),
+                "",
+                "## Requirements",
+                requirements.slice(0, 4000),
+                "",
+                "## Technologies",
+                technologies.slice(0, 3000),
+                "",
+                "## Todo",
+                todo.slice(0, 3000),
+              ].join("\n")
+            ),
+          ],
+          { stage: `analyze:${role}` }
+        );
+        sections.push(`## ${role}`, String(res.content ?? "").trim(), "");
+      } catch (e) {
+        sections.push(
+          `## ${role}`,
+          `_analyze failed: ${errorText(e).slice(0, 200)}_`,
+          ""
+        );
+      }
+    }
+
+    const rel = `.docs/reviews/${scope}-review.md`;
+    await writeDoc(appRoot, rel, sections.join("\n"));
+    notify("analyzePrepare", `wrote ${rel}`);
+    return {
+      appRoot,
+      filesWritten: [rel],
+      workflow: "analyze",
+    };
+  });
+}
+
+async function qaTddRedNode(
+  state: OrchestratorStateType
+): Promise<Partial<OrchestratorStateType>> {
+  let pending = [...(state.pendingTddRedSpecs ?? [])];
+  return timedStage(
+    "qaTddRed",
+    async () => {
+      const appRoot = appRootOf(state);
+      if (pending.length === 0) {
+        pending = [...(state.pendingSpecs ?? [])].filter(
+          (s) => s !== "project-setup"
+        );
+        if (pending.length === 0) {
+          pending = (await listSpecSlugs(appRoot)).filter(
+            (s) => s !== "project-setup"
+          );
+        }
+      }
+      const focus = (state.focusSlug || "").trim();
+      if (focus) {
+        pending = applyFocusSlug(pending, focus);
+      }
+      if (pending.length === 0) {
+        notify(
+          "qaTddRed",
+          state.workflow === "tests"
+            ? "No specs for TDD red — skip to QA verify"
+            : "No specs for TDD red — skip to SE"
+        );
+        return { appRoot, pendingTddRedSpecs: [] };
+      }
+
+      const slug = pending[0] ?? "";
+      notify("qaTddRed", `TDD red for '${slug}'`);
+      const [readme, technologies, specBody] = await Promise.all([
+        readDoc(appRoot, README_PATH),
+        readDoc(appRoot, TECHNOLOGIES_PATH),
+        slug ? readDoc(appRoot, specPath(slug)) : Promise.resolve(""),
+      ]);
+
+      const res = await invokeRoleLlm(
+        "qaEngineer",
+        [
+          new SystemMessage(qaEngineerTddRedPrompt()),
+          new HumanMessage(
+            [
+              `## Current spec: ${slug}`,
+              specBody,
+              "",
+              "## README.md",
+              readme,
+              "",
+              "## .docs/technologies.md",
+              technologies,
+            ].join("\n")
+          ),
+        ],
+        {
+          stage: "qaTddRed",
+          validate: (c) => {
+            assertHasFileSections(stripSeQaTrailMarkers(c), "qaTddRed");
+            const sc = validateQaSelfCheck(c);
+            if (!sc.ok) throw new Error(sc.message);
+          },
+        }
+      );
+
+      const testsRaw = String(res.content ?? "");
+      const tests = stripSeQaTrailMarkers(testsRaw);
+      const projectRoot = state.projectRoot || ".";
+      const written = await writeParsedFiles(appRoot, tests, projectRoot);
+      const remaining = pending.filter((s) => s !== slug);
+      notify(
+        "qaTddRed",
+        `red tests for '${slug}' — ${written.count} file(s); ${remaining.length} left`
+      );
+      return {
+        appRoot,
+        tests: testsRaw,
+        filesWritten: written.filesWritten,
+        currentSpec: slug,
+        pendingTddRedSpecs: remaining,
+      };
+    },
+    {
+      pendingTddRedSpecs: pending,
+      detail: pending[0] ? `red '${pending[0]}'` : "tdd-red",
+    }
+  );
+}
+
 async function softwareEngineerNode(
   state: OrchestratorStateType
 ): Promise<Partial<OrchestratorStateType>> {
-  const pending = [...(state.pendingSpecs ?? [])];
+  const pending = applyFocusSlug(
+    [...(state.pendingSpecs ?? [])],
+    state.focusSlug
+  );
   return timedStage(
     "softwareEngineer",
     async () => {
@@ -3637,10 +3860,7 @@ async function softwareEngineerNode(
       };
     }
 
-    for (const s of batch) {
-      await markTodoDone(appRoot, s);
-    }
-
+    // TDD: do NOT markTodoDone here — QA verify marks [x] after tests pass
     const remaining = workPending.slice(batch.length);
     const completedNow = alreadyDone + batch.length;
     getProgress().setPending({
@@ -3654,7 +3874,7 @@ async function softwareEngineerNode(
       "softwareEngineer",
       remaining.length > 0
         ? `spec(s) ${batch.join(",")} done — wrote ${written.count} files: ${formatFileList(written.filesWritten)}; faltam ${remaining.length}`
-        : `spec(s) ${batch.join(",")} done — wrote ${written.count} files: ${formatFileList(written.filesWritten)}; all implementation tasks done`,
+        : `spec(s) ${batch.join(",")} implemented (await QA verify for [x]) — wrote ${written.count} files: ${formatFileList(written.filesWritten)}; all implementation tasks done`,
       {
         phase: "implement",
         specs: {
@@ -3794,13 +4014,16 @@ async function softwareEngineerFixNode(
 async function qaEngineerNode(
   state: OrchestratorStateType
 ): Promise<Partial<OrchestratorStateType>> {
-  let pendingQa = [...(state.pendingQaSpecs ?? [])];
+  let pendingQa = applyFocusSlug(
+    [...(state.pendingQaSpecs ?? [])],
+    state.focusSlug
+  );
   return timedStage(
     "qaEngineer",
     async () => {
     const appRoot = appRootOf(state);
     if (pendingQa.length === 0) {
-      pendingQa = await listSpecSlugs(appRoot);
+      pendingQa = applyFocusSlug(await listSpecSlugs(appRoot), state.focusSlug);
     }
 
     const slug = pendingQa[0] ?? state.currentSpec ?? "";
@@ -3978,6 +4201,7 @@ async function qaEngineerNode(
 
     const remaining = pendingQa.filter((s) => s !== slug);
     const passed = [...passedBefore.filter((p) => p !== slug), slug];
+    await markTodoDone(appRoot, slug);
     getProgress().setPending({
       pendingQaSpecs: remaining,
       qaIndex: remaining.length > 0 ? passed.length + 1 : qaTotalAll,
@@ -3988,8 +4212,8 @@ async function qaEngineerNode(
       appRoot,
       "qaEngineer",
       remaining.length > 0
-        ? `QA PASS ${slug}; ${remaining.length} spec(s) left`
-        : `QA PASS ${slug}; all tests passed`,
+        ? `QA PASS ${slug} (marked [x]); ${remaining.length} spec(s) left`
+        : `QA PASS ${slug} (marked [x]); all tests passed`,
       {
         phase: remaining.length > 0 ? "qa" : "done",
         qa: {
@@ -4699,14 +4923,18 @@ async function resumePrepareNode(
         ? []
         : parseTodoChecklist(todoAfter);
 
-      const pending: string[] = [];
+      const candidates: string[] = [];
       const orphans: string[] = [];
       for (const item of itemsAfter) {
         if (item.done) continue;
         const exists = await pathExists(join(appRoot, specPath(item.slug)));
-        if (exists) pending.push(item.slug);
+        if (exists) candidates.push(item.slug);
         else orphans.push(item.slug);
       }
+      const focus = (state.focusSlug || "").trim();
+      const pending = focus
+        ? candidates.filter((s) => s === focus)
+        : candidates;
 
       if (orphans.length > 0) {
         notify(
@@ -4857,7 +5085,8 @@ async function fixPrepareNode(
     async () => {
       const appRoot = appRootOf(state);
       const existing = await listSpecSlugs(appRoot);
-      const slug = existing[0] || "fix";
+      const focused = applyFocusSlug(existing, state.focusSlug);
+      const slug = focused[0] || existing[0] || "fix";
 
       if (existing.length === 0) {
         const body = [
@@ -4883,17 +5112,20 @@ async function fixPrepareNode(
         "(No prior automated failure log — SE should inspect and fix.)",
       ].join("\n");
 
+      const qaPending =
+        focused.length > 0 ? focused : existing.length > 0 ? existing : [slug];
+
       getProgress().setPending({
-        pendingQaSpecs: existing.length > 0 ? existing : [slug],
+        pendingQaSpecs: qaPending,
       });
       notify(
         "fixPrepare",
-        `Prepared fix for '${slug}' (${existing.length} existing spec(s))`
+        `Prepared fix for '${slug}' (${qaPending.length} QA spec(s))`
       );
 
       return {
         currentSpec: slug,
-        pendingQaSpecs: existing.length > 0 ? existing : [slug],
+        pendingQaSpecs: qaPending,
         qaFailureLog: failureLog,
         qaFixRound: 0,
         testsPassed: false,
@@ -4928,6 +5160,16 @@ function routeAfterSpecEnrich(state: OrchestratorStateType): string {
   return (state.pendingSpecDrafts ?? []).length > 0
     ? "systemArchitectSpecItem"
     : "deliveryCriticArchitecture";
+}
+
+function routeAfterTddRed(state: OrchestratorStateType): string {
+  if ((state.pendingTddRedSpecs ?? []).length > 0) {
+    return "qaTddRed";
+  }
+  if (state.workflow === "tests") {
+    return "qaEngineer";
+  }
+  return "softwareEngineer";
 }
 
 function routeAfterArchitectureCritic(state: OrchestratorStateType): string {
@@ -5002,6 +5244,8 @@ const fullGraph = new StateGraph(OrchestratorState)
   .addNode("deliveryCriticArchitecture", deliveryCriticArchitectureNode)
   .addNode("scaffoldPrepare", scaffoldPrepareNode)
   .addNode("bootstrapFix", bootstrapFixNode)
+  .addNode("qaTddRed", qaTddRedNode)
+  .addNode("analyzePrepare", analyzePrepareNode)
   .addNode("softwareEngineer", softwareEngineerNode)
   .addNode("deliveryCriticDelivery", deliveryCriticDeliveryNode)
   .addNode("softwareEngineerFix", softwareEngineerFixNode)
@@ -5016,6 +5260,8 @@ const fullGraph = new StateGraph(OrchestratorState)
     punchPrepare: "punchPrepare",
     fixPrepare: "fixPrepare",
     resumePrepare: "resumePrepare",
+    qaTddRed: "qaTddRed",
+    analyzePrepare: "analyzePrepare",
   })
   .addEdge("orchestratorBootstrapReadme", "systemArchitectReqItem")
   .addEdge("systemArchitectReqItem", "orchestratorAfterPreReq")
@@ -5051,12 +5297,17 @@ const fullGraph = new StateGraph(OrchestratorState)
       orchestratorFinalize: "orchestratorFinalize",
     }
   )
-  .addEdge("scaffoldPrepare", "softwareEngineer")
-  .addEdge("punchPrepare", "softwareEngineer")
+  .addEdge("scaffoldPrepare", "qaTddRed")
+  .addEdge("punchPrepare", "qaTddRed")
   .addEdge("fixPrepare", "softwareEngineerFix")
   .addConditionalEdges("resumePrepare", routeAfterResumePrepare, {
     scaffoldPrepare: "scaffoldPrepare",
     orchestratorFinalize: "orchestratorFinalize",
+  })
+  .addConditionalEdges("qaTddRed", routeAfterTddRed, {
+    qaTddRed: "qaTddRed",
+    softwareEngineer: "softwareEngineer",
+    qaEngineer: "qaEngineer",
   })
   .addConditionalEdges("softwareEngineer", routeAfterSoftwareEngineer, {
     softwareEngineer: "softwareEngineer",
@@ -5083,6 +5334,7 @@ const fullGraph = new StateGraph(OrchestratorState)
   .addEdge("systemArchitectTechDebtReview", "orchestratorFinalize")
   .addEdge("softwareEngineerFix", "qaEngineer")
   .addEdge("bootstrapFix", "qaEngineer")
+  .addEdge("analyzePrepare", "orchestratorFinalize")
   .addEdge("orchestratorFinalize", END);
 
 /** Compiled graph; workflow (or docsOnly alias) selects the route after workflowRouter. */
@@ -5109,16 +5361,18 @@ server.tool(
   [
     "Runs a spec-driven LangGraph development pipeline under a project root.",
     "START → workflowRouter picks a route (or use workflow override), then:",
-    "full/docs: bootstrap → SA pré-reqs → clean README → fidelity → TA → specs → (SE/QA if full) → SA project summary → optional tech-debt plan → finalize;",
-    "feature: specs → SE* → QA* → SA summary → optional tech-debt plan; punch/fix/resume: … → QA → SA summary → optional tech-debt plan;",
+    "Implementation TDD: scaffold → QA-red* → SE green* → delivery critic → QA-verify* (markTodoDone) → SA summary;",
+    "full/docs: bootstrap → … → arch critic → (TDD chain if full; docs stops at finalize);",
+    "feature/punch/resume: … → TDD chain; tests: QA-red → QA-verify (no SE); analyze: role opinions → .docs/reviews → finalize;",
     `Workflows: ${workflowCatalogText()}.`,
-    "Set workflow to full|docs|feature|punch|fix|resume to force a route; omit to auto-classify.",
+    "Set workflow to full|docs|feature|punch|fix|resume|tests|analyze; omit to auto-classify.",
+    "Optional slug (feature/tests), role+scope (analyze).",
     "docsOnly=true is an alias for workflow=docs (deprecated).",
     "Pass workspaceRoot = absolute path of the Cursor-open folder (REQUIRED; MCP never uses sticky WORKSPACE_ROOT env).",
     "Set projectRoot to a relative folder under that workspace (default '.') treated as the app root for all writes.",
     "Requires .zteam/config.json (workspace and/or app) unless skipConfigGate=true.",
     "Config models are absolute truth: cursor aliases (inherit/auto/cursor/cursor-auto) → returns delegationPlaybook for Cursor Task (no 9router LLM); any other id → ChatOpenAI literal via 9router (validated against GET /models).",
-    "Mixed cursor+9router primaries → failureKind=mixed_runtime.",
+    "Mixed cursor+9router primaries → failureKind=mixed_runtime. Dual runtime: ninerouter = MCP owns LLMs (no Task rewrite); cursor = skill runs Task playbook in stage order.",
     "FILE writes are sanitized (no .., strip projectRoot prefix, strip markdown fences).",
     "On failure, check .docs/pipeline-result.json and resumeHint (prefer workflow=resume).",
   ].join(" "),
@@ -5133,11 +5387,38 @@ server.tool(
         "Relative project folder under workspaceRoot treated as app root (default '.')"
       ),
     workflow: z
-      .enum(["full", "docs", "feature", "punch", "fix", "resume"])
+      .enum([
+        "full",
+        "docs",
+        "feature",
+        "punch",
+        "fix",
+        "resume",
+        "tests",
+        "analyze",
+      ])
       .optional()
       .describe(
         "Force a workflow route; omit to auto-classify from idea + existing docs"
       ),
+    slug: z
+      .string()
+      .optional()
+      .describe("Focus one spec slug (feature / tests workflows)"),
+    role: z
+      .enum([
+        "systemArchitect",
+        "technologyArchitect",
+        "uiUxDesigner",
+        "softwareEngineer",
+        "qaEngineer",
+      ])
+      .optional()
+      .describe("analyze workflow: single role (omit = all roles)"),
+    scope: z
+      .string()
+      .optional()
+      .describe("analyze workflow: scope label / path key for review file"),
     docsOnly: z
       .boolean()
       .optional()
@@ -5152,7 +5433,17 @@ server.tool(
       .describe("Skip .zteam/config.json gate (smoke/dev only)"),
   },
   async (
-    { userIdea, workspaceRoot, projectRoot, workflow, docsOnly, skipConfigGate },
+    {
+      userIdea,
+      workspaceRoot,
+      projectRoot,
+      workflow,
+      slug,
+      role,
+      scope,
+      docsOnly,
+      skipConfigGate,
+    },
     extra
   ) => {
     const root = projectRoot || ".";
@@ -5220,7 +5511,11 @@ server.tool(
                 appRoot,
                 workspaceRoot: ws.root,
                 resumeHint:
-                  "Use the same runtime for all primaries: all inherit/auto/cursor OR all 9router ids. Fix .zteam/config.json then re-run.",
+                  "Use the same runtime for all primaries: all inherit/auto/cursor OR all 9router ids. Fix .zteam/config.json then re-run." +
+                  (runtimeRes.suggestedConfigSnippet
+                    ? `\nSuggested config snippet:\n${runtimeRes.suggestedConfigSnippet}`
+                    : ""),
+                suggestedConfigSnippet: runtimeRes.suggestedConfigSnippet,
               },
               null,
               2
@@ -5353,6 +5648,10 @@ server.tool(
                 pendingSpecs: [],
                 completedSpecs: [],
                 pendingQaSpecs: [],
+                pendingTddRedSpecs: [],
+                focusSlug: (slug || "").trim(),
+                analyzeRole: (role || "").trim(),
+                analyzeScope: (scope || slug || "").trim(),
                 qaFixRound: 0,
                 bootstrapFixRound: 0,
                 deliveryFixRound: 0,
@@ -5522,7 +5821,9 @@ server.tool(
         .string()
         .min(1)
         .optional()
-        .default(DEFAULT_MODELS.uiUxDesigner),
+        .describe(
+          "UI/UX primary; if omitted, inherits peer family (cursor alias or 9router default)"
+        ),
       softwareEngineer: z.string().min(1),
       qaEngineer: z.string().min(1),
       fallback: z.string().optional().default(""),
@@ -5602,6 +5903,74 @@ server.tool(
               exists: teamConfig.exists,
               workspace: diagnoseWorkspace(ws.root, ws.source),
               appRoot,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "ensure_zteam_setup",
+  "Isolated setup (no LLM): copy canonical zteam skill/README, create .docs stubs, optionally write official config template. Never writes src/**.",
+  {
+    workspaceRoot: workspaceRootArg,
+    projectRoot: z.string().optional().default("."),
+    skill: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Install/refresh .zteam/skills/SKILL.md + README from package"),
+    docsDirs: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Create .docs / .docs/specs / .docs/reviews if missing"),
+    configTemplate: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Write official config.json only if none exists"),
+    configFamily: z
+      .enum(["cursor", "ninerouter"])
+      .optional()
+      .default("ninerouter")
+      .describe("Template family when configTemplate=true"),
+  },
+  async ({
+    workspaceRoot,
+    projectRoot,
+    skill,
+    docsDirs,
+    configTemplate,
+    configFamily,
+  }) => {
+    const resolved = mcpResolveWorkspace(workspaceRoot);
+    if (!resolved.ok) return resolved.result;
+    const ws = resolved.ws;
+    const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
+    assertSafeAppRoot(appRoot, projectRoot || ".");
+    const result = await ensureZteamSetup({
+      workspaceRoot: ws.root,
+      appRoot,
+      skill,
+      docsDirs,
+      configTemplate,
+      configFamily,
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              ...result,
+              workspaceRoot: ws.root,
+              appRoot,
+              workspace: diagnoseWorkspace(ws.root, ws.source),
             },
             null,
             2

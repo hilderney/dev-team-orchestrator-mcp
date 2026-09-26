@@ -318,6 +318,47 @@ try {
     assert(!res.ok && res.failureKind === "mixed_runtime", "mixed fails");
   }
 
+  // --- omit uiUxDesigner with all-inherit peers → cursor homogeneous ---
+  {
+    const ws = join(base, "omit-ux-ws");
+    await mkdir(ws, { recursive: true });
+    await mkdir(join(ws, ".zteam"), { recursive: true });
+    await writeFile(
+      join(ws, ".zteam", "config.json"),
+      JSON.stringify({
+        version: 1,
+        models: {
+          systemArchitect: "inherit",
+          technologyArchitect: "inherit",
+          softwareEngineer: "inherit",
+          qaEngineer: "inherit",
+        },
+      }) + "\n",
+      "utf8"
+    );
+    const cfg = await loadTeamConfig(ws, ws);
+    assert(
+      cfg.models.uiUxDesigner === "inherit",
+      `omit UX should inherit peer family, got ${cfg.models.uiUxDesigner}`
+    );
+    const rt = resolveTeamRuntime(cfg);
+    assert(rt.ok && rt.runtime === "cursor", "omit-UX→cursor runtime");
+
+    await writeTeamConfig(ws, {
+      models: {
+        systemArchitect: "inherit",
+        technologyArchitect: "inherit",
+        softwareEngineer: "inherit",
+        qaEngineer: "inherit",
+      },
+    });
+    const cfg2 = await loadTeamConfig(ws, ws);
+    assert(
+      cfg2.models.uiUxDesigner === "inherit",
+      "writeTeamConfig infers UX inherit"
+    );
+  }
+
   // --- playbook + missing models helper ---
   {
     const pb = buildCursorDelegationPlaybook({
@@ -342,11 +383,70 @@ try {
       pb.stages.every((s) => s.model === "inherit"),
       "stage models inherit"
     );
+    const fullPb = buildCursorDelegationPlaybook({
+      workflow: "full",
+      userIdea: "pacman",
+      workspaceRoot: base,
+      projectRoot: ".",
+      appRoot: base,
+      models: pb.models,
+      maxTokens: pb.maxTokens,
+    });
+    const ids = fullPb.stages.map((s) => s.id);
+    const redIdx = ids.indexOf("qa-tdd-red");
+    const seIdx = ids.indexOf("se-implement");
+    const criticIdx = ids.indexOf("delivery-critic");
+    const verIdx = ids.indexOf("qa-tdd-verify");
+    assert(
+      redIdx >= 0 &&
+        seIdx > redIdx &&
+        criticIdx > seIdx &&
+        verIdx > criticIdx,
+      "TDD order red→SE→delivery-critic→verify"
+    );
     const miss = missingNineRouterModels(
       { models: { systemArchitect: "no-such-model", qaEngineer: "" } },
       new Set(["ok"])
     );
     assert(miss.includes("systemArchitect=no-such-model"), "missing detect");
+  }
+
+  // --- ensureZteamSetup: skill + docs, never src ---
+  {
+    const { ensureZteamSetup, ensureDocsDirs } = await import(
+      "../src/zteam-config.ts"
+    );
+    const ws = join(base, "setup-ws");
+    const app = join(ws, "app");
+    await mkdir(app, { recursive: true });
+    const r = await ensureZteamSetup({
+      workspaceRoot: ws,
+      appRoot: app,
+      skill: true,
+      docsDirs: true,
+      configTemplate: true,
+      configFamily: "cursor",
+    });
+    assert(r.ok && r.capability === "setup", "setup ok");
+    assert(
+      r.pathsTouched.every((p) => !/[\\/]src[\\/]/.test(p)),
+      "setup must not touch src"
+    );
+    const skillPath = join(app, ".zteam", "skills", "SKILL.md");
+    assert(
+      (await readFile(skillPath, "utf8")).includes("@zteam"),
+      "app skill copied"
+    );
+    const docs = await ensureDocsDirs(app);
+    assert(
+      docs.existed.includes(".docs") || docs.created.length === 0,
+      "docs dirs present"
+    );
+    assert(r.config?.written === true, "config template written");
+    const cfg = JSON.parse(
+      await readFile(join(app, ".zteam", "config.json"), "utf8")
+    );
+    assert(cfg.models.uiUxDesigner === "inherit", "cursor template has UX");
   }
 
   console.log("smoke:zteam-config OK");

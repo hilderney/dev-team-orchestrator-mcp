@@ -61,7 +61,7 @@ function assert(cond, msg) {
 {
   delete process.env.GRAPH_RECURSION_LIMIT;
   assert(resolveGraphRecursionLimit() === 120, "default 120");
-  assert(resolveGraphRecursionLimit(20) === Math.max(100, 10 + 4 * 20), "estimate");
+  assert(resolveGraphRecursionLimit(20) === Math.max(100, 10 + 8 * 20), "estimate");
   process.env.GRAPH_RECURSION_LIMIT = "200";
   assert(resolveGraphRecursionLimit() === 200, "env override");
   delete process.env.GRAPH_RECURSION_LIMIT;

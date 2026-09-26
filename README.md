@@ -1,6 +1,6 @@
 # Dev Team Orchestrator MCP
 
-MCP server that runs a **spec-driven** LangGraph pipeline against 9router models:
+MCP server that runs a **spec-driven** LangGraph pipeline (dual runtime: **Cursor Task** playbook when models are `inherit`/`auto`/`cursor`, or **9router** ChatOpenAI otherwise):
 
 1. System Architect → `README.md` + `.docs/requirements.md` (pré-reqs loop)
 2. UI/UX Designer → score + `## UX / Juice addendum` in requirements (action/reaction; score ≥7)
@@ -8,17 +8,19 @@ MCP server that runs a **spec-driven** LangGraph pipeline against 9router models
 4. Technology Architect → `.docs/technologies.md`
 5. UI/UX Designer → `.docs/ui-ux.md` (look-and-feel, palette, sensory, evidence-based emotion)
 6. System Architect → `.docs/todo.md` plan (testable chunks from pré-reqs)
-7. Per todo slug → SA detailed spec → UI/UX enrich → TA technical enrich → `.docs/specs/{slug}.spec.md` (≥3 use cases)
+7. Per todo slug → SA detailed spec → UI/UX enrich (`## Flow & states` when UI) → TA technical enrich → `.docs/specs/{slug}.spec.md` (≥3 use cases)
 8. Delivery critic (architecture) → idea ↔ tech/specs gaps
 9. Scaffold → vite+vitest template / augment missing shell files
-10. Software Engineer → specs in todo order; Clean Code + `===SELF_CHECK===` (functionalities / use cases / usability-emotions); `verifyDelivery` + `tsc`; redo with feedback
-11. Delivery critic (delivery) → reopen incomplete slugs
-12. QA Engineer → vitest (work → as described → all use cases); optional `===TECH_DEBT===` → `.docs/tech-debt.md`; fix loop (bootstrap → bootstrapFix; logic → SE fix)
-13. System Architect → project summary from requirements + README → `.docs/project-summary.md` + `.docs/user-report.md`
-14. System Architect (if tech debt) → judge vs requirements/spirit; update docs if needed; plan-mode `.docs/tech-debt-plan.md` for the owner to decide
-15. Finalize → README status + `.docs/pipeline-result.json` (includes `userReport` / plan paths)
+10. **QA TDD red** → failing tests from specs (use cases / screen-flow) **before** code
+11. Software Engineer → TDD green; Clean Code + `===SELF_CHECK===`; `verifyDelivery` + `tsc`; redo with feedback — **does not** mark `[x]`
+12. Delivery critic (delivery) → reopen incomplete slugs
+13. **QA TDD verify** → run suite + gaps; mark `[x]` only when tests pass; optional `===TECH_DEBT===`
+14. System Architect → project summary → `.docs/user-report.md`
+15. Optional tech-debt plan → finalize → `.docs/pipeline-result.json`
 
-MCP also exposes `get_pipeline_state` and `approve_gate` (HITL when `ZTEAM_HITL=1`).
+**Workflows:** `full` | `docs` | `feature` (+ optional `slug`) | `punch` | `fix` | `resume` | `tests` (+ `slug`) | `analyze` (+ `scope` / `role`).
+
+**MCP tools:** `run_development_pipeline`, `get_zteam_config`, `write_zteam_config`, `ensure_zteam_setup`, `get_pipeline_state`, `approve_gate` (HITL when `ZTEAM_HITL=1`).
 
 Package docs and pipeline graph live under **`.docs/`** (not `docs/`) — same convention as app artefacts (`.docs/requirements.md`, …).
 
@@ -146,7 +148,7 @@ After `.docs/ui-ux.md` exists, the System Architect plans a **short** `todo.md` 
 
 **Delivers**
 - `.docs/todo.md` — plan notes + `- [ ] slug: title` checklist (testable chunks from pré-reqs)
-- Per slug `.docs/specs/{slug}.spec.md` — functionalities, all actions/reactions, **≥3 use-case examples (≥1 per scenario)**, acceptance, Files to touch, usability/juice, technical approach
+- Per slug `.docs/specs/{slug}.spec.md` — functionalities, all actions/reactions, **≥3 use-case examples (≥1 per scenario)**, acceptance, Files to touch, usability/juice, technical approach; UI/UX may add `## Flow & states` (screen-flow) when the slug is UI
 - Self-checks at each hand (all must be yes before writing)
 
 ```mermaid
@@ -183,41 +185,47 @@ flowchart TD
   draftLoop -->|no| nextArch
 ```
 
-## Implementation + owner report (SE → QA → SA)
+## Implementation (TDD) + owner report
 
-Runs after scaffold (or punch/fix/resume prepare). Docs-only workflows skip this phase.
+Runs after scaffold (or punch/resume prepare). Docs-only and analyze skip this phase. Workflow `tests` runs QA-red → QA-verify only (no SE).
 
 **Delivers**
-- Code from each `.docs/specs/{slug}.spec.md` in todo order (Clean Code / readable; light SOLID)
-- SE `===SELF_CHECK===`: `covers_all_functionalities`, `covers_all_use_cases`, `follows_usability_and_emotions`
-- QA tests (vitest): must work → as described → all use cases; optional `.docs/tech-debt.md`
+- **QA TDD red** — failing vitest tests from each pending spec (use cases / screen-flow / `## Flow & states` when present); does **not** mark todos `[x]`
+- **SE TDD green** — implement until code + `tsc` + `verifyDelivery` pass; Clean Code + `===SELF_CHECK===` (`covers_all_functionalities`, `covers_all_use_cases`, `follows_usability_and_emotions`); does **not** mark `[x]`
+- **Delivery critic** — may reopen incomplete slugs back to SE
+- **QA TDD verify** — run suite + gap tests; mark `[x]` only when tests pass; optional `.docs/tech-debt.md`
 - `.docs/project-summary.md` + `.docs/user-report.md` — what the project does (for the owner)
 - If tech debt exists: disposition + plan-mode `.docs/tech-debt-plan.md` (owner decides; not auto-implemented)
 
 ```mermaid
 flowchart TD
   scaffold[scaffoldPrepare]
+  qaRed[qaTddRed]
   se[softwareEngineer]
   delCritic[deliveryCriticDelivery]
-  qa[qaEngineer]
+  qaVerify[qaEngineer verify]
   seFix[softwareEngineerFix]
   bootFix[bootstrapFix]
   saSummary[systemArchitectProjectSummary]
   saDebt[systemArchitectTechDebtReview]
   finalize[orchestratorFinalize]
 
-  scaffold --> se
+  scaffold --> qaRed
+  qaRed -->|moreSlugs| qaRed
+  qaRed -->|done| se
   se -->|pendingSpecs| se
-  se -->|done| delCritic
+  se -->|batchDone| delCritic
   delCritic -->|reopen| se
-  delCritic -->|PASS| qa
-  qa -->|logic fail| seFix --> qa
-  qa -->|bootstrap fail| bootFix --> qa
-  qa -->|moreSpecs| qa
-  qa -->|allPass| saSummary
+  delCritic -->|PASS| qaVerify
+  qaVerify -->|logic fail| seFix --> qaVerify
+  qaVerify -->|bootstrap fail| bootFix --> qaVerify
+  qaVerify -->|moreSpecs| qaVerify
+  qaVerify -->|allPass markTodoDone| saSummary
   saSummary -->|no tech debt| finalize
   saSummary -->|tech debt| saDebt --> finalize
 ```
+
+Matches LangGraph dump: [`.docs/langgraph.mmd`](.docs/langgraph.mmd) (`scaffoldPrepare → qaTddRed → softwareEngineer → … → qaEngineer`).
 
 ## Setup
 
@@ -274,7 +282,7 @@ Example:
 }
 ```
 
-MCP tools: `get_zteam_config`, `write_zteam_config`, `run_development_pipeline`, `get_pipeline_state`, `approve_gate`.
+MCP tools: `get_zteam_config`, `write_zteam_config`, `ensure_zteam_setup`, `run_development_pipeline`, `get_pipeline_state`, `approve_gate`.
 
 ### Env vars (orchestrator)
 
@@ -307,9 +315,9 @@ Examples:
 /zteam punch — make the submit button blue in samples/my-app
 ```
 
-Always pass `workspaceRoot` (absolute Cursor open folder) and `projectRoot` when you can. Optional `workflow`: `full` | `docs` | `feature` | `punch` | `fix` | `resume` (omit = auto-router).
+Always pass `workspaceRoot` (absolute Cursor open folder) and `projectRoot` when you can. Optional `workflow`: `full` | `docs` | `feature` | `punch` | `fix` | `resume` | `tests` | `analyze` (omit = auto-router). Optional `slug` (feature/tests), `role` + `scope` (analyze).
 
-Skill subcommands: **`@zteam/config`**, **`@zteam/models`**, **`@zteam/documentation`**, **`@zteam/tests`** — see [`.zteam/README.MD`](.zteam/README.MD).
+Skill subcommands: **`@zteam/config`**, **`@zteam/models`**, **`@zteam/documentation`**, **`@zteam/tests`** — see [`.zteam/README.MD`](.zteam/README.MD). When models are Cursor aliases (`inherit`/…), MCP returns `delegationPlaybook` — run stages via Cursor Task (incl. QA-red before SE).
 
 Also see the always-on routing rule for stage/env details. Rescue mid-failure with `workflow=resume` (see skill). Resume reopens phantom `[x]` todos whose Files to touch are missing on disk.
 
@@ -318,33 +326,38 @@ Also see the always-on routing rule for stage/env details. Rescue mid-failure wi
 | Mode | How | Route |
 |------|-----|--------|
 | **auto** | omit `workflow` | `workflowRouter` classifies from idea + `.docs` on disk |
-| **full** | `workflow=full` | … → arch critic → scaffold → SE\* → QA\* → SA summary → optional tech-debt plan → finalize |
-| **docs** | `workflow=docs` or `docsOnly=true` / `--docs-only` | … → (SA→UX→TA spec)\* → arch critic → finalize (no SE/QA/summary) |
-| **feature** | `workflow=feature` | SA todo plan → (SA→UX→TA spec)\* → arch critic → scaffold → SE\* → QA\* → SA summary → optional tech-debt plan → finalize |
-| **punch** | `workflow=punch` | prepare → SE → QA → SA summary → optional tech-debt plan → finalize |
-| **fix** | `workflow=fix` | prepare → SE fix → QA → SA summary → optional tech-debt plan → finalize |
-| **resume** | `workflow=resume` | reopen phantoms + pending `[ ]` → scaffold → SE\* → QA\* → SA summary → optional tech-debt plan → finalize |
+| **full** | `workflow=full` | … → arch critic → scaffold → **QA-red\*** → **SE\*** → delivery critic → **QA-verify\*** → SA summary → optional tech-debt plan → finalize |
+| **docs** | `workflow=docs` or `docsOnly=true` / `--docs-only` | … → (SA→UX→TA spec)\* → arch critic → finalize (no SE/QA) |
+| **feature** | `workflow=feature` (+ optional `slug`) | SA todo plan → (SA→UX→TA spec)\* → arch critic → scaffold → QA-red\* → SE\* → QA-verify\* → SA summary → optional tech-debt plan → finalize |
+| **punch** | `workflow=punch` | prepare → QA-red → SE → QA-verify → SA summary → optional tech-debt plan → finalize |
+| **fix** | `workflow=fix` | prepare → SE fix → QA-verify → SA summary → optional tech-debt plan → finalize |
+| **resume** | `workflow=resume` | reopen phantoms + pending `[ ]` → scaffold → QA-red\* → SE\* → QA-verify\* → SA summary → optional tech-debt plan → finalize |
+| **tests** | `workflow=tests` (+ `slug`) | QA-red\* → QA-verify\* → finalize |
+| **analyze** | `workflow=analyze` (+ `scope` / optional `role`) | analyzePrepare → `.docs/reviews/…` → finalize |
 
-Catalog + classifier: [`src/workflows/`](src/workflows/). Multiagent ideal (future): [`.docs/adr-multiagent-flow.md`](.docs/adr-multiagent-flow.md). Historical plans: [`.docs/postmortems/`](.docs/postmortems/).
+Catalog + classifier: [`src/workflows/`](src/workflows/) (`WORKFLOW_CATALOG`). Graph dump: [`.docs/langgraph.mmd`](.docs/langgraph.mmd). Multiagent ideal (future): [`.docs/adr-multiagent-flow.md`](.docs/adr-multiagent-flow.md). Historical plans: [`.docs/postmortems/`](.docs/postmortems/).
 
 ### Workflow `full`
 
 1. **Bootstrap** — Resume + Pré Requirements; stub `.docs/requirements.md` (empty LLM → `llm_empty`, no stub charter)
 2. **SA loop** — expand each pré-req into `.docs/requirements.md`
 3. **Clean README** — Resume + link to requirements
-4. **Fidelity** — hard FAIL vs `userIdea` (API/locale/stub); one redo then classified abort
+4. **UI/UX juice** → score + addendum; then **Fidelity** — hard FAIL vs `userIdea`; one redo then classified abort
 5. **TA** → `.docs/technologies.md`
 6. **UI/UX look-and-feel** → `.docs/ui-ux.md`
 7. **SA todo plan** → `.docs/todo.md` (testable chunks)
-8. **Per-slug specs** → SA → UI/UX → TA on each `.docs/specs/{slug}.spec.md`
+8. **Per-slug specs** → SA → UI/UX (`## Flow & states` when UI) → TA on each `.docs/specs/{slug}.spec.md`
 9. **Architecture critic** — coverage gaps; may reopen TA
 10. **Scaffold** — template or augment missing shell files + install
-11. **SE** — Clean Code / readable implementer; batch specs in todo order; `===SELF_CHECK===` (functionalities, use cases, usability/emotions); `verifyDelivery` + `tsc`; redo with `deliveryFixRound`; then `markTodoDone`
-12. **Delivery critic** — reopen incomplete slugs
-13. **QA** — priorities: work → as described → all use cases; `===SELF_CHECK===`; optional `===TECH_DEBT===` → `.docs/tech-debt.md` for orchestrator; bootstrapFix vs SE fix by error class
-14. **SA project summary** — reads requirements + README; writes `.docs/project-summary.md` + `.docs/user-report.md` for the owner
-15. **SA tech-debt review** (if `.docs/tech-debt.md` has content) — necessary vs not vs project spirit; updates docs when needed; writes plan-mode `.docs/tech-debt-plan.md` for the user to decide
-16. **Finalize** → README + `.docs/pipeline-result.json` (includes `userReport` / plan paths)
+11. **QA TDD red** — failing tests per pending spec; no `[x]`
+12. **SE TDD green** — implement; `===SELF_CHECK===`; `verifyDelivery` + `tsc`; redo with `deliveryFixRound`; **does not** `markTodoDone`
+13. **Delivery critic** — reopen incomplete slugs
+14. **QA TDD verify** — run suite + gaps; `markTodoDone` when pass; optional `===TECH_DEBT===` → `.docs/tech-debt.md`; bootstrapFix vs SE fix by error class
+15. **SA project summary** — `.docs/project-summary.md` + `.docs/user-report.md`
+16. **SA tech-debt review** (if tech debt) — plan-mode `.docs/tech-debt-plan.md`
+17. **Finalize** → README + `.docs/pipeline-result.json`
+
+LangGraph overview (simplified; full dump in [`.docs/langgraph.mmd`](.docs/langgraph.mmd)):
 
 ```mermaid
 flowchart TD
@@ -364,17 +377,27 @@ flowchart TD
   taSpec[technologyArchitectSpecEnrich]
   archCritic[deliveryCriticArchitecture]
   scaffold[scaffoldPrepare]
+  qaRed[qaTddRed]
   se[softwareEngineer]
   delCritic[deliveryCriticDelivery]
-  qa[qaEngineer]
+  qaVerify[qaEngineer]
   seFix[softwareEngineerFix]
   bootFix[bootstrapFix]
+  analyze[analyzePrepare]
   saSummary[systemArchitectProjectSummary]
   saDebt[systemArchitectTechDebtReview]
   finalize[orchestratorFinalize]
   endNode[END]
+
   startNode --> router
   router -->|full| boot
+  router -->|feature| todoPlan
+  router -->|punch| qaRed
+  router -->|fix| seFix
+  router -->|resume| scaffold
+  router -->|tests| qaRed
+  router -->|analyze| analyze
+  analyze --> finalize
   boot --> saItem
   saItem --> afterItem
   afterItem -->|pendingPreReqs| saItem
@@ -386,26 +409,29 @@ flowchart TD
   taSpec -->|more drafts| saSpec
   taSpec -->|done| archCritic
   archCritic -->|gaps| ta
-  archCritic -->|PASS| scaffold
-  scaffold --> se
-  se -->|pendingSpecs + SELF_CHECK| se
-  se -->|done| delCritic
+  archCritic -->|PASS full/feature| scaffold
+  archCritic -->|docs| finalize
+  scaffold --> qaRed
+  qaRed -->|moreSlugs| qaRed
+  qaRed -->|done impl| se
+  qaRed -->|done testsOnly| qaVerify
+  se -->|pendingSpecs| se
+  se -->|batchDone| delCritic
   delCritic -->|reopen| se
-  delCritic -->|PASS| qa
-  qa -->|logic fail| seFix
-  seFix -->|SELF_CHECK| qa
-  qa -->|bootstrap fail| bootFix
-  bootFix --> qa
-  qa -->|moreSpecs| qa
-  qa -->|TECH_DEBT optional| qa
-  qa -->|allPass| saSummary
+  delCritic -->|PASS| qaVerify
+  qaVerify -->|logic fail| seFix
+  seFix --> qaVerify
+  qaVerify -->|bootstrap fail| bootFix
+  bootFix --> qaVerify
+  qaVerify -->|moreSpecs| qaVerify
+  qaVerify -->|allPass| saSummary
   saSummary -->|no tech debt| finalize
   saSummary -->|tech debt| saDebt
-  saDebt -->|plan for user| finalize
+  saDebt --> finalize
   finalize --> endNode
 ```
 
-SE answers: `covers_all_functionalities`, `covers_all_use_cases`, `follows_usability_and_emotions`. QA answers: `tests_cover_all_use_cases`, `no_unresolved_spec_conflicts` (conflicts go to `.docs/tech-debt.md`). After QA, SA presents a project summary; if tech debt exists, SA judges it against requirements/spirit and leaves a plan-mode action plan for you to decide.
+SE answers: `covers_all_functionalities`, `covers_all_use_cases`, `follows_usability_and_emotions`. QA (red + verify) answers: `tests_cover_all_use_cases`, `no_unresolved_spec_conflicts` (conflicts go to `.docs/tech-debt.md`). Todos `[x]` only after QA-verify PASS. After QA, SA presents a project summary; if tech debt exists, SA judges it against requirements/spirit and leaves a plan-mode action plan for you to decide.
 
 Hard guard: refuses to write when `projectRoot` is `.` and `appRoot` equals the orchestrator package, or when a path escapes `workspaceRoot`. `GRAPH_RECURSION_LIMIT` default **120**.
 

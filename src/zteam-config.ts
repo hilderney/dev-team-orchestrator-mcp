@@ -99,9 +99,79 @@ export type TeamRuntimeErr = {
   failureKind: "mixed_runtime";
   message: string;
   roles: Record<TeamRole, { model: string; runtime: LlmRuntime }>;
+  suggestedConfigSnippet?: string;
 };
 
 export type TeamRuntimeResolution = TeamRuntimeOk | TeamRuntimeErr;
+
+/**
+ * When a config layer omits a primary but peers in the same layer are a single
+ * runtime family, inherit that family's representative model (avoids injecting
+ * DEFAULT 9router UX into an all-`inherit` config → mixed_runtime).
+ */
+export function inferMissingPrimaryFromPeers(
+  layerModels: Partial<Record<TeamRole, string>> | undefined,
+  role: TeamRole
+): string | undefined {
+  if (!layerModels) return undefined;
+  if (layerModels[role]?.trim()) return undefined;
+  const peers = TEAM_ROLES.filter((r) => r !== role)
+    .map((r) => layerModels[r]?.trim() || "")
+    .filter(Boolean);
+  if (peers.length === 0) return undefined;
+  const allCursor = peers.every((m) => isCursorModelAlias(m));
+  const allNine = peers.every((m) => !isCursorModelAlias(m));
+  if (allCursor) {
+    // Prefer the most common alias; fall back to first peer
+    const counts = new Map<string, number>();
+    for (const m of peers) counts.set(m, (counts.get(m) || 0) + 1);
+    let best = peers[0];
+    let bestN = 0;
+    for (const [m, n] of counts) {
+      if (n > bestN) {
+        best = m;
+        bestN = n;
+      }
+    }
+    return best;
+  }
+  if (allNine) {
+    return DEFAULT_MODELS[role];
+  }
+  return undefined;
+}
+
+/** Official template: every primary listed (incl. uiUxDesigner). */
+export function officialConfigModelsTemplate(
+  family: "cursor" | "ninerouter" = "ninerouter"
+): ResolvedTeamConfig["models"] {
+  if (family === "cursor") {
+    return {
+      systemArchitect: "inherit",
+      technologyArchitect: "inherit",
+      uiUxDesigner: "inherit",
+      softwareEngineer: "inherit",
+      qaEngineer: "inherit",
+      fallback: "",
+      systemArchitectFallback: "",
+      technologyArchitectFallback: "",
+      uiUxDesignerFallback: "",
+      softwareEngineerFallback: "",
+      qaEngineerFallback: "",
+    };
+  }
+  return { ...DEFAULT_MODELS };
+}
+
+/** Snippet for mixed_runtime / missing_role resumeHint. */
+export function suggestedHomogeneousConfigSnippet(
+  prefer: LlmRuntime = "cursor"
+): string {
+  const models = officialConfigModelsTemplate(
+    prefer === "cursor" ? "cursor" : "ninerouter"
+  );
+  return JSON.stringify({ version: 1, models }, null, 2);
+}
 
 /** Homogeneous runtime from primary models; mix → mixed_runtime. */
 export function resolveTeamRuntime(
@@ -123,11 +193,17 @@ export function resolveTeamRuntime(
     const detail = TEAM_ROLES.map(
       (r) => `${r}=${roles[r].model}(${roles[r].runtime})`
     ).join(", ");
+    const cursorCount = TEAM_ROLES.filter(
+      (r) => roles[r].runtime === "cursor"
+    ).length;
+    const prefer: LlmRuntime =
+      cursorCount >= TEAM_ROLES.length / 2 ? "cursor" : "ninerouter";
     return {
       ok: false,
       failureKind: "mixed_runtime",
       message: `All primary models must share one runtime (cursor aliases OR 9router ids). Got mixed: ${detail}`,
       roles,
+      suggestedConfigSnippet: suggestedHomogeneousConfigSnippet(prefer),
     };
   }
   return {
@@ -194,10 +270,43 @@ export function buildCursorDelegationPlaybook(opts: {
   const needsImpl = ["full", "feature", "punch", "fix", "resume", ""].includes(
     wf
   );
-  const needsQa = ["full", "feature", "punch", "fix", "resume", ""].includes(
-    wf
-  );
+  const needsQa = [
+    "full",
+    "feature",
+    "punch",
+    "fix",
+    "resume",
+    "tests",
+    "",
+  ].includes(wf);
   const docsOnly = wf === "docs";
+  const testsOnly = wf === "tests";
+  const analyzeOnly = wf === "analyze";
+
+  if (analyzeOnly) {
+    stages.push(
+      stage(
+        "analyze",
+        "systemArchitect",
+        "Analyze (read-only)",
+        "Write .docs/reviews/<scope>-review.md covering gaps/risks for the given scope. Do not implement code or mark todos [x]. If a single role was requested, stay in that lens.",
+        [".docs/reviews/*.md"]
+      )
+    );
+    return {
+      llmRuntime: "cursor",
+      workflow: wf,
+      userIdea: idea,
+      workspaceRoot: opts.workspaceRoot,
+      projectRoot: opts.projectRoot,
+      appRoot: opts.appRoot,
+      models: opts.models,
+      maxTokens: opts.maxTokens,
+      stages,
+      resumeHint:
+        "llmRuntime=cursor: run each delegationPlaybook.stages entry via Cursor Task. Do NOT call 9router.",
+    };
+  }
 
   if (needsArch || wf === "docs") {
     stages.push(
@@ -247,14 +356,44 @@ export function buildCursorDelegationPlaybook(opts: {
     );
   }
 
-  if (needsImpl && !docsOnly) {
+  if (needsImpl && !docsOnly && !testsOnly) {
+    stages.push(
+      stage(
+        "qa-tdd-red",
+        "qaEngineer",
+        "QA — TDD red (tests first)",
+        "BEFORE implementation: write failing automated tests from each pending spec (use cases, ACs, screen-flow / Flow & states if present). Prefer vitest. Do NOT implement product code. Do NOT mark todos [x]. Tests must fail or be clearly red until SE implements.",
+        ["**/*.{test,spec}.*", "tests/**"]
+      )
+    );
     stages.push(
       stage(
         "se-implement",
         "softwareEngineer",
-        "Software Engineer — implement",
-        "Implement pending [ ] todos that have specs. Write production code under appRoot. Follow technologies.md and specs. Do not write tests (QA does).",
+        "Software Engineer — implement (TDD green)",
+        "Implement pending [ ] todos that have specs AND existing red tests. Make tests pass. Follow technologies.md and specs. Do not delete or weaken tests. Do not mark todos [x] — QA verify does that after green.",
         ["src/**", "package.json"]
+      )
+    );
+    stages.push(
+      stage(
+        "delivery-critic",
+        "softwareEngineer",
+        "Delivery critic — spot-check",
+        "After SE green and BEFORE QA verify: spot-check completed specs vs Files to touch on disk and use-case coverage. Reopen incomplete slugs (do not mark [x]). Do not rewrite or weaken red tests.",
+        [".docs/todo.md", "src/**"]
+      )
+    );
+  }
+
+  if (testsOnly) {
+    stages.push(
+      stage(
+        "qa-tdd-red",
+        "qaEngineer",
+        "QA — TDD red (tests only)",
+        "Write failing tests for the focused slug/requirement only. No product implementation.",
+        ["**/*.{test,spec}.*", "tests/**"]
       )
     );
   }
@@ -262,10 +401,10 @@ export function buildCursorDelegationPlaybook(opts: {
   if (needsQa && !docsOnly) {
     stages.push(
       stage(
-        "qa-tests",
+        "qa-tdd-verify",
         "qaEngineer",
-        "QA Engineer — tests",
-        "Add/fix unit and integration tests for implemented features. Do not change production behavior except minor testability hooks if required.",
+        "QA — TDD verify",
+        "Run the suite; add only gap/regression tests. Confirm ACs of [x]-candidate specs are covered (incl. screen-flow/overlays when the spec requires it). Do not re-implement the product. Mark done only when tests pass.",
         ["**/*.{test,spec}.*", "tests/**"]
       )
     );
@@ -425,12 +564,31 @@ const maxTokensSchema = z
 export const zteamConfigFileSchema = z
   .object({
     version: z.number().int().positive().default(1),
+    /** webgame | crud | webapp | mobile | cli-dos | backend | frontend | fullstack | library | desktop | other */
+    projectType: z.string().min(1).optional(),
     models: modelsSchema.optional(),
     maxTokens: maxTokensSchema.optional(),
     createdAt: z.string().optional(),
     updatedAt: z.string().optional(),
   })
   .passthrough();
+
+export const PROJECT_TYPES_NEEDING_UI_FLOW = new Set([
+  "webgame",
+  "webapp",
+  "mobile",
+  "frontend",
+  "fullstack",
+  "desktop",
+  "crud",
+]);
+
+export function needsUiFlow(projectType?: string | null): boolean {
+  const t = (projectType || "").trim().toLowerCase();
+  if (!t) return true; // unknown → prefer UI rigor
+  if (t === "backend" || t === "library" || t === "cli-dos") return false;
+  return PROJECT_TYPES_NEEDING_UI_FLOW.has(t) || t === "other";
+}
 
 export type ZteamConfigFile = z.infer<typeof zteamConfigFileSchema>;
 
@@ -566,8 +724,9 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 | **\`@zteam/config\`** | Setup completo: \`.zteam/config.json\` (modelos, maxTokens, escopo workspace/app, gitignore). | \`get_zteam_config\` → perguntas → \`write_zteam_config\` |
 | **\`@zteam/models\`** | Só LLMs por papel — perguntas guiadas → atualiza \`models\` em \`.zteam/config.json\` neste projeto. | \`get_zteam_config\` → \`modelQuestions\` → \`write_zteam_config\` |
 | **\`@zteam/documentation\`** | Só documentação / arquitetura (requirements, technologies, todo, specs). Sem SE/QA. | \`run_development_pipeline\` com \`workflow: "docs"\` |
-| **\`@zteam/tests\`** | Analisa o app/specs e cria ou reforça testes (QA + fix loop se falhar). | \`run_development_pipeline\` com foco em testes (\`workflow: "fix"\` ou \`"feature"\` / \`"resume"\` conforme o estado) |
-| **\`@zteam\`** / **\`/zteam\`** | Pipeline completo ou o workflow que pedires (full, feature, punch, resume, …). | \`run_development_pipeline\` (ou Task playbook se runtime=cursor) |
+| **\`@zteam/tests\`** | Só testes (TDD red → verify) para um requisito. | \`run_development_pipeline\` com \`workflow: "tests"\` + \`slug\` |
+| **\`@zteam\`** / **\`/zteam\`** | Pipeline completo ou o workflow que pedires (\`full\` \\| \`docs\` \\| \`feature\` \\| \`punch\` \\| \`fix\` \\| \`resume\` \\| \`tests\` \\| \`analyze\`). | \`run_development_pipeline\` (ou Task playbook se runtime=cursor) |
+| **\`ensure_zteam_setup\`** | Stubs skill + \`.docs\` (+ template config opcional), sem LLM. | MCP \`ensure_zteam_setup\` |
 
 ### Exemplos
 
@@ -607,6 +766,8 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
     "systemArchitectFallback": "9RSA-system-architect",
     "technologyArchitect": "9RTA-technology-architect-free",
     "technologyArchitectFallback": "",
+    "uiUxDesigner": "9RUX-ui-ux-designer-free",
+    "uiUxDesignerFallback": "",
     "softwareEngineer": "9RSE-software-engineer-free",
     "softwareEngineerFallback": "9RSE-software-engineer",
     "qaEngineer": "9RQA-qa-free",
@@ -616,6 +777,7 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
   "maxTokens": {
     "systemArchitect": 1600,
     "technologyArchitect": 2500,
+    "uiUxDesigner": 2000,
     "softwareEngineer": 8000,
     "qaEngineer": 2000
   }
@@ -632,6 +794,8 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
     "systemArchitectFallback": "",
     "technologyArchitect": "inherit",
     "technologyArchitectFallback": "",
+    "uiUxDesigner": "inherit",
+    "uiUxDesignerFallback": "",
     "softwareEngineer": "inherit",
     "softwareEngineerFallback": "",
     "qaEngineer": "inherit",
@@ -767,6 +931,116 @@ export async function ensureZteamBootstrapRoots(
   return { workspace, app };
 }
 
+const DOCS_STUB_DIRS = [".docs", ".docs/specs", ".docs/reviews"] as const;
+
+/** Create `.docs/` tree stubs only — never writes product code. */
+export async function ensureDocsDirs(appRoot: string): Promise<{
+  created: string[];
+  existed: string[];
+}> {
+  const root = resolve(appRoot);
+  const created: string[] = [];
+  const existed: string[] = [];
+  for (const rel of DOCS_STUB_DIRS) {
+    const abs = join(root, rel);
+    if (await pathExists(abs)) {
+      existed.push(rel);
+    } else {
+      await mkdir(abs, { recursive: true });
+      created.push(rel);
+    }
+  }
+  return { created, existed };
+}
+
+export type EnsureZteamSetupOpts = {
+  workspaceRoot: string;
+  appRoot: string;
+  skill?: boolean;
+  docsDirs?: boolean;
+  /** Write official config template if no config exists yet */
+  configTemplate?: boolean;
+  /** cursor | ninerouter template family */
+  configFamily?: "cursor" | "ninerouter";
+};
+
+/**
+ * Isolated setup capability (no LLM, no pipeline): skill, .docs dirs, optional config template.
+ * Allowlist: `.zteam/**`, `.docs/**` stubs — never `src/**`.
+ */
+export async function ensureZteamSetup(opts: EnsureZteamSetupOpts): Promise<{
+  ok: true;
+  capability: "setup";
+  pathsTouched: string[];
+  skill: Awaited<ReturnType<typeof ensureZteamBootstrapRoots>> | null;
+  docs: Awaited<ReturnType<typeof ensureDocsDirs>> | null;
+  config: { path: string; written: boolean } | null;
+  nextHint: string;
+}> {
+  const pathsTouched: string[] = [];
+  const doSkill = opts.skill !== false;
+  const doDocs = opts.docsDirs !== false;
+  const doConfig = opts.configTemplate === true;
+
+  let skillResult: Awaited<ReturnType<typeof ensureZteamBootstrapRoots>> | null =
+    null;
+  if (doSkill) {
+    skillResult = await ensureZteamBootstrapRoots(
+      opts.workspaceRoot,
+      opts.appRoot
+    );
+    pathsTouched.push(
+      skillResult.workspace.dir,
+      skillResult.workspace.skill.path,
+      skillResult.workspace.readme.path
+    );
+    if (skillResult.app) {
+      pathsTouched.push(
+        skillResult.app.dir,
+        skillResult.app.skill.path,
+        skillResult.app.readme.path
+      );
+    }
+  }
+
+  let docsResult: Awaited<ReturnType<typeof ensureDocsDirs>> | null = null;
+  if (doDocs) {
+    docsResult = await ensureDocsDirs(opts.appRoot);
+    pathsTouched.push(...docsResult.created.map((d) => join(opts.appRoot, d)));
+  }
+
+  let configResult: { path: string; written: boolean } | null = null;
+  if (doConfig) {
+    const cfg = await loadTeamConfig(opts.workspaceRoot, opts.appRoot);
+    const target =
+      resolve(opts.appRoot) !== resolve(opts.workspaceRoot)
+        ? opts.appRoot
+        : opts.workspaceRoot;
+    const abs = join(resolve(target), ".zteam", "config.json");
+    if (hasAnyTeamConfig(cfg)) {
+      configResult = { path: abs, written: false };
+    } else {
+      const family = opts.configFamily ?? "ninerouter";
+      const { path } = await writeTeamConfig(target, {
+        models: officialConfigModelsTemplate(family),
+      });
+      configResult = { path, written: true };
+      pathsTouched.push(path);
+    }
+  }
+
+  return {
+    ok: true,
+    capability: "setup",
+    pathsTouched: [...new Set(pathsTouched)],
+    skill: skillResult,
+    docs: docsResult,
+    config: configResult,
+    nextHint:
+      "Setup done. Use get_zteam_config / write_zteam_config for models, then run_development_pipeline when ready.",
+  };
+}
+
 const MCP_JSON_HINT =
   "MCP requires workspaceRoot arg (absolute Cursor open folder); remove sticky WORKSPACE_ROOT from ~/.cursor/mcp.json and restart MCP";
 
@@ -888,41 +1162,49 @@ function mergeLayer(
   layer: ZteamConfigFile | null
 ): Omit<ResolvedTeamConfig, "sources" | "exists"> {
   if (!layer) return base;
+  const lm = layer.models;
   return {
     models: {
       systemArchitect:
-        layer.models?.systemArchitect?.trim() || base.models.systemArchitect,
+        lm?.systemArchitect?.trim() ||
+        inferMissingPrimaryFromPeers(lm, "systemArchitect") ||
+        base.models.systemArchitect,
       technologyArchitect:
-        layer.models?.technologyArchitect?.trim() ||
+        lm?.technologyArchitect?.trim() ||
+        inferMissingPrimaryFromPeers(lm, "technologyArchitect") ||
         base.models.technologyArchitect,
       uiUxDesigner:
-        layer.models?.uiUxDesigner?.trim() || base.models.uiUxDesigner,
+        lm?.uiUxDesigner?.trim() ||
+        inferMissingPrimaryFromPeers(lm, "uiUxDesigner") ||
+        base.models.uiUxDesigner,
       softwareEngineer:
-        layer.models?.softwareEngineer?.trim() || base.models.softwareEngineer,
-      qaEngineer: layer.models?.qaEngineer?.trim() || base.models.qaEngineer,
-      fallback:
-        layer.models?.fallback !== undefined
-          ? String(layer.models.fallback).trim()
-          : base.models.fallback,
+        lm?.softwareEngineer?.trim() ||
+        inferMissingPrimaryFromPeers(lm, "softwareEngineer") ||
+        base.models.softwareEngineer,
+      qaEngineer:
+        lm?.qaEngineer?.trim() ||
+        inferMissingPrimaryFromPeers(lm, "qaEngineer") ||
+        base.models.qaEngineer,
+      fallback: lm?.fallback !== undefined ? String(lm.fallback).trim() : base.models.fallback,
       systemArchitectFallback:
-        layer.models?.systemArchitectFallback !== undefined
-          ? String(layer.models.systemArchitectFallback).trim()
+        lm?.systemArchitectFallback !== undefined
+          ? String(lm.systemArchitectFallback).trim()
           : base.models.systemArchitectFallback,
       technologyArchitectFallback:
-        layer.models?.technologyArchitectFallback !== undefined
-          ? String(layer.models.technologyArchitectFallback).trim()
+        lm?.technologyArchitectFallback !== undefined
+          ? String(lm.technologyArchitectFallback).trim()
           : base.models.technologyArchitectFallback,
       uiUxDesignerFallback:
-        layer.models?.uiUxDesignerFallback !== undefined
-          ? String(layer.models.uiUxDesignerFallback).trim()
+        lm?.uiUxDesignerFallback !== undefined
+          ? String(lm.uiUxDesignerFallback).trim()
           : base.models.uiUxDesignerFallback,
       softwareEngineerFallback:
-        layer.models?.softwareEngineerFallback !== undefined
-          ? String(layer.models.softwareEngineerFallback).trim()
+        lm?.softwareEngineerFallback !== undefined
+          ? String(lm.softwareEngineerFallback).trim()
           : base.models.softwareEngineerFallback,
       qaEngineerFallback:
-        layer.models?.qaEngineerFallback !== undefined
-          ? String(layer.models.qaEngineerFallback).trim()
+        lm?.qaEngineerFallback !== undefined
+          ? String(lm.qaEngineerFallback).trim()
           : base.models.qaEngineerFallback,
     },
     maxTokens: {
@@ -1080,7 +1362,17 @@ export async function writeTeamConfig(
       systemArchitect: input.models.systemArchitect.trim(),
       technologyArchitect: input.models.technologyArchitect.trim(),
       uiUxDesigner: (
-        input.models.uiUxDesigner ?? DEFAULT_MODELS.uiUxDesigner
+        input.models.uiUxDesigner?.trim() ||
+        inferMissingPrimaryFromPeers(
+          {
+            systemArchitect: input.models.systemArchitect,
+            technologyArchitect: input.models.technologyArchitect,
+            softwareEngineer: input.models.softwareEngineer,
+            qaEngineer: input.models.qaEngineer,
+          },
+          "uiUxDesigner"
+        ) ||
+        DEFAULT_MODELS.uiUxDesigner
       ).trim(),
       softwareEngineer: input.models.softwareEngineer.trim(),
       qaEngineer: input.models.qaEngineer.trim(),

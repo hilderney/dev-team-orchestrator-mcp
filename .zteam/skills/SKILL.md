@@ -18,10 +18,37 @@ When the user invokes a **subcommand**, follow that path **before** a generic fu
 | Trigger | Action |
 |---------|--------|
 | **`@zteam/config`** / `/zteam config` | Full setup — `.zteam/config.json` (models, maxTokens, scope, gitignore). Do **not** start the pipeline unless the user also asked to run it. |
-| **`@zteam/models`** / `/zteam models` | **LLMs only** — guided questions for SA/TA/SE/QA (+ fallback) → update `models` in this project's `.zteam/config.json`. |
+| **`@zteam/models`** / `/zteam models` | **LLMs only** — guided questions for SA/TA/**UX**/SE/QA (+ fallback) → update `models` in this project's `.zteam/config.json`. |
 | **`@zteam/documentation`** / `/zteam documentation` / `/zteam docs` | Docs-only — `workflow: "docs"`. |
-| **`@zteam/tests`** / `/zteam tests` | Analyze app/specs and create or strengthen tests via MCP (QA-focused). |
+| **`@zteam/tests`** / `/zteam tests` | TDD tests only — `workflow: "tests"` + `slug` (QA-red → QA-verify). |
 | **`@zteam`** / `/zteam` (no subcommand) | Normal pipeline; pick workflow from the table below. |
+
+## MCP tools (must match GetDynamicTools after MCP restart)
+
+| Tool | Purpose |
+|------|---------|
+| `get_zteam_config` | Read merged config, `needsConfig`, `llmRuntime`, suggestions |
+| `write_zteam_config` | Write `.zteam/config.json` (always include **uiUxDesigner**) |
+| `ensure_zteam_setup` | Skill + `.docs` stubs + optional config template (no LLM) — if present |
+| `run_development_pipeline` | Pipeline / playbook (`workspaceRoot` **required**, `workflow` optional) |
+| `get_pipeline_state` | Debug / resume state |
+| `approve_gate` | HITL when `ZTEAM_HITL=1` |
+
+If GetDynamicTools shows only an old `run_development_pipeline` schema (no `workspaceRoot`), **restart the zteam MCP server** so Cursor reloads `src/orchestrator.ts`.
+
+## Capability matrix (isolated vs pipeline)
+
+| Need | Tool / workflow | Writes |
+|------|-----------------|--------|
+| Só skill + `.docs` stubs (+ optional config template) | `ensure_zteam_setup` | `.zteam/**`, `.docs/**` — never `src/**` |
+| Só models / config | `get_zteam_config` → `write_zteam_config` | `.zteam/config.json` (+ optional `projectType`) |
+| Só docs/specs | `workflow: "docs"` | `.docs/**` |
+| Uma feature (1 slug) | `workflow: "feature"` + `slug` | that slug only |
+| Só testes de um requisito | `workflow: "tests"` + `slug` | `*.{test,spec}.*` |
+| Análise (time ou 1 papel) | `workflow: "analyze"` + `scope` + optional `role` | `.docs/reviews/**` |
+| Pipeline completo | `workflow: "full"` / omit | app + docs |
+
+**Role skills** (`.zteam/skills/roles/`): pick by `(role, phase, projectType)` — e.g. `qa-tdd-red-screenflow` + `se-implement-tdd-green` + `qa-tdd-verify-screenflow` for webgame; `qa-tdd-red-api-contract` when `needsUiFlow=false`. **Hosts:** `.zteam/skills/hosts/{copilot,opencode}.md`.
 
 ## Dual runtime (config is absolute truth)
 
@@ -59,7 +86,8 @@ Help the user choose models for **this** project (Cursor aliases **or** 9router 
 2. projectRoot = user app folder if given (else ".")
 3. get_zteam_config({ workspaceRoot, projectRoot })
 4. Show current models + llmRuntime + cursorAliases + modelSuggestions + suggestedDefaults
-5. Ask modelQuestions: for EACH role (SA/TA/SE/QA) pick primary AND fallback
+5. Ask modelQuestions: for EACH role (SA/TA/**uiUxDesigner**/SE/QA) pick primary AND fallback
+   - Always set **uiUxDesigner** (same family as the others — never omit)
    - fallback only meaningful for ninerouter; empty ok for cursor
 6. Prefer scope:
    - projectRoot != "." → "app" (write {appRoot}/.zteam/config.json)
@@ -87,9 +115,14 @@ Help the user choose models for **this** project (Cursor aliases **or** 9router 
 1. get_zteam_config({ workspaceRoot, projectRoot })
 2. If needsConfig → STOP; @zteam/models or @zteam/config first
 3. If runtimeError / mixed → fix config
-4. run_development_pipeline({ workspaceRoot, projectRoot, userIdea, workflow })
-5. If llmRuntime=cursor → execute delegationPlaybook via Task (see above)
-6. If ninerouter → trust MCP result; report failureKind / resumeHint / filesWritten
+4. Pick workflow:
+   - @zteam/documentation → workflow: "docs"
+   - @zteam/tests → workflow: "tests" + slug (required when one requirement)
+   - plain → table below (feature+slug / analyze+scope / …)
+5. run_development_pipeline({ workspaceRoot, projectRoot, userIdea, workflow, slug?, role?, scope? })
+6. If llmRuntime=cursor → execute delegationPlaybook via Task in order
+   (QA-red → SE green → delivery critic → QA-verify; mark [x] only on verify)
+7. If ninerouter → trust MCP result; report failureKind / resumeHint / filesWritten
 ```
 
 ## Shared instructions (all commands)
@@ -97,7 +130,7 @@ Help the user choose models for **this** project (Cursor aliases **or** 9router 
 1. Call MCP tools on **`user-zteam`** (may also appear as `zteam`).
 2. **Always** pass **`workspaceRoot`** = absolute path of the **Cursor-open folder** (MCP required; fails with `needs_workspace_root` if omitted — never uses sticky `WORKSPACE_ROOT` from mcp.json).
 3. Always set **`projectRoot`** when the app is not the workspace root.
-4. Put hard constraints in **`userIdea`**.
+4. Put hard constraints in **`userIdea`**. Optional `projectType` in config when known (webgame / webapp / crud / api).
 5. **Before any pipeline**: always `get_zteam_config` first until `needsConfig === false`.
 
 ### Config gate
@@ -118,7 +151,10 @@ Help the user choose models for **this** project (Cursor aliases **or** 9router 
 | `workspaceRoot` | **yes** (MCP + skill) | Absolute Cursor open folder; omit → `needs_workspace_root` |
 | `userIdea` | yes (pipeline) | Idea **plus** non-negotiable constraints |
 | `projectRoot` | strongly yes | Relative under `workspaceRoot` |
-| `workflow` | no | `full` \| `docs` \| `feature` \| `punch` \| `fix` \| `resume` |
+| `workflow` | no | `full` \| `docs` \| `feature` \| `punch` \| `fix` \| `resume` \| `tests` \| `analyze` |
+| `slug` | feature/tests | Focus one todo/spec slug |
+| `role` | analyze | Single team role |
+| `scope` | analyze | Review file key / path label |
 
 ### Which workflow?
 
@@ -126,9 +162,11 @@ Help the user choose models for **this** project (Cursor aliases **or** 9router 
 |-----------|----------|
 | New app, sensitive / large idea | **`docs` first** → then **`feature`** or **`full`** |
 | New app, small / trusted | `full` (or omit) |
-| Docs already good, new capability | `feature` |
+| Docs already good, new capability | `feature` (+ optional `slug`) |
 | Tiny UI/copy tweak | `punch` |
-| Bug / failing tests / add tests | `fix` |
+| Bug / failing suite | `fix` |
+| Add/strengthen tests for one requirement | **`tests` + `slug`** |
+| Read-only team/role review | **`analyze` + `scope`** (+ optional `role`) |
 | Mid-failure, todos still `[ ]` | **`resume`** |
 
 ### Rescue

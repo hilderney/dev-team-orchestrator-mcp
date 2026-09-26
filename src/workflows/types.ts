@@ -6,6 +6,8 @@ export const WORKFLOW_IDS = [
   "punch",
   "fix",
   "resume",
+  "tests",
+  "analyze",
 ] as const;
 
 export type WorkflowId = (typeof WORKFLOW_IDS)[number];
@@ -18,7 +20,9 @@ export type WorkflowMeta = {
     | "systemArchitectTodoPlan"
     | "punchPrepare"
     | "fixPrepare"
-    | "resumePrepare";
+    | "resumePrepare"
+    | "qaTddRed"
+    | "analyzePrepare";
   summary: string;
   route: string;
 };
@@ -29,7 +33,7 @@ export const WORKFLOW_CATALOG: Record<WorkflowId, WorkflowMeta> = {
     entry: "orchestratorBootstrapReadme",
     summary: "Greenfield / projeto novo",
     route:
-      "bootstrap → SA pré-reqs* → juice → fidelity → TA → UI/UX look-and-feel → SA todo plan → (SA→UX→TA spec)* → arch critic → scaffold → SE* → QA* → SA summary → optional tech-debt plan → finalize",
+      "bootstrap → SA pré-reqs* → juice → fidelity → TA → UI/UX look-and-feel → SA todo plan → (SA→UX→TA spec)* → arch critic → scaffold → QA-red* → SE* → delivery critic → QA-verify* → SA summary → optional tech-debt plan → finalize",
   },
   docs: {
     id: "docs",
@@ -41,30 +45,43 @@ export const WORKFLOW_CATALOG: Record<WorkflowId, WorkflowMeta> = {
   feature: {
     id: "feature",
     entry: "systemArchitectTodoPlan",
-    summary: "Feature em app com docs existentes",
+    summary: "Feature em app com docs existentes (opcional: 1 slug)",
     route:
-      "SA todo plan → (SA→UX→TA spec)* → arch critic → scaffold → SE* → QA* → SA summary → optional tech-debt plan → finalize",
+      "SA todo plan → (SA→UX→TA spec)* → arch critic → scaffold → QA-red* → SE* → delivery critic → QA-verify* → SA summary → optional tech-debt plan → finalize",
   },
   punch: {
     id: "punch",
     entry: "punchPrepare",
     summary: "Mudança pontual (cor, copy, tweak)",
     route:
-      "punch prepare → SE → QA → SA summary → optional tech-debt plan → finalize",
+      "punch prepare → QA-red → SE → delivery critic → QA-verify → SA summary → optional tech-debt plan → finalize",
   },
   fix: {
     id: "fix",
     entry: "fixPrepare",
     summary: "Bug / teste falhando",
     route:
-      "fix prepare → SE fix → QA → SA summary → optional tech-debt plan → finalize",
+      "fix prepare → SE fix → QA-verify → SA summary → optional tech-debt plan → finalize",
   },
   resume: {
     id: "resume",
     entry: "resumePrepare",
     summary: "Retomar todos [ ] com spec existente",
     route:
-      "resume prepare → scaffold → SE* → QA* → SA summary → optional tech-debt plan → finalize",
+      "resume prepare → scaffold → QA-red* → SE* → delivery critic → QA-verify* → SA summary → optional tech-debt plan → finalize",
+  },
+  tests: {
+    id: "tests",
+    entry: "qaTddRed",
+    summary: "Só testes (TDD red + verify) para um slug/requisito",
+    route:
+      "QA-red* → QA-verify* → SA summary → optional tech-debt plan → finalize",
+  },
+  analyze: {
+    id: "analyze",
+    entry: "analyzePrepare",
+    summary: "Análise read-mostly (time ou um papel)",
+    route: "analyze prepare → analyze role(s) → finalize",
   },
 };
 

@@ -1,5 +1,5 @@
 ---
-description: zteam — run MCP LangGraph team (9router) via run_development_pipeline
+description: zteam — run MCP LangGraph team (dual runtime) via run_development_pipeline
 alwaysApply: false
 ---
 
@@ -14,13 +14,13 @@ When this rule is attached (`@zteam`) or the user says **zteam** / **/zteam** / 
 | **`@zteam/config`** | Full setup: `get_zteam_config` → questions → `write_zteam_config`. See `.zteam/README.MD`. |
 | **`@zteam/models`** | LLMs only: `get_zteam_config` → `modelQuestions` → `write_zteam_config` (update models in this project's `.zteam/config.json`). |
 | **`@zteam/documentation`** | Config gate first, then `run_development_pipeline` with `workflow: "docs"`. |
-| **`@zteam/tests`** | Config gate first, then QA-focused pipeline (`fix` / `feature` / `resume`). |
-| **`@zteam`** (plain) | Config gate first, then full/auto pipeline. |
+| **`@zteam/tests`** | Config gate first, then `run_development_pipeline` with `workflow: "tests"` + `slug` (focused requirement). |
+| **`@zteam`** (plain) | Config gate first, then full/auto pipeline (or `feature`/`analyze`/`punch`/… as asked). |
 
 ## Always
 
-1. Call MCP on **`user-zteam`** (not Cursor Task subagents).
+1. Call MCP on **`user-zteam`**. If `llmRuntime=ninerouter`, do not rewrite with Cursor Task. If `llmRuntime=cursor`, run `delegationPlaybook` stages via Task in order.
 2. Pass **`workspaceRoot`** = absolute Cursor-open folder (required; MCP never uses sticky `mcp.json` `WORKSPACE_ROOT`).
-3. Pass rich `userIdea` + **`projectRoot`** (prefer `samples/…`).
-4. **Before any `run_development_pipeline`:** call **`get_zteam_config`**. If `needsConfig === true`, do **not** start the pipeline — run `@zteam/models` or `@zteam/config` (`write_zteam_config`) first, then re-check. Exceptions: `@zteam/config` / `@zteam/models` (they are the setup).
+3. Pass rich `userIdea` + **`projectRoot`** (prefer `samples/…`). Optional: `slug`, `role`, `scope`.
+4. **Before any `run_development_pipeline`:** call **`get_zteam_config`**. If `needsConfig === true`, do **not** start the pipeline — run `@zteam/models` or `@zteam/config` (`write_zteam_config`) first, then re-check. Exceptions: `@zteam/config` / `@zteam/models` (they are the setup). Prefer `ensure_zteam_setup` when only stubs/skill are needed.
 5. Report `workspaceRoot`, `appRoot`, `filesWritten`, `failureKind`, `resumeHint`; never silently copy sibling projects.

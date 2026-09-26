@@ -15,7 +15,7 @@ async function pathExists(abs: string): Promise<boolean> {
 }
 
 const WORKFLOW_TAG_RE =
-  /\[workflow:\s*(full|docs|feature|punch|fix|resume)\s*\]/i;
+  /\[workflow:\s*(full|docs|feature|punch|fix|resume|tests|analyze)\s*\]/i;
 
 /** Strip `[workflow:x]` tags from the user idea (kept for routing only). */
 export function stripWorkflowTag(userIdea: string): string {
@@ -87,6 +87,22 @@ export async function classifyWorkflow(opts: {
     )
   ) {
     return { workflow: "docs", reason: "pedido explícito de docs/planejamento" };
+  }
+
+  if (
+    /\b(s[oó]\s+testes?|apenas\s+testes?|tests?\s*-?\s*only|tdd\s+red|gerar\s+testes?)\b/i.test(
+      lower
+    )
+  ) {
+    return { workflow: "tests", reason: "pedido explícito de só testes" };
+  }
+
+  if (
+    /\b(analisa[rs]?|analyze|review\s+only|s[oó]\s+an[aá]lise|parecer)\b/i.test(
+      lower
+    )
+  ) {
+    return { workflow: "analyze", reason: "pedido explícito de análise" };
   }
 
   if (
