@@ -25,6 +25,7 @@ console.log(
       readme: result.readme,
       skill: result.skill,
       langgraph: result.langgraph,
+      dashboard: result.dashboard,
       skillSource: ZTEAM_SKILL_SOURCE,
     },
     null,

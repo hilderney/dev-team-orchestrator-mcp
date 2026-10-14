@@ -7,6 +7,7 @@
 Define the leanest stack for high-performance webgame loops and safe chrome.
 
 ## Must deliver
+- **9-Layer Matrix profile (`webgame`)**: `adopt` Layers **1** (Clients/Canvas/DOM) & **8** (Vitest + static build); default `none` for Layers **2, 3, 4, 6, 7** (unless multiplayer/backend/AI explicitly requested in `userIdea`); Layer **5** = in-memory / `localStorage`; Layer **9** = minimal console/env
 - Game loop strategy (rAF vs fixed timestep)
 - State management (single source of truth vs scattered)
 - Rendering choice (Canvas/WebGL vs DOM for overlays)

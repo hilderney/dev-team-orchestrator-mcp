@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>zTeam Live Orchestrator — 9Router Canvas View</title>
+<style>
+  :root {
+    --bg: #0b0c10;
+    --panel: #12141c;
+    --panel-border: #212534;
+    --text: #e6e9f2;
+    --muted: #7e869c;
+    --accent: #f97316;
+    --green: #22c55e;
+    --blue: #38bdf8;
+    --red: #ef4444;
+    --amber: #f59e0b;
+    --purple: #a855f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--panel-border);
+    background: #0e1017;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .brand-badge {
+    background: rgba(249, 115, 22, 0.15);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-weight: 700;
+    padding: 4px 10px;
+    border-radius: 8px;
+    font-size: 13px;
+    letter-spacing: 0.4px;
+  }
+  .brand-title {
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .brand-sub {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .pill {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    color: var(--muted);
+    padding: 5px 11px;
+    border-radius: 8px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .pill:hover, .pill.active {
+    color: var(--text);
+    border-color: var(--accent);
+  }
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    display: inline-block;
+    margin-right: 6px;
+    box-shadow: 0 0 8px var(--green);
+  }
+  .kpis {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+    padding: 14px 20px;
+  }
+  .kpi-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+  .kpi-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .kpi-val {
+    font-size: 24px;
+    font-weight: 700;
+  }
+  .kpi-sub {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .val-orange { color: #fb923c; }
+  .val-blue { color: var(--blue); }
+  .val-green { color: var(--green); }
+  .val-amber { color: var(--amber); }
+
+  .workspace {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 410px;
+    gap: 14px;
+    padding: 0 20px 18px 20px;
+    min-height: 0;
+  }
+  .canvas-card {
+    position: relative;
+    background: radial-gradient(circle at center, #141824 0%, #0d0f16 100%);
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: grab;
+  }
+  canvas:active { cursor: grabbing; }
+  .canvas-hud {
+    position: absolute;
+    left: 14px;
+    bottom: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .hud-btn {
+    width: 30px;
+    height: 30px;
+    background: rgba(18, 20, 28, 0.9);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 15px;
+  }
+  .hud-btn:hover { border-color: var(--accent); }
+  .canvas-legend {
+    position: absolute;
+    top: 12px;
+    left: 14px;
+    display: flex;
+    gap: 12px;
+    background: rgba(14, 16, 23, 0.82);
+    border: 1px solid var(--panel-border);
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .leg-dot {
+    width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px;
+  }
+
+  .log-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .log-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--panel-border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--muted);
+  }
+  .log-cols {
+    display: grid;
+    grid-template-columns: 1fr 105px 52px;
+    padding: 8px 16px;
+    border-bottom: 1px solid #1a1e2b;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .log-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+  .log-row {
+    display: grid;
+    grid-template-columns: 1fr 105px 52px;
+    align-items: center;
+    padding: 8px 16px;
+    border-bottom: 1px solid rgba(33, 37, 52, 0.45);
+    font-size: 12px;
+    gap: 6px;
+  }
+  .log-row:hover {
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .log-stage {
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .log-msg {
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 2px;
+  }
+  .log-io {
+    font-family: monospace;
+    font-size: 11px;
+    text-align: right;
+  }
+  .io-in { color: #fb923c; }
+  .io-out { color: var(--green); }
+  .log-when {
+    font-size: 11px;
+    color: var(--muted);
+    text-align: right;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="brand-badge">9R · zTeam</span>
+      <div>
+        <div class="brand-title" id="projTitle">zTeam Live Orchestrator</div>
+        <div class="brand-sub" id="projMeta">workflow: full · projectType: core</div>
+      </div>
+    </div>
+    <div class="controls">
+      <button class="pill" id="btnSimulate" title="Fire a demo pulse across all agents">⚡ Simulate Pulse</button>
+      <span class="pill active"><span class="status-dot" id="liveDot"></span><span id="liveStatus">Polling .docs/zteam-live.js</span></span>
+    </div>
+  </header>
+
+  <section class="kpis">
+    <div class="kpi-card">
+      <div class="kpi-label">Total Events</div>
+      <div class="kpi-val" id="kpiEvents">0</div>
+      <div class="kpi-sub" id="kpiActiveStage">Stage: idle</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Payload Chars In</div>
+      <div class="kpi-val val-orange" id="kpiCharsIn">0</div>
+      <div class="kpi-sub">Prompt context sent</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Specs Progress</div>
+      <div class="kpi-val val-blue" id="kpiSpecs">0 / 0</div>
+      <div class="kpi-sub" id="kpiFiles">0 files touched</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Output Chars</div>
+      <div class="kpi-val val-green" id="kpiCharsOut">0</div>
+      <div class="kpi-sub">Agent generations</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Retries / Fixes</div>
+      <div class="kpi-val val-amber" id="kpiRetries">0</div>
+      <div class="kpi-sub">Self-heal &amp; TDD loops</div>
+    </div>
+  </section>
+
+  <main class="workspace">
+    <div class="canvas-card">
+      <div class="canvas-legend">
+        <span><i class="leg-dot" style="background:#f97316"></i>Orchestrator Hub</span>
+        <span><i class="leg-dot" style="background:#38bdf8"></i>Active Call</span>
+        <span><i class="leg-dot" style="background:#22c55e"></i>Done</span>
+        <span><i class="leg-dot" style="background:#ef4444"></i>Error / Fix</span>
+      </div>
+      <canvas id="graphCanvas"></canvas>
+      <div class="canvas-hud">
+        <button class="hud-btn" id="zoomIn">+</button>
+        <button class="hud-btn" id="zoomOut">−</button>
+        <button class="hud-btn" id="zoomReset">⟲</button>
+      </div>
+    </div>
+
+    <aside class="log-card">
+      <div class="log-header">
+        <span>Recent Agent Activity</span>
+        <span id="lastUpdateLabel">live</span>
+      </div>
+      <div class="log-cols">
+        <span>Stage / Subagent</span>
+        <span style="text-align:right">In / Out</span>
+        <span style="text-align:right">When</span>
+      </div>
+      <div class="log-list" id="logList"></div>
+    </aside>
+  </main>
+
+<script>
+(function() {
+  const canvas = document.getElementById("graphCanvas");
+  const ctx = canvas.getContext("2d");
+
+  let zoom = 1;
+  let panX = 0;
+  let panY = 0;
+  let isDragging = false;
+  let dragStartX = 0;
+  let dragStartY = 0;
+
+  // Radial positions around the center hub (normalized offsets)
+  const NODE_LAYOUT = {
+    orchestrator:        { rx: 0,     ry: 0,     color: "#f97316", icon: "9R" },
+    systemArchitect:     { rx: -0.34, ry: -0.28, color: "#38bdf8", icon: "SA" },
+    uiUxDesigner:        { rx: 0,     ry: -0.36, color: "#a855f7", icon: "UX" },
+    technologyArchitect: { rx: 0.34,  ry: -0.28, color: "#fb923c", icon: "TA" },
+    qaTddRed:            { rx: 0.36,  ry: 0.06,  color: "#f43f5e", icon: "RED" },
+    softwareEngineer:    { rx: 0.24,  ry: 0.34,  color: "#22c55e", icon: "SE" },
+    qaVerify:            { rx: -0.24, ry: 0.34,  color: "#10b981", icon: "QA" },
+    critics:             { rx: -0.36, ry: 0.06,  color: "#eab308", icon: "CRT" }
+  };
+
+  let state = {
+    projectTitle: "zTeam Live Orchestrator",
+    workflow: "full",
+    projectType: "core",
+    activeStage: "idle",
+    activeNode: "orchestrator",
+    seq: 0,
+    kpis: { totalEvents: 0, specsDone: 0, specsTotal: 0, charsIn: 0, charsOut: 0, filesWritten: 0, retriesAndFixes: 0 },
+    nodes: {
+      orchestrator: { id: "orchestrator", label: "zTeam Orchestrator", sublabel: "LangGraph / MCP Hub", status: "active", model: "router", calls: 0, lastMessage: "Waiting for pipeline..." },
+      systemArchitect: { id: "systemArchitect", label: "System Architect", sublabel: "Reqs · Todo · Specs", status: "idle", model: "SA", calls: 0, lastMessage: "" },
+      uiUxDesigner: { id: "uiUxDesigner", label: "UI/UX Designer", sublabel: "Juice · Flow & States", status: "idle", model: "UX", calls: 0, lastMessage: "" },
+      technologyArchitect: { id: "technologyArchitect", label: "Tech Architect", sublabel: "9-Layer Stack", status: "idle", model: "TA", calls: 0, lastMessage: "" },
+      qaTddRed: { id: "qaTddRed", label: "QA TDD Red", sublabel: "Failing Tests First", status: "idle", model: "QA", calls: 0, lastMessage: "" },
+      softwareEngineer: { id: "softwareEngineer", label: "Software Engineer", sublabel: "TDD Green · Code", status: "idle", model: "SE", calls: 0, lastMessage: "" },
+      qaVerify: { id: "qaVerify", label: "QA TDD Verify", sublabel: "Suite · Mark [x]", status: "idle", model: "QA", calls: 0, lastMessage: "" },
+      critics: { id: "critics", label: "Critics & Gates", sublabel: "Fidelity · Arch · DoD", status: "idle", model: "gate", calls: 0, lastMessage: "" }
+    },
+    events: []
+  };
+
+  let lastSeenSeq = 0;
+  const particles = [];
+
+  function spawnPulse(fromId, toId, color) {
+    if (!NODE_LAYOUT[fromId] || !NODE_LAYOUT[toId]) return;
+    for (let i = 0; i < 3; i++) {
+      particles.push({
+        from: fromId,
+        to: toId,
+        t: -i * 0.14,
+        speed: 0.012 + i * 0.002,
+        color: color || "#f97316"
+      });
+    }
+  }
+
+  function resize() {
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * window.devicePixelRatio;
+    canvas.height = rect.height * window.devicePixelRatio;
+    ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  canvas.addEventListener("mousedown", (e) => {
+    isDragging = true;
+    dragStartX = e.clientX - panX;
+    dragStartY = e.clientY - panY;
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!isDragging) return;
+    panX = e.clientX - dragStartX;
+    panY = e.clientY - dragStartY;
+  });
+  window.addEventListener("mouseup", () => { isDragging = false; });
+
+  document.getElementById("zoomIn").onclick = () => { zoom = Math.min(1.8, zoom + 0.15); };
+  document.getElementById("zoomOut").onclick = () => { zoom = Math.max(0.6, zoom - 0.15); };
+  document.getElementById("zoomReset").onclick = () => { zoom = 1; panX = 0; panY = 0; };
+
+  document.getElementById("btnSimulate").onclick = () => {
+    const order = ["systemArchitect", "uiUxDesigner", "technologyArchitect", "critics", "qaTddRed", "softwareEngineer", "qaVerify"];
+    order.forEach((id, idx) => {
+      setTimeout(() => {
+        state.activeNode = id;
+        state.activeStage = "sim:" + id;
+        state.nodes[id].status = "active";
+        state.nodes[id].calls = (state.nodes[id].calls || 0) + 1;
+        spawnPulse("orchestrator", id, NODE_LAYOUT[id].color);
+        setTimeout(() => {
+          spawnPulse(id, "orchestrator", "#22c55e");
+          state.nodes[id].status = "done";
+        }, 650);
+      }, idx * 450);
+    });
+  };
+
+  function getCoords(id, w, h) {
+    const lay = NODE_LAYOUT[id] || { rx: 0, ry: 0 };
+    const cx = w / 2 + panX;
+    const cy = h / 2 + panY;
+    const radiusX = Math.min(w, 900) * zoom;
+    const radiusY = Math.min(h, 620) * zoom;
+    return {
+      x: cx + lay.rx * radiusX,
+      y: cy + lay.ry * radiusY
+    };
+  }
+
+  function drawGrid(w, h) {
+    ctx.strokeStyle = "rgba(255,255,255,0.025)";
+    ctx.lineWidth = 1;
+    const step = 36 * zoom;
+    for (let x = (panX % step); x < w; x += step) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+    }
+    for (let y = (panY % step); y < h; y += step) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    }
+  }
+
+  function quadPoint(p0, p1, p2, t) {
+    const inv = 1 - t;
+    return {
+      x: inv * inv * p0.x + 2 * inv * t * p1.x + t * t * p2.x,
+      y: inv * inv * p0.y + 2 * inv * t * p1.y + t * t * p2.y
+    };
+  }
+
+  function draw() {
+    const rect = canvas.parentElement.getBoundingClientRect();
+    const w = rect.width;
+    const h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+    drawGrid(w, h);
+
+    const hub = getCoords("orchestrator", w, h);
+
+    // Keep continuous subtle pulse on activeNode
+    if (state.activeNode && state.activeNode !== "orchestrator" && Math.random() < 0.06) {
+      spawnPulse("orchestrator", state.activeNode, NODE_LAYOUT[state.activeNode]?.color);
+    }
+
+    // Draw curved edges from orchestrator to every role node
+    Object.keys(NODE_LAYOUT).forEach((id) => {
+      if (id === "orchestrator") return;
+      const target = getCoords(id, w, h);
+      const nodeState = state.nodes?.[id] || {};
+      const isActive = state.activeNode === id || nodeState.status === "active";
+      const isDone = nodeState.status === "done";
+      const ctrl = {
+        x: (hub.x + target.x) / 2,
+        y: (hub.y + target.y) / 2 - 28 * zoom
+      };
+
+      ctx.beginPath();
+      ctx.moveTo(hub.x, hub.y);
+      ctx.quadraticCurveTo(ctrl.x, ctrl.y, target.x, target.y);
+      ctx.lineWidth = isActive ? 2.4 : 1.3;
+      ctx.strokeStyle = isActive
+        ? NODE_LAYOUT[id].color
+        : isDone
+          ? "rgba(34, 197, 94, 0.38)"
+          : "rgba(126, 134, 156, 0.22)";
+      ctx.stroke();
+    });
+
+    // Update & draw moving particles along Bézier curves
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.t += p.speed;
+      if (p.t > 1) {
+        particles.splice(i, 1);
+        continue;
+      }
+      if (p.t < 0) continue;
+      const a = getCoords(p.from, w, h);
+      const b = getCoords(p.to, w, h);
+      const ctrl = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 28 * zoom };
+      const pt = quadPoint(a, ctrl, b, p.t);
+
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, 4.2 * zoom, 0, Math.PI * 2);
+      ctx.fillStyle = p.color;
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 12;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    // Draw nodes (9Router pill cards)
+    Object.keys(NODE_LAYOUT).forEach((id) => {
+      const pos = getCoords(id, w, h);
+      const lay = NODE_LAYOUT[id];
+      const n = state.nodes?.[id] || { label: id, sublabel: "", status: "idle", calls: 0 };
+      const isHub = id === "orchestrator";
+      const isActive = state.activeNode === id || n.status === "active";
+      const cardW = (isHub ? 190 : 176) * zoom;
+      const cardH = (isHub ? 58 : 54) * zoom;
+      const x = pos.x - cardW / 2;
+      const y = pos.y - cardH / 2;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(x, y, cardW, cardH, 10 * zoom);
+      ctx.fillStyle = isHub ? "#191516" : "#131621";
+      if (isActive) {
+        ctx.shadowColor = lay.color;
+        ctx.shadowBlur = 18;
+      }
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      ctx.lineWidth = isActive ? 2 : 1.2;
+      ctx.strokeStyle = isHub
+        ? "#f97316"
+        : n.status === "error"
+          ? "#ef4444"
+          : isActive
+            ? lay.color
+            : n.status === "done"
+              ? "rgba(34,197,94,0.65)"
+              : "#262b3d";
+      ctx.stroke();
+
+      // Icon badge
+      const badgeSize = 26 * zoom;
+      ctx.beginPath();
+      ctx.roundRect(x + 10 * zoom, pos.y - badgeSize / 2, badgeSize, badgeSize, 6 * zoom);
+      ctx.fillStyle = lay.color + "26";
+      ctx.fill();
+      ctx.fillStyle = lay.color;
+      ctx.font = "bold " + Math.round(10 * zoom) + "px Inter, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(lay.icon, x + 10 * zoom + badgeSize / 2, pos.y);
+
+      // Texts
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#e6e9f2";
+      ctx.font = "600 " + Math.round(12 * zoom) + "px Inter, sans-serif";
+      ctx.fillText(n.label || id, x + 44 * zoom, pos.y - 7 * zoom);
+
+      ctx.fillStyle = "#7e869c";
+      ctx.font = Math.round(10 * zoom) + "px Inter, sans-serif";
+      const sub = (n.model && n.model !== "SA" && n.model !== "TA" && n.model !== "UX" && n.model !== "SE" && n.model !== "QA")
+        ? n.model.slice(0, 22)
+        : (n.sublabel || "");
+      ctx.fillText(sub, x + 44 * zoom, pos.y + 9 * zoom);
+
+      // Call counter pill
+      if (n.calls > 0) {
+        ctx.fillStyle = lay.color;
+        ctx.font = "bold " + Math.round(10 * zoom) + "px monospace";
+        ctx.textAlign = "right";
+        ctx.fillText("×" + n.calls, x + cardW - 10 * zoom, y + 14 * zoom);
+      }
+      ctx.restore();
+    });
+
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+
+  function fmtNum(n) {
+    return Number(n || 0).toLocaleString();
+  }
+
+  function relTime(iso) {
+    if (!iso) return "now";
+    const diff = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+    if (diff < 60) return diff + "s ago";
+    if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+    return Math.floor(diff / 3600) + "h ago";
+  }
+
+  function applyIncomingState(next) {
+    if (!next || typeof next !== "object") return;
+    if (next.seq && next.seq > lastSeenSeq) {
+      const newEvents = (next.events || []).filter((e) => e.seq > lastSeenSeq).reverse();
+      newEvents.forEach((ev) => {
+        const col = ev.status === "error" ? "#ef4444" : ev.status === "done" ? "#22c55e" : (NODE_LAYOUT[ev.to]?.color || "#38bdf8");
+        spawnPulse(ev.from || "orchestrator", ev.to || "systemArchitect", col);
+      });
+      lastSeenSeq = next.seq;
+    }
+    state = next;
+
+    document.getElementById("projTitle").textContent = (state.projectTitle || "zTeam") + " — Live Orchestrator";
+    document.getElementById("projMeta").textContent =
+      "workflow: " + (state.workflow || "full") + " · projectType: " + (state.projectType || "core") + " · updated " + relTime(state.updatedAt);
+
+    const k = state.kpis || {};
+    document.getElementById("kpiEvents").textContent = fmtNum(k.totalEvents);
+    document.getElementById("kpiActiveStage").textContent = "Active: " + (state.activeStage || "idle");
+    document.getElementById("kpiCharsIn").textContent = fmtNum(k.charsIn);
+    document.getElementById("kpiSpecs").textContent = (k.specsDone || 0) + " / " + (k.specsTotal || 0);
+    document.getElementById("kpiFiles").textContent = fmtNum(k.filesWritten) + " files touched";
+    document.getElementById("kpiCharsOut").textContent = fmtNum(k.charsOut);
+    document.getElementById("kpiRetries").textContent = fmtNum(k.retriesAndFixes);
+
+    const listEl = document.getElementById("logList");
+    const evs = state.events || [];
+    listEl.innerHTML = evs.map((ev) => {
+      const dotColor = ev.status === "error" ? "#ef4444" : ev.status === "done" ? "#22c55e" : "#38bdf8";
+      const ioText = (ev.charsIn || ev.charsOut)
+        ? '<span class="io-in">' + fmtNum(ev.charsIn || 0) + '↑</span> <span class="io-out">' + fmtNum(ev.charsOut || 0) + '↓</span>'
+        : (ev.filesCount ? '<span class="io-out">' + ev.filesCount + ' files</span>' : '<span style="color:#7e869c">' + (ev.status || "info") + '</span>');
+      return '<div class="log-row">' +
+        '<div>' +
+          '<div class="log-stage"><span class="leg-dot" style="background:' + dotColor + '"></span>' + (ev.stage || "stage") + (ev.skillKey ? ' · ' + ev.skillKey : '') + '</div>' +
+          '<div class="log-msg">' + (ev.message || "").replace(/</g, "&lt;") + '</div>' +
+        '</div>' +
+        '<div class="log-io">' + ioText + '</div>' +
+        '<div class="log-when">' + relTime(ev.at) + '</div>' +
+      '</div>';
+    }).join("");
+  }
+
+  // Zero-server JSONP polling: reload ../../.docs/zteam-live.js every 1000ms
+  function pollLiveJs() {
+    const old = document.getElementById("__zteam_live_script");
+    if (old) old.remove();
+    const s = document.createElement("script");
+    s.id = "__zteam_live_script";
+    s.src = "../../.docs/zteam-live.js?t=" + Date.now();
+    s.onload = () => {
+      if (window.__ZTEAM_LIVE__) {
+        applyIncomingState(window.__ZTEAM_LIVE__);
+      }
+    };
+    document.body.appendChild(s);
+  }
+  pollLiveJs();
+  setInterval(pollLiveJs, 1000);
+})();
+</script>
+</body>
+</html>

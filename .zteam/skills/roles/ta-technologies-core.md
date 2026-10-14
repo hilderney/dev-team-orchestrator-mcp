@@ -7,9 +7,10 @@
 Establish shared tooling and quality standards across project types.
 
 ## Must deliver
-- Stack + folder layout + standards in `.docs/technologies.md`
+- Stack + folder layout + standards in `.docs/technologies.md` (11 fixed H2 headings)
+- **9-Layer System Design + AI Stack Matrix** (`adopt | defer | none` for: *1. Clients & Interfaces · 2. Edge, DNS & Traffic · 3. APIs & Service Layer · 4. Messaging & Workflows · 5. Data, Storage & Cache · 6. Search, Vector & Retrieval · 7. AI, RAG & Agents [product only] · 8. Eval, Compute & Deployment · 9. Security & Observability*) guided by `projectType` defaults
 - Test runner / CI expectation (lint → test → build)
-- Dependency policy (YAGNI)
+- Dependency policy (YAGNI — only expand `adopt` layers in detail)
 - Env/config strategy
 
 ## Anti-patterns

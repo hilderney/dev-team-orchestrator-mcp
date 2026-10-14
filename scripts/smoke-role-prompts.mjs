@@ -41,6 +41,9 @@ import {
   parseTechDebtReviewResponse,
   validateTechDebtReviewSelfCheck,
   buildUserReportMarkdown,
+  validateTechDocumentStructure,
+  TA_REQUIRED_H2_HEADINGS,
+  TA_NINE_LAYERS,
 } from "../src/role-prompts.ts";
 
 assert.match(ROLE_PERSONAS.systemArchitect, /Systems Architect/i);
@@ -58,6 +61,46 @@ assert.match(technologyArchitectPrompt(), /owner_can_follow/);
 assert.match(technologyArchitectPrompt(), /## Hosting \/ publish target/);
 assert.match(technologyArchitectPrompt(), /## Data persistence/);
 assert.match(technologyArchitectPrompt(), /## Scalability & growth/);
+assert.match(technologyArchitectPrompt(), /9-Layer System Design \+ AI Stack Matrix/);
+assert.equal(TA_REQUIRED_H2_HEADINGS.length, 11);
+assert.equal(TA_NINE_LAYERS.length, 9);
+{
+  const goodTech = `
+## Technology decisions
+| Layer | Status | Choice | Trigger / Notes |
+|---|---|---|---|
+| 1. Clients & Interfaces | adopt | React | SPA |
+| 9. Security & Observability | adopt | env | Local |
+## Folder architecture
+- src/
+## Stacks
+- Vite
+## Hosting / publish target
+Local
+## Data persistence
+localStorage
+## Scalability & growth
+Stateless
+## Cost-benefit & services
+Free
+## Specialized services
+none
+## Schemas / API exposure
+none
+## Security
+env
+## Development standards
+Clean code
+`;
+  const vOk = validateTechDocumentStructure(goodTech);
+  assert.equal(vOk.ok, true, vOk.message);
+  assert.equal(vOk.hasNineLayerMatrix, true);
+
+  const badTech = `## Technology decisions\nOnly one heading`;
+  const vBad = validateTechDocumentStructure(badTech);
+  assert.equal(vBad.ok, false);
+  assert.ok(vBad.missingHeadings.includes("Folder architecture"));
+}
 assert.match(ROLE_PERSONAS.uiUxDesigner, /juice/i);
 assert.match(uiUxRequirementsPrompt(), /SCORE_BEFORE/);
 assert.match(uiUxRequirementsPrompt(), /score_improved_to_at_least_7/);

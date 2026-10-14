@@ -514,6 +514,115 @@ export function findArchitectureCoverageGaps(
     }
   }
 
+  // 9-Layer System Design + AI Stack heuristics (forward: userIdea -> tech + specs)
+  const layerSignals: Array<{
+    layer: string;
+    ideaRe: RegExp;
+    techRe: RegExp;
+    slugHints: string[];
+  }> = [
+    {
+      layer: "Layer 4 (Messaging & Workflows)",
+      ideaRe:
+        /\b(kafka|rabbitmq|sqs|nats|pulsar|temporal|message\s+queue|background\s+job|webhook\s+worker)\b/i,
+      techRe:
+        /\b(kafka|rabbitmq|sqs|nats|pulsar|temporal|queue|worker|messaging|bullmq)\b/i,
+      slugHints: [
+        "queue",
+        "worker",
+        "job",
+        "messaging",
+        "webhook",
+        "workflow",
+        "event",
+        "temporal",
+        "kafka",
+      ],
+    },
+    {
+      layer: "Layer 6/7 (Vector Search / AI, RAG & Agents)",
+      ideaRe:
+        /\b(rag|vector\s+search|semantic\s+search|embeddings?|pgvector|pinecone|milvus|weaviate|llamaindex|chatbot)\b/i,
+      techRe:
+        /\b(rag|vector|embedding|pgvector|pinecone|milvus|weaviate|openai|claude|gemini|llamaindex|llm)\b/i,
+      slugHints: [
+        "rag",
+        "vector",
+        "search",
+        "embed",
+        "ai",
+        "chat",
+        "agent",
+        "assistant",
+        "llm",
+        "retrieval",
+      ],
+    },
+    {
+      layer: "Layer 9 (Security & AuthN/AuthZ)",
+      ideaRe: /\b(oauth2?|oidc|openid|jwt\s+auth|rbac|multi-tenant|sso)\b/i,
+      techRe:
+        /\b(oauth|oidc|openid|jwt|rbac|auth|session|token|vault|permissions?)\b/i,
+      slugHints: [
+        "auth",
+        "login",
+        "oauth",
+        "session",
+        "rbac",
+        "security",
+        "tenant",
+        "user",
+      ],
+    },
+  ];
+
+  const hasSlugMatch = (hints: string[]) =>
+    hints.some((h) =>
+      [...slugSet].some((s) => s.includes(h) || h.includes(s))
+    );
+
+  for (const sig of layerSignals) {
+    if (!sig.ideaRe.test(idea)) continue;
+    if (!sig.techRe.test(tech)) {
+      gaps.push(
+        `userIdea requires ${sig.layer} but technologies.md has no matching decision`
+      );
+    }
+    if (slugSet.size > 0 && !hasSlugMatch(sig.slugHints)) {
+      gaps.push(
+        `userIdea requires ${sig.layer} but no matching spec slug (${sig.slugHints.slice(0, 4).join("/")})`
+      );
+    }
+  }
+
+  // Reverse (anti-overengineering): if technologies.md explicitly adopts a heavy layer row in the 9-Layer Matrix
+  // without any matching spec slug (and userIdea didn't ask for it), flag orphan architecture.
+  if (slugSet.size > 0) {
+    const adoptedRows = (technologiesMd || "")
+      .split(/\r?\n/)
+      .filter((line) => /^\s*\|.*\|\s*adopt\s*\|/i.test(line));
+    for (const row of adoptedRows) {
+      if (
+        /Messaging\s*&\s*Workflows/i.test(row) &&
+        /\b(kafka|rabbitmq|sqs|nats|pulsar|temporal)\b/i.test(row) &&
+        !hasSlugMatch(["queue", "worker", "job", "messaging", "webhook", "workflow", "event", "temporal", "kafka"])
+      ) {
+        gaps.push(
+          "technologies.md adopts Layer 4 (Messaging & Workflows) heavy broker but no spec slug covers it (orphan layer)"
+        );
+      }
+      if (
+        /(Search,\s*Vector|AI,\s*RAG\s*&\s*Agents)/i.test(row) &&
+        /\b(pinecone|milvus|weaviate|pgvector|llamaindex|openai|claude|gemini|rag)\b/i.test(row) &&
+        !hasSlugMatch(["rag", "vector", "search", "embed", "ai", "chat", "agent", "assistant", "llm", "retrieval"])
+      ) {
+        gaps.push(
+          "technologies.md adopts Layer 6/7 (Vector/AI/RAG) but no spec slug covers it (orphan layer)"
+        );
+      }
+    }
+  }
+
   return gaps;
 }
 

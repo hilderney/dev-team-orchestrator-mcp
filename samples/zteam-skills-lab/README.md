@@ -6,7 +6,7 @@ Subject was enriching stubs under the orchestrator package `.zteam/skills/roles/
 
 See `.docs/skill-briefing.md` and `.docs/requirements.md`.
 
-**Next (package):** [`.docs/todo.md`](../../.docs/todo.md) — validate skills by project type / role.
+**Next (package):** [`.docs/todo-skills.md`](../../.docs/todo-skills.md) — validate skills by project type / role.
 
 ## Pipeline status
 

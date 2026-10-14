@@ -1,11 +1,12 @@
 # Plano de melhorias zTeam — review Pacman-Z (pipeline + qualidade)
 
-> **Status: open / backlog ativo** (2026-09-26) — documento de produto; **ainda não implementado** no orquestrador.
+> **Status: partially implemented** (atualizado 2026-03) — grande parte do harness entregue; itens abertos em **§8** e multi-host em **§11**. Skills: [`.docs/todo-skills.md`](../todo-skills.md).
 
-**Fonte:** [`zteam-pipeline-review.md`](../../zteam-pipeline-review.md) (tentativa full em `c:\GIT\ZAPFCOORP\pacman-z`, modelos `inherit`, runtime cursor + 7 stages Task).  
-**Complementa (arquivados):** [3-zteam-improvements.md](./3-zteam-improvements.md), [5-zteam-improvement-plan.md](./5-zteam-improvement-plan.md), [6-zz-review-hygiene.md](./6-zz-review-hygiene.md).
+**Origem:** review full Pacman-Z (runtime cursor + Task, falso verde em `screens-flow`). Planos harness anteriores (P0 bootstrap, verify, hygiene) foram removidos do repo após shipping em `src/`.
 
 **Princípio:** `ok: true` + suite verde **não** equivalem a Definition of Done. O Pacman-Z fechou 36/36 testes e ainda assim entregou fluxo Title→Play quebrado (overlays `PAUSED` + `Generating maze…` simultâneos) — **falso verde** face a DoD de `screens-flow`.
+
+**Entregue (ver também [README — Modes/workflows](../../README.md#modes--workflows)):** MCP `get_zteam_config` / `write_zteam_config` / `ensure_zteam_setup`; workflows `full` \| `docs` \| `feature` \| `punch` \| `fix` \| `resume` \| `tests` \| `analyze` com `slug` / `role` / `scope`; TDD `qaTddRed → SE → qaVerify`; `resolveSkill` + pilots em `.zteam/skills/roles/`.
 
 ---
 
@@ -13,10 +14,10 @@
 
 | Camada | Causa-raiz dominante |
 |--------|----------------------|
-| Orquestração / MCP | Surface `user-zteam` desalinhado da skill/README (tools de config ausentes; schema incompleto; texto anti-Task vs playbook cursor) |
-| Produto / qualidade | SE implementou CSS/`[hidden]` incorreto; QA não cobriu screen-flow; SA/UX/TA deixaram DoD testável fraco |
-| Processo | Ordem atual `SE → QA` descobre gaps **depois** da implementação; UI/UX não é dono explícito do fluxo por funcionalidade; não há tipagem de projeto nem skills focadas por tipo |
-| Modularidade | Orquestrador quase só oferece o pipeline monolítico; faltam fatias oficiais: config, skill, `.docs`, **uma feature**, **só testes**, **só docs/specs**, **análise por agente** |
+| Orquestração / MCP | *(largamente resolvido)* — alinhar schema/docs em drift residual; multi-host Copilot/OpenCode em aberto |
+| Produto / qualidade | SE implementou CSS/`[hidden]` incorreto; QA não cobriu screen-flow; SA/UX/TA deixaram DoD testável fraco — **ainda** relevante para gates e smoke fixture §8 |
+| Processo | TDD red→green **shipped**; UX `## Flow & states` nos prompts; skills por `projectType` via H4 — validar conteúdo em [todo-skills](../todo-skills.md) |
+| Modularidade | Fatias `docs` / `feature` / `tests` / `analyze` + setup **shipped**; allowlists de write por capacidade **parcial** (§8) |
 
 ROI em seis frentes: (1) alinhar MCP/skill/config, (2) **capacidades isoladas** (setup + fatias de trabalho), (3) **TDD**, (4) **UI/UX dono de fluxos**, (5) **tipo de projeto + skills por agente/fase**, (6) **Skills/config por host LLM** (Cursor → Copilot → OpenCode).
 
@@ -85,11 +86,11 @@ Cada item: ID · severidade · onde · critério de aceite. Referências § do r
 
 ## 2. Capacidades isoladas do orquestrador
 
-### 2.1 Problema
+### 2.1 Problema (histórico)
 
-Hoje o caminho natural empurra para `run_development_pipeline` (full ou docs). No Pacman-Z, sem `get_zteam_config` / `write_zteam_config`, o agent **improvisou** bootstrap: criou config à mão, copiou skill/README de outro repo (§1.1, §2.1, §2.3).
+No Pacman-Z original, sem tools de config, o agent improvisou bootstrap (config à mão, skill de outro repo). **Mitigado:** `get_zteam_config` / `write_zteam_config` / `ensure_zteam_setup` e subcomandos na skill.
 
-A skill já descreve subcomandos (`@zteam/config`, `@zteam/models`, `@zteam/documentation`, `@zteam/tests`), e existem workflows `feature` / `docs` / `punch`, mas o **orquestrador MCP** não expõe um catálogo claro de fatias com parâmetros (`slug`, `role`, `scope`) e allowlists de write. Resultado: “usar zteam” = quase sempre pipeline inteiro, ou trabalho manual fora do contrato.
+**Ainda em aberto:** allowlists de write por capacidade (docs-only não deve tocar `src/**`); matriz capacidade → params documentada de ponta a ponta (§2.6–2.7, §8).
 
 ### 2.2 Família A — setup / harness (sem time de produto)
 
@@ -113,7 +114,7 @@ Estas **usam** agentes, mas com escopo delimitado (não greenfield full de N spe
 | **Só testes de um requisito** | Gerar (TDD-red) ou reforçar testes **apenas** para um requisito/spec — **sem** implementar produto | QA (opcional: SA aponta ACs) | `@zteam/tests` + `slug` / `requirementId`; writes só em `**/*.{test,spec}.*` |
 | **Análise (review) por fatia** | Analisar parte do projeto **sem** implementar: todo o time em modo crítico **ou** **um único agente** | Ver §2.4 | `@zteam/analyze` + `scope` + opcional `role` |
 
-Relação com workflows atuais em [`src/workflows/types.ts`](../../src/workflows/types.ts): `docs` e `feature` existem no router, mas faltam **parâmetro de slug**, modo **tests-only**, e modo **analyze** (read-mostly) explícitos no MCP/skill.
+**Estado atual:** [`src/workflows/`](../../src/workflows/) + [`README.md`](../../README.md#modes--workflows) expõem `docs`, `feature` (+ `slug`), `tests`, `analyze` (+ `scope` / `role`), `punch`, `fix`, `resume`. Pendente: endurecer **uma feature** (1 slug, SE filtrado) e **allowlists** §2.6.
 
 ### 2.4 Análise isolada — todo o time ou um agente
 
@@ -190,15 +191,9 @@ Critérios:
 
 ## 3. TDD — testes primeiro, código depois
 
-### 3.1 Problema
+### 3.1 Problema (histórico) — TDD **entregue**
 
-Fluxos atuais em [`src/workflows/types.ts`](../../src/workflows/types.ts):
-
-```text
-… → scaffold → SE* → QA* → …
-```
-
-O QA entra **depois** da implementação. No Pacman-Z, o QA reforçou o que o SE já destacou (maze/ranking) e **omitiu** screen-flow pedido na spec — suite verde = falso sinal de pronto.
+Antes: `… → scaffold → SE* → QA* → …` (Pacman-Z: QA omitiu screen-flow). **Hoje:** `… → scaffold → qaTddRed → SE → qaVerify` — ver grafo em [`README.md`](../../README.md#modes--workflows) e nó `qaTddRed` em `src/orchestrator.ts`.
 
 ### 3.2 Ordem alvo
 
@@ -444,11 +439,12 @@ Ver também secção **§11** abaixo.
 - [x] Specs UI com `## Flow & states` quando UI (prompt UX)
 - [x] Workflows `tests` | `analyze` + params `slug`/`role`/`scope`
 - [x] Skills piloto roles (webgame/crud/screenflow) sob `.zteam/skills/roles/`
-- [x] README topo alinhado a TDD + tools + workflows
+- [x] README topo alinhado a TDD + tools + workflows + Matriz das 9 Camadas + workflows por partes e completo
+- [x] Limpeza repo (G1 — postmortems históricos removidos)
+- [x] **Matriz das 9 Camadas (System Design + AI Stack):** tabela `adopt | defer | none` em `technologies.md`, defaults em `ta-technologies-*`, qualifier `qa-tdd-red-ai-rag.md` e crítico bidirecional em `findArchitectureCoverageGaps` (§12)
 - [ ] Capacidade **uma feature** (1 slug) — param existe; endurecer filtro SE
 - [ ] Allowlist writes por capacidade (docs-only sandbox) — parcial
 - [ ] Skills/config **Copilot** / **OpenCode**
-- [ ] Limpeza repo (G1)
 - [ ] Regressão Pacman-Z §8: overlays em fixture de smoke dedicada
 
 ---
@@ -498,3 +494,46 @@ O orquestrador deve ser **usável por outras LLMs**, com onboarding e Skills **e
 3. **P3-3 OpenCode:** idem para OpenCode; documentar limitações e caminho CLI-first.
 
 Núcleo partilhado (não duplicar lógica): workflows, `projectType`, TDD, allowlists — só a **casca de host** muda.
+
+---
+
+## 12. Matriz das 9 Camadas (System Design + AI Stack)
+
+Para cobrir de ponta a ponta as 9 camadas de arquitetura moderna (**1. Clients & Interfaces · 2. Edge, DNS & Traffic · 3. APIs & Service Layer · 4. Messaging & Workflows · 5. Data, Storage & Cache · 6. Search, Vector & Retrieval · 7. AI, RAG & Agents [produto] · 8. Eval, Compute & Deployment · 9. Security & Observability**) sem estourar limites de tokens do 9router nem poluir apps simples:
+
+### 12.1 Solução A — Tabela compacta nos 11 H2 existentes de `technologies.md`
+
+- **Sem novos H2 obrigatórios** (evita `LlmContentError("parse_failed")` em modelos free) e **sem flags booleanas no SA**.
+- O TA inclui sob `## Technology decisions` (ou `## Specialized services`) uma única **tabela de 9 linhas** onde cada camada recebe `adopt` | `defer` | `none`, a escolha técnica e o gatilho/nota.
+- Apenas camadas **`adopt`** são detalhadas nos H2 correspondentes (`## Data persistence`, `## Schemas / API exposure`, `## Security`, `## Hosting / publish target`).
+- **Regra de ouro (Harness vs Produto):** a Camada 7 (*AI, RAG & Agents*) refere-se exclusivamente ao **produto gerado**; o harness do orquestrador (LangGraph + MCP + Cursor/9router) nunca entra como dependência do app salvo se o próprio app for um agente/MCP.
+
+### 12.2 Solução B — Perfis default por `projectType` nas skills `ta-technologies-*`
+
+Injetados automaticamente via `resolveSkill` (`src/skill-resolve.ts`), garantindo zero-bloat:
+
+| `projectType` | Camadas `adopt` por defeito | Camadas `none` por defeito (salvo pedido na `userIdea`) |
+|---|---|---|
+| `webgame` / `frontend` | 1 (Clients), 8 (Vitest + build estático) | 2, 3, 4, 6, 7 (`5` = localStorage/memória, `9` = mínimo) |
+| `crud` / `webapp` | 1, 3 (REST), 5 (DB), 8, 9 (Auth/Validação) | 2 (Edge), 4 (Filas), 6 (Vector), 7 (AI) |
+| `backend` | 3 (API), 5 (DB/Cache), 8, 9 (Auth/Logs) | 1 (UI), 6, 7 |
+| `fullstack` | 1, 2 (Edge/CDN), 3, 5, 8, 9 | 4, 6, 7 |
+
+### 12.3 Solução C — Crítico de arquitetura bidirecional (`findArchitectureCoverageGaps`)
+
+Evoluir `findArchitectureCoverageGaps` em [`src/verify-delivery.ts`](../../src/verify-delivery.ts) (heurística determinística, zero custo LLM):
+
+1. **Ideia → Tecnologias → Specs:**
+   - Sinais de **fila / webhook / job assíncrono** na `userIdea` ou `requirements.md` exigem Camada 4 ativa em `technologies.md` + slug de spec correspondente.
+   - Sinais de **RAG / embeddings / busca semântica / LLM / chatbot** exigem Camadas 6, 7 e estratégia de Eval na 8 + slug de spec.
+   - Sinais de **OAuth / OIDC / JWT / RBAC / multi-tenant** exigem Camada 9 explícita + slug de spec.
+2. **Inverso (anti-overengineering):**
+   - Se `technologies.md` adota Redis, Kafka, S3, Pinecone ou OAuth, mas **nenhuma spec** em `.docs/specs/*.spec.md` referencia a camada, o crítico acusa *camada órfã* (reabre TA/specs).
+3. **Parser (`assertParsedTechSummaryAndBody`):** validar presença dos H2 obrigatórios e da tabela das 9 camadas.
+
+### 12.4 Solução D — Qualifiers de TDD conectados às camadas
+
+- **Camadas 1–2:** cobertas por `screenflow` e `forms`.
+- **Camadas 3, 4, 5, 9 (API, Filas, Dados, Auth):** cobertas por `api-contract` (`qa-tdd-red-api-contract.md` / `qa-tdd-verify-api-contract.md`).
+- **Camadas 6, 7, 8 (Vector/RAG + AI/Agents + Eval):** qualifier planejado `ai-rag` (`qa-tdd-red-ai-rag.md`) exigindo mock determinístico de LLM/embeddings nos testes unitários + contrato de schema/fallback.
+

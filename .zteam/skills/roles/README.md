@@ -1,8 +1,7 @@
 # Role skills — índice
 
 Skills focadas por **(role × phase × projectType|qualifier)**.  
-Catálogo completo + backlog: [`.docs/todo-skills.md`](../../../.docs/todo-skills.md)  
-Charter: [`.docs/postmortems/9-skills-catalog.md`](../../../.docs/postmortems/9-skills-catalog.md)
+Catálogo, charter e backlog: [`.docs/todo-skills.md`](../../../.docs/todo-skills.md)
 
 ## Resolução (runtime H4)
 
@@ -32,6 +31,7 @@ Implementação: [`src/skill-resolve.ts`](../../../src/skill-resolve.ts) — inj
 | [ux-flow-webgame.md](./ux-flow-webgame.md) | ux | spec-flow |
 | [qa-tdd-red-screenflow.md](./qa-tdd-red-screenflow.md) | qa | tdd-red |
 | [qa-tdd-red-api-contract.md](./qa-tdd-red-api-contract.md) | qa | tdd-red |
+| [qa-tdd-red-ai-rag.md](./qa-tdd-red-ai-rag.md) | qa | tdd-red (AI/RAG/Vector layers 6–8) |
 | [se-implement-tdd-green.md](./se-implement-tdd-green.md) | se | tdd-green (multi-type pilot; prefer over thin core) |
 | [qa-tdd-verify-screenflow.md](./qa-tdd-verify-screenflow.md) | qa | tdd-verify |
 

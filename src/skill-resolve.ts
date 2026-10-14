@@ -112,6 +112,14 @@ export function skillFileCandidates(
   }
 
   if (role === "qaEngineer" && phase === "tdd-red") {
+    if (
+      type === "ai-rag" ||
+      type === "ai" ||
+      type === "rag" ||
+      type === "agent"
+    ) {
+      push("qa-tdd-red-ai-rag.md");
+    }
     if (ui) push("qa-tdd-red-screenflow.md");
     else push("qa-tdd-red-api-contract.md");
     if (type === "crud" || type === "webapp" || type === "forms") {
@@ -120,6 +128,14 @@ export function skillFileCandidates(
   }
 
   if (role === "qaEngineer" && phase === "tdd-verify") {
+    if (
+      type === "ai-rag" ||
+      type === "ai" ||
+      type === "rag" ||
+      type === "agent"
+    ) {
+      push("qa-tdd-verify-api-contract.md");
+    }
     if (ui) push("qa-tdd-verify-screenflow.md");
     else push("qa-tdd-verify-api-contract.md");
   }

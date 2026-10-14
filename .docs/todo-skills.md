@@ -1,19 +1,60 @@
 # Todo — skills (role × phase × projectType)
 
-Backlog vivo da **Fase 9** (referência; **próximo trabalho** em [todo.md](./todo.md)). Charter: [postmortems/9-skills-catalog.md](./postmortems/9-skills-catalog.md).  
-Ficheiros: [`.zteam/skills/roles/`](../.zteam/skills/roles/).
+**Backlog vivo do pacote MCP** para role skills (Fase 9 entregue: inventário, stubs, H4 wiring, pilots via `samples/zteam-skills-lab`).  
+Itens **não-skill** (allowlists, multi-host, feature slug, smoke Pacman): [postmortems/8-zteam-pipeline-review-improvements.md](./postmortems/8-zteam-pipeline-review-improvements.md) §8.
+
+Ficheiros on disk: [`.zteam/skills/roles/`](../.zteam/skills/roles/) · runtime: [`src/skill-resolve.ts`](../src/skill-resolve.ts).
 
 **Status:** `pilot` = conteúdo útil · `stub` = ficheiro criado, enriquecer · `planned` = só nesta lista · `n/a` = sem skill LLM.
 
 **Prioridade:** P0 = piloto webgame/crud/TDD · P1 = webapp/backend · P2 = outros tipos · P3 = analyze/wiring.
 
+> Nota: `.docs/todo.md` no **app** é artefacto da pipeline (checklist de specs), não este backlog — ver `.gitignore`.
+
 ---
 
-## Resolução
+## Charter (Fase 9)
+
+Skills **focadas** (≤1 página) por `(role, phase, projectType|qualifier)` injectadas em `invokeRoleLlm` / playbook Cursor — sem monolito. Distintas da skill de **uso** zteam (`.cursor/skills/zteam`, `.zteam/skills/SKILL.md`).
+
+### Taxonomia
+
+| Campo | Valores |
+|-------|---------|
+| Role | `sa` · `ta` · `ux` · `se` · `qa` |
+| Phase | `bootstrap` · `requirements` · `juice` · `technologies` · `look-and-feel` · `todo-plan` · `spec-write` · `spec-flow` · `spec-tech` · `tdd-red` · `tdd-green` · `tdd-verify` · `fix` · `summary` · `tech-debt` · `analyze` · `delivery-critic` |
+| projectType | `core` · `webgame` · `webapp` · `crud` · `backend` · `frontend` · `fullstack` · `mobile` · `cli-dos` · `library` · `desktop` · `other` |
+| Qualifier | `screenflow` · `api-contract` · `forms` (quando span tipos) |
+
+**Ficheiro:** `{role}-{phase}-{qualifier|projectType}.md`
+
+### Resolução
 
 ```text
 exact {role}-{phase}-{projectType|qualifier} → else {role}-{phase}-core
 ```
+
+```mermaid
+flowchart TD
+  detect[projectType] --> resolve[resolve]
+  resolve -->|hit| skill[role-phase-type]
+  resolve -->|miss| core[role-phase-core]
+```
+
+### Fora de escopo
+
+- Skills para nós heurísticos (`fidelityCritic`, `scaffoldPrepare`, …) além do stub `se-delivery-critic-core`
+- Hosts multi-LLM além do índice em [`.zteam/skills/hosts/`](../.zteam/skills/hosts/) (Copilot / OpenCode — ver postmortem 8 §11)
+
+---
+
+## Próximo trabalho
+
+- [x] **9-Layer System Design + AI Stack:** incluir tabela das 9 camadas (`adopt | defer | none`) nas skills `ta-technologies-*`, qualifier `qa-tdd-red-ai-rag.md` e no validador/crítico (`validateTechDocumentStructure` + `findArchitectureCoverageGaps`) — ver [README — Technology phase](../README.md#technology-phase-docstechnologiesmd--9-layer-matrix) e [postmortem 8 §12](./postmortems/8-zteam-pipeline-review-improvements.md#12-matriz-das-9-camadas-system-design--ai-stack)
+- [ ] Enriquecer stubs P0/P1 → `ready` com validação por `projectType` (webgame, crud, webapp, backend)
+- [ ] Re-run QA analyze quando 9router estável (lab QA body empty ×2)
+- [ ] Tipos planned (mobile, cli-dos, …) após P0/P1
+- [ ] Itens abertos do [postmortem 8 §8](./postmortems/8-zteam-pipeline-review-improvements.md#8-checklist-de-verificação-quando-implementado) (allowlists, Copilot/OpenCode, fixture Pacman overlays)
 
 ---
 
@@ -61,6 +102,7 @@ qa-tdd-red-core.md
 qa-tdd-red-screenflow.md
 qa-tdd-red-api-contract.md
 qa-tdd-red-forms.md
+qa-tdd-red-ai-rag.md
 qa-tdd-verify-core.md
 qa-tdd-verify-screenflow.md
 qa-tdd-verify-api-contract.md
@@ -111,8 +153,9 @@ README.md
 | S-SE-07 | se-delivery-critic-core.md | se | delivery-critic | core | — | P1 | pilot | Spot-check Files to touch | todo + src | Sem [x]; reopen gaps | playbook delivery-critic |
 | S-QA-01 | qa-tdd-red-core.md | qa | tdd-red | core | — | P0 | stub | Testes a falhar genéricos | *.{test,spec}.* | Sem [x]; sem product code | qaEngineerTddRedPrompt |
 | S-QA-02 | qa-tdd-red-screenflow.md | qa | tdd-red | screenflow | true | P0 | pilot | Red SF/overlays | *test* | Exclusividade chrome | same |
-| S-QA-03 | qa-tdd-red-api-contract.md | qa | tdd-red | api-contract | false | P0 | pilot | Red contratos API | *test* | Happy+alt | same |
+| S-QA-03 | qa-tdd-red-api-contract.md | qa | tdd-red | api-contract | false | P0 | pilot | Red contratos API/Data/Queue/Auth | *test* | Happy+alt | same |
 | S-QA-04 | qa-tdd-red-forms.md | qa | tdd-red | forms | true | P1 | pilot | Red forms/validação UI | *test* | Empty/error | same |
+| S-QA-10 | qa-tdd-red-ai-rag.md | qa | tdd-red | ai-rag | false | P1 | pilot | Red AI/RAG/Vector mock + schema (camadas 6–8) | *test* | Sem chamadas live | same |
 | S-QA-05 | qa-tdd-verify-core.md | qa | tdd-verify | core | — | P0 | stub | Suite + gaps; mark [x] | *test* + todo | [x] só se pass | qaEngineerVerifyPrompt |
 | S-QA-06 | qa-tdd-verify-screenflow.md | qa | tdd-verify | screenflow | true | P0 | pilot | Verify SF | *test* | Sem [x] se chrome falha | same |
 | S-QA-07 | qa-tdd-verify-api-contract.md | qa | tdd-verify | api-contract | false | P1 | pilot | Verify API contracts | *test* | Auth/fail paths | same |
@@ -171,12 +214,10 @@ README.md
 
 ## Checklist fase 9 — concluído
 
-- [x] Postmortem 9 + roles/README
+- [x] Charter neste ficheiro + [roles/README](../.zteam/skills/roles/README.md)
 - [x] Este catálogo
 - [x] Stubs core + tipo prioritário (ver ON_DISK_SKILLS)
-- [x] [`.docs/todo.md`](./todo.md) + postmortems README
+- [x] [postmortems/README](./postmortems/README.md) mínimo
 - [x] Smoke on-disk
 - [x] Team analyze (SA/TA/UX/SE) applied to P0 skills; QA reconciled
 - [x] H4 runtime resolve + inject + smoke
-
-**Próximo (backlog ativo):** [todo.md](./todo.md) — validar skills por tipo de projeto / função.

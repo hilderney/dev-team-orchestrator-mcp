@@ -473,6 +473,48 @@ try {
       r.pathsTouched.some((p) => /[\\/]\.zteam[\\/]langgraph/.test(p)),
       "setup pathsTouched includes langgraph"
     );
+    const dashHtml = join(app, ".zteam", "dashboard", "index.html");
+    const liveJs = join(app, ".docs", "zteam-live.js");
+    assert(
+      (await readFile(dashHtml, "utf8")).includes("zTeam Live Orchestrator"),
+      "9Router-style dashboard HTML materialized"
+    );
+    assert(
+      (await readFile(liveJs, "utf8")).includes("window.__ZTEAM_LIVE__"),
+      "initial zteam-live.js written"
+    );
+    const { emitLiveEvent, readLiveDashboardState, formatCompactChatLine } =
+      await import("../src/live-dashboard.ts");
+    await emitLiveEvent({
+      appRoot: app,
+      stage: "qaTddRed",
+      role: "qaEngineer",
+      model: "9RQA-qa-free",
+      skillKey: "qa-tdd-red-api-contract",
+      status: "start",
+      charsIn: 1200,
+      message: "Writing failing tests for login-form",
+      specsDone: 1,
+      specsTotal: 4,
+    });
+    const liveState = await readLiveDashboardState(app);
+    assert(
+      liveState?.activeNode === "qaTddRed" && liveState.kpis.charsIn === 1200,
+      "emitLiveEvent updates activeNode and KPIs"
+    );
+    const banner = formatCompactChatLine({
+      workflow: "full",
+      stage: "qaTddRed",
+      role: "qaEngineer",
+      skillKey: "qa-tdd-red-api-contract",
+      message: "Writing failing tests",
+      specsDone: 1,
+      specsTotal: 4,
+    });
+    assert(
+      banner.includes("[zTeam · full [1/4]]") && banner.includes("qaTddRed"),
+      "compact 1-line chat banner"
+    );
   }
 
   console.log("smoke:zteam-config OK");

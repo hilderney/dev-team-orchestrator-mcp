@@ -31,7 +31,7 @@ When the user invokes a **subcommand**, follow that path **before** a generic fu
 | `write_zteam_config` | Write `.zteam/config.json` (always include **uiUxDesigner**) |
 | `ensure_zteam_setup` | Skill + `.docs` stubs + optional config template (no LLM) — if present |
 | `run_development_pipeline` | Pipeline / playbook (`workspaceRoot` **required**, `workflow` optional) |
-| `get_pipeline_state` | Debug / resume state |
+| `get_pipeline_state` | Live Canvas Dashboard state + push subagent telemetry (`recordStage`, `recordRole`, `recordStatus`, `recordMessage`) |
 | `approve_gate` | HITL when `ZTEAM_HITL=1` |
 
 If GetDynamicTools shows only an old `run_development_pipeline` schema (no `workspaceRoot`), **restart the zteam MCP server** so Cursor reloads `src/orchestrator.ts`.
@@ -62,17 +62,34 @@ If GetDynamicTools shows only an old `run_development_pipeline` schema (no `work
 
 `get_zteam_config` returns `llmRuntime` when homogeneous.
 
-### After `run_development_pipeline` (cursor)
+### After `run_development_pipeline` (cursor) — Live Canvas Dashboard + Short Chat Log
+
+When `ensure_zteam_setup` or `run_development_pipeline` runs, it materializes **`.zteam/dashboard/index.html`** (a 9Router-style interactive Canvas with animated Bézier pulses between the Orchestrator hub and each subagent, KPI cards, and live log feed polling `.docs/zteam-live.js` with zero server needed).
 
 ```text
 If response.llmRuntime === "cursor" (or delegated === true):
+0. Tell the user once: "Live Canvas Dashboard: `.zteam/dashboard/index.html`"
 1. For each stage in delegationPlaybook.stages (in order):
-   Task({
-     subagent_type: stage.subagentType,  // system-architect | technology-architect | software-engineer | qa-engineer
-     model: stage.model,                 // usually "inherit"
-     description: stage.title,
-     prompt: stage.instructions + " Write expected outputs: " + stage.expectedOutputs.join(", ")
-   })
+   a) Call get_pipeline_state({
+        workspaceRoot, projectRoot,
+        recordStage: stage.id, recordRole: stage.role,
+        recordStatus: "start", skillKey: stage.skillKey,
+        recordMessage: "Starting " + stage.title
+      })
+      Print ONLY the 1-line `chatBanner` in chat (keep chat ultra-clean).
+   b) Run Task({
+        subagent_type: stage.subagentType,  // system-architect | technology-architect | software-engineer | qa-engineer
+        model: stage.model,                 // usually "inherit"
+        description: stage.title,
+        prompt: stage.instructions + " Write expected outputs: " + stage.expectedOutputs.join(", ")
+      })
+   c) Call get_pipeline_state({
+        workspaceRoot, projectRoot,
+        recordStage: stage.id, recordRole: stage.role,
+        recordStatus: "done", skillKey: stage.skillKey,
+        recordMessage: "Completed " + stage.title
+      })
+      Print ONLY the 1-line `chatBanner` in chat.
 2. Verify artefacts under appRoot (.docs/*, code, tests)
 3. Report stages completed; do not call 9router
 ```

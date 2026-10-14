@@ -68,22 +68,50 @@ flowchart TD
   fidelity -->|PASS| nextPhase
 ```
 
-## Technology phase (`.docs/technologies.md`)
+## Technology phase (`.docs/technologies.md` + 9-Layer Matrix)
 
 Runs after fidelity PASS. The Technology Architect turns approved requirements into production-oriented tech decisions — **no feature code**.
 
 **Delivers**
-- `.docs/technologies.md` — stack, folders, hosting, persistence, scalability, cost-benefit services, specialized services, schemas, security, standards
-- README — Technology summary + link to technologies.md
+- `.docs/technologies.md` — 11 fixed H2 sections (`## Technology decisions`, `## Folder architecture`, `## Stacks`, `## Hosting / publish target`, `## Data persistence`, `## Scalability & growth`, `## Cost-benefit & services`, `## Specialized services`, `## Schemas / API exposure`, `## Security`, `## Development standards`)
+- **9-Layer System Design + AI Stack Matrix** (inside `## Technology decisions` or `## Specialized services`) — every layer must be explicitly marked `adopt`, `defer`, or `none` so small projects never get bloated while complex ones never miss a layer
+- README — Technology summary + link to `technologies.md`
 - `===SELF_CHECK===` — nine yes/no gates (coverage ≥90%, folders, patterns, scale, cost, hosting, persistence, specialized services, owner can follow)
+
+### The 9 System Design + AI Stack Layers
+
+> **Harness vs Product:** Layer 7 (*AI, RAG & Agents*) refers strictly to **product** capabilities (if the app itself calls an LLM/RAG/MCP). The zteam orchestrator harness (LangGraph + MCP + Cursor/9router) is external and is never added to the product stack unless the product is an MCP/agent tool.
+
+| # | Layer | Scope / Examples | Default when not required by `userIdea` |
+|---|---|---|---|
+| **1** | **Clients & Interfaces** | Web (React, Next.js), Mobile (Flutter, Swift, Kotlin, React Native), CLI, or headless | Guided by `projectType` (`needsUiFlow`) |
+| **2** | **Edge, DNS & Traffic** | Cloudflare, Route 53, CloudFront, NGINX, Envoy, HAProxy | `none` (localhost / single host) |
+| **3** | **APIs & Service Layer** | REST, GraphQL, gRPC · Direct app vs Gateway (Kong, Apigee, AWS API Gateway) | `none` (client-only) or direct REST (`crud`/`backend`) |
+| **4** | **Messaging & Workflows** | Sync in-process vs Queues/Streams (SQS, RabbitMQ, Kafka, NATS, Pulsar) vs Orchestration (Temporal) | `none` (in-process sync) |
+| **5** | **Data, Storage & Cache** | DB (PostgreSQL, MySQL, MongoDB, DynamoDB), Object Storage (S3), Cache (Redis) | `localStorage` / `none` (games) or single DB (`crud`/`backend`) |
+| **6** | **Search, Vector & Retrieval** | Full-text (Postgres/OpenSearch/Elastic) vs Vector DB (pgvector, Pinecone, Milvus, Weaviate) | `none` (unless semantic search / RAG required) |
+| **7** | **AI, RAG & Agents (product)** | Providers (OpenAI, Claude, Gemini), Orchestration (LangGraph, LlamaIndex), Product MCP/Tools | `none` (unless product uses AI) |
+| **8** | **Eval, Compute & Deployment** | Compute (Local, Docker, Lambda, Cloud Run, K8s), CI/IaC (GitHub Actions, Terraform), LLM Evals | Local Vite/Node + Vitest (`adopt`) |
+| **9** | **Security & Observability** | AuthN/AuthZ (OAuth 2.0, OIDC), Secrets (env, Vault), Telemetry (Console, OpenTelemetry, Prometheus/Grafana, Datadog) | `env` + structured console logs |
+
+### Layer profiles by `projectType` (zero-bloat defaults)
+
+| `projectType` | `adopt` by default | `none` by default (unless `userIdea` asks) |
+|---|---|---|
+| `webgame` / `frontend` | **1** (Clients), **8** (Vitest + static build) | **2, 3, 4, 6, 7** (`5` = in-memory/localStorage, `9` = minimal) |
+| `crud` / `webapp` | **1** (UI), **3** (REST), **5** (DB), **8** (Test/Build), **9** (Auth/Validation) | **2** (Edge), **4** (Queues), **6** (Vector), **7** (AI) |
+| `backend` | **3** (API), **5** (DB/Cache), **8** (Test/Runtime), **9** (Auth/Logs) | **1** (UI), **6, 7** |
+| `fullstack` | **1, 2** (CDN/Edge), **3, 5, 8, 9** | **4, 6, 7** |
+
+Only layers marked **`adopt`** are expanded in detail under the corresponding H2 sections (`## Data persistence`, `## Schemas / API exposure`, `## Security`, `## Hosting / publish target`) and turned into `.docs/specs/{slug}.spec.md` items.
 
 ```mermaid
 flowchart TD
   fidelityPass[fidelityCritic PASS]
-  inputs[README + requirements.md + optional architectureGaps]
+  inputs[README + requirements.md + projectType + optional architectureGaps]
   ta[technologyArchitect]
-  draft["===SUMMARY=== + ===TECH=== body"]
-  headings["Required H2: decisions folders stacks hosting persistence scale cost services schemas security standards"]
+  draft["===SUMMARY=== + ===TECH=== body + 9-Layer Matrix"]
+  headings["Required 11 H2: decisions folders stacks hosting persistence scale cost services schemas security standards"]
   selfCheck[SELF_CHECK all nine yes]
   writeTech["write .docs/technologies.md"]
   readmeTech["README Technology section + link"]
@@ -504,27 +532,74 @@ Also see the always-on routing rule for stage/env details. Rescue mid-failure wi
 | **tests** | `workflow=tests` (+ `slug`) | QA-red\* → QA-verify\* → finalize |
 | **analyze** | `workflow=analyze` (+ `scope` / optional `role`) | analyzePrepare → `.docs/reviews/…` → finalize |
 
-Catalog + classifier: [`src/workflows/`](src/workflows/) (`WORKFLOW_CATALOG`). Graph dump: [`.docs/langgraph.mmd`](.docs/langgraph.mmd). Multiagent ideal (future): [`.docs/adr-multiagent-flow.md`](.docs/adr-multiagent-flow.md). Historical plans: [`.docs/postmortems/`](.docs/postmortems/).
+Catalog + classifier: [`src/workflows/`](src/workflows/) (`WORKFLOW_CATALOG`). Graph dump: [`.docs/langgraph.mmd`](.docs/langgraph.mmd) · LangGraph Studio: [`.zteam/langgraph/README.md`](.zteam/langgraph/README.md) (`npm run studio` / `npm run graph`). Multiagent ideal (future): [`.docs/adr-multiagent-flow.md`](.docs/adr-multiagent-flow.md). Open product backlog: [`.docs/postmortems/8-zteam-pipeline-review-improvements.md`](.docs/postmortems/8-zteam-pipeline-review-improvements.md). Skills catalog + charter: [`.docs/todo-skills.md`](.docs/todo-skills.md).
 
-### Workflow `full`
+### Workflow `full` (no completo — agrupado em 4 macro-fases)
 
-1. **Bootstrap** — Resume + Pré Requirements; stub `.docs/requirements.md` (empty LLM → `llm_empty`, no stub charter)
-2. **SA loop** — expand each pré-req into `.docs/requirements.md`
-3. **Clean README** — Resume + link to requirements
-4. **UI/UX juice** → score + addendum; then **Fidelity** — hard FAIL vs `userIdea`; one redo then classified abort
-5. **TA** → `.docs/technologies.md`
-6. **UI/UX look-and-feel** → `.docs/ui-ux.md`
-7. **SA todo plan** → `.docs/todo.md` (testable chunks)
-8. **Per-slug specs** → SA → UI/UX (`## Flow & states` when UI) → TA on each `.docs/specs/{slug}.spec.md`
-9. **Architecture critic** — coverage gaps; may reopen TA
-10. **Scaffold** — template or augment missing shell files + install
-11. **QA TDD red** — failing tests per pending spec; no `[x]`
-12. **SE TDD green** — implement; `===SELF_CHECK===`; `verifyDelivery` + `tsc`; redo with `deliveryFixRound`; **does not** `markTodoDone`
-13. **Delivery critic** — reopen incomplete slugs
-14. **QA TDD verify** — run suite + gaps; `markTodoDone` when pass; optional `===TECH_DEBT===` → `.docs/tech-debt.md`; bootstrapFix vs SE fix by error class
-15. **SA project summary** — `.docs/project-summary.md` + `.docs/user-report.md`
-16. **SA tech-debt review** (if tech debt) — plan-mode `.docs/tech-debt-plan.md`
-17. **Finalize** → README + `.docs/pipeline-result.json`
+Para facilitar o entendimento do fluxo ponta a ponta, os **17 passos** do `workflow=full` agrupam-se em **4 macro-fases**:
+
+```mermaid
+flowchart LR
+  subgraph F1 ["Fase 1: Descoberta & Fidelidade"]
+    P1["1-4. SA Bootstrap + Pré-reqs → Clean README → UX Juice (≥7) → Fidelity Critic"]
+  end
+  subgraph F2 ["Fase 2: Arquitetura (9 Camadas) & UI/UX"]
+    P2["5-6. TA technologies.md (9-Layer Matrix) → UX Design System (ui-ux.md)"]
+  end
+  subgraph F3 ["Fase 3: Planejamento & Specs Three-Handed"]
+    P3["7-9. SA todo.md → Por slug: SA → UX (Flow) → TA → Architecture Critic"]
+  end
+  subgraph F4 ["Fase 4: Execução TDD & Fechamento"]
+    P4["10-17. Scaffold → QA Red → SE Green → Delivery Critic → QA Verify [x] → SA Report"]
+  end
+  F1 --> F2 --> F3 --> F4
+```
+
+| Macro-Fase | Passos no Grafo | Papéis / Nós | Artefactos e Gates |
+|---|---|---|---|
+| **1. Descoberta & Fidelidade** | **1.** Bootstrap README + lista de pré-reqs<br>**2.** Loop SA (expande 1 pré-req por vez)<br>**3.** Clean README<br>**4.** UX Juice + Fidelity Critic | `SA` → `UX` → `fidelityCritic` | `README.md`, `.docs/requirements.md` (tech-agnostic + `## UX / Juice addendum` score ≥7). **Gate:** Hard FAIL se desviar da `userIdea` (`llm_empty` se vazio). |
+| **2. Arquitetura (9 Camadas) & Design** | **5.** Decisões de stack + Matriz das 9 Camadas (`adopt \| defer \| none`)<br>**6.** Look-and-feel, paleta, emoção baseada em evidência | `TA` → `UX` | `.docs/technologies.md` (11 H2 + 9-Layer Matrix), `.docs/ui-ux.md`. **Gate:** 9 chaves `TA_SELF_CHECK` + 3 chaves `UX_DESIGN_SELF_CHECK`. |
+| **3. Planejamento & Specs Three-Handed** | **7.** Plano de chunks testáveis<br>**8.** Escrita a 3 mãos por slug (SA → UX → TA)<br>**9.** Crítico de arquitetura (ideia ↔ 9 camadas ↔ specs) | `SA` → `UX` → `TA` → `archCritic` | `.docs/todo.md`, `.docs/specs/{slug}.spec.md` (≥3 use cases, `## Flow & states` se UI, `Files to touch` limpos). **Gate:** Reabre `TA` se faltar camada ativa ou spec. |
+| **4. Execução TDD & Fechamento** | **10.** Scaffold + `npm install`<br>**11.** **QA TDD Red** (testes falhando antes do código)<br>**12.** **SE TDD Green** (código + `tsc` + `verifyDelivery`)<br>**13.** Delivery Critic<br>**14.** **QA TDD Verify** (suite verde → marca `[x]`)<br>**15–17.** Resumo SA, plano de tech-debt (opcional) e finalize | `scaffold` → `QA-red` → `SE` → `delCritic` → `QA-verify` → `SA` → `finalize` | `src/**`, `**/*.{test,spec}.*`, `.docs/user-report.md`, `.docs/tech-debt-plan.md` (se houver dívida), `.docs/pipeline-result.json`. **Gate:** SE nunca marca `[x]`; QA só marca `[x]` com testes verdes. |
+
+---
+
+### Workflows por partes (fatias isoladas)
+
+Quando não quiser rodar o pipeline monolítico (`full`), use as capacidades isoladas agrupadas em **3 famílias**:
+
+#### Família A — Setup & Diagnóstico (sem implementar código de produto)
+
+| Parte / Comando | Como acionar | Fluxo interno (passos agrupados) | Escreve em |
+|---|---|---|---|
+| **Config / Models** (`@zteam/config`, `@zteam/models`) | Tools MCP `get_zteam_config` → `write_zteam_config` | Lê config atual → valida família homogénea (`cursor` vs `ninerouter`) e `projectType` → grava `.zteam/config.json` (+ `.gitignore`). | `.zteam/config.json`, `.gitignore` |
+| **Bootstrap de estrutura** (`ensure_zteam_setup`) | Tool MCP `ensure_zteam_setup` | Materializa `.zteam/skills/SKILL.md`, `.zteam/langgraph/` (Studio launcher) e pasta `.docs/` inicial — **zero chamadas LLM**. | `.zteam/**`, `.docs/langgraph.mmd` |
+| **Análise / Review** (`workflow=analyze`) | `workflow: "analyze"` + `scope` (+ `role` opcional) | `analyzePrepare`: roda **um papel específico** (`sa`, `ta`, `ux`, `se`, `qa`) ou o **time inteiro** em modo crítico read-only sobre uma spec/pasta/requisito. | `.docs/reviews/*.md` (não toca em `src/**` nem marca `[x]`) |
+
+#### Família B — Só Documentação, Arquitetura & Specs (`workflow=docs` / `@zteam/documentation`)
+
+Executa apenas as **Macro-Fases 1, 2 e 3** e para antes do código:
+
+```text
+Bootstrap → SA Requirements Loop → UX Juice → Fidelity Critic
+  → TA technologies.md (9-Layer Matrix) → UX ui-ux.md
+  → SA todo.md → (SA → UX → TA spec por slug)* → Architecture Critic → Finalize
+```
+
+- **Quando usar:** Validar requisitos, escolher as 9 camadas de arquitetura e fechar contratos `.spec.md` antes de gastar tokens de SE/QA.
+- **Isolamento:** Zero escrita em `src/**` ou ficheiros de teste.
+
+#### Família C — Execução & TDD por fatia (`feature`, `tests`, `punch`, `fix`, `resume`)
+
+| Workflow | Gatilho / Parâmetros | Passos agrupados que executam | Diferença chave |
+|---|---|---|---|
+| **Uma Feature** (`workflow=feature`) | `workflow: "feature"`, `slug` (opcional) | **Macro-Fase 3 + 4** (pula Requirements/TA global): `SA todoPlan` → `SA→UX→TA spec` → `archCritic` → `scaffold` → `QA-red` → `SE-green` → `QA-verify` → `SA summary`. | Usa `requirements.md` e `technologies.md` já existentes; foca nos novos slugs. |
+| **Só Testes (TDD)** (`workflow=tests` / `@zteam/tests`) | `workflow: "tests"` + `slug` | `qaTddRed` (cria/reforça testes a partir da spec usando qualifier `screenflow` / `api-contract` / `forms` / `ai-rag`) → `qaEngineer` (verify) → `finalize`. | **Não roda SE**; escreve apenas em `**/*.{test,spec}.*`. |
+| **Mudança Rápida** (`workflow=punch`) | `workflow: "punch"` | `punchPrepare` (reabre ou cria spec alvo) → `QA-red` → `SE-green` (batch curto) → `QA-verify` → `SA summary` → `finalize`. | Pula toda a fase de arquitetura; direto ao ciclo TDD do ajuste. |
+| **Correção de Bug/Suite** (`workflow=fix`) | `workflow: "fix"` | `fixPrepare` → `softwareEngineerFix` → `QA-verify` (loop até passar ou `bootstrapFix` se erro de ambiente) → `SA summary` → `finalize`. | Pula `QA-red`; corrige implementação contra testes/erros existentes. |
+| **Retomada Segura** (`workflow=resume`) | `workflow: "resume"` | `resumePrepare` (reabre `[x]` fantasmas cujos `Files to touch` faltam no disco + specs `[ ]` pendentes) → `scaffold` → `QA-red` → `SE-green` → `QA-verify` → `SA summary`. | Recupera execuções interrompidas sem refazer `.docs` já aprovados. |
+
+---
 
 LangGraph overview (simplified; full dump in [`.docs/langgraph.mmd`](.docs/langgraph.mmd)):
 
@@ -611,7 +686,15 @@ Hard guard: refuses to write when `projectRoot` is `.` and `appRoot` equals the 
 - Network / 429 / 5xx are also retried.
 - Delivery verify FAIL → structured feedback + redo until `MAX_DELIVERY_FIX_ROUNDS`.
 
-## Live progress
+## Live progress & 9Router-style Canvas Dashboard (`.zteam/dashboard/index.html`)
+
+Every bootstrapped project automatically gets **`.zteam/dashboard/index.html`** — a self-contained dark Canvas UI inspired by the **9Router overview** that works directly from disk (`file://`, zero web server required):
+
+- **Animated Radial Canvas:** central `zTeam Orchestrator` hub firing glowing Bézier particles to/from `System Architect`, `UI/UX Designer`, `Tech Architect`, `QA TDD Red`, `Software Engineer`, `QA TDD Verify`, and `Critics & Gates` as each agent is called or consults a teammate.
+- **Top KPI Cards:** *Total Events*, *Payload Chars In*, *Specs Progress*, *Output Chars*, and *Retries / Fixes*.
+- **Recent Agent Activity Feed:** live stream of stages, active `skillKey`, chars `↑/↓` or files touched, and relative timestamps.
+- **Zero-server JSONP polling:** the orchestrator writes `.docs/zteam-live.js` (`window.__ZTEAM_LIVE__ = ...`) and `.docs/zteam-live.json` on every LangGraph node, LLM call (`invokeRoleLlm`), teammate consult (`consultTeammate`), or `get_pipeline_state` push; the HTML page reloads `.docs/zteam-live.js` every 1 second.
+- **Clean Chat Contract:** when running in Cursor (`delegationPlaybook`), the orchestrator agent pushes subagent start/done events via `get_pipeline_state({ recordStage, recordRole, recordStatus, recordMessage })` so the HTML dashboard animates the full work while the Cursor chat prints **only the 1-line `chatBanner`**.
 
 While the pipeline runs (MCP tool or CLI):
 

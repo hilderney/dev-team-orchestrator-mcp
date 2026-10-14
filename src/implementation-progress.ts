@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { getMetrics } from "./metrics.js";
 import { updatePipelineStage } from "./pipeline-state.js";
 import { formatSlugList } from "./architecture-progress.js";
+import { emitLiveEvent } from "./live-dashboard.js";
 
 export const IMPLEMENTATION_PROGRESS_PATH =
   ".docs/implementation-progress.json";
@@ -223,6 +224,15 @@ export async function implNotify(
   await writeImplementationProgress(appRoot, next);
   try {
     await updatePipelineStage(appRoot, { stage, workflow: undefined });
+    await emitLiveEvent({
+      appRoot,
+      stage,
+      message: prefixed,
+      status: /FAIL|error/i.test(message) ? "error" : "done",
+      filesCount: patch?.lastWrite?.count,
+      specsDone: next.specs.completed || undefined,
+      specsTotal: next.specs.total || undefined,
+    });
   } catch {
     /* best-effort */
   }

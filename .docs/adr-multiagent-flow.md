@@ -2,7 +2,7 @@
 
 **Status:** Partially implemented — critics/gates/verify shipped; SE parallel + `dependsOn` still future  
 **Date:** 2026-09-24 (updated 2026-09-25)  
-**Context:** [workflow-pacman-z2.md](./postmortems/workflow-pacman-z2.md) §8 — pipe linear frágil em greenfield. Plans: [postmortems/](./postmortems/).
+**Context:** Review Pacman-Z — pipe linear frágil e **falso verde** em screen-flow (suite verde com overlays quebrados). Backlog aberto: [postmortem 8 §8](./postmortems/8-zteam-pipeline-review-improvements.md#8-checklist-de-verificação-quando-implementado).
 
 ## Decisão
 

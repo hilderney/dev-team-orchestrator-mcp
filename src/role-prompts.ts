@@ -438,6 +438,80 @@ export function validateKeyedSelfCheck(
   return { ok: true, missing: [], nos: [], message: "ok" };
 }
 
+export const TA_REQUIRED_H2_HEADINGS = [
+  "Technology decisions",
+  "Folder architecture",
+  "Stacks",
+  "Hosting / publish target",
+  "Data persistence",
+  "Scalability & growth",
+  "Cost-benefit & services",
+  "Specialized services",
+  "Schemas / API exposure",
+  "Security",
+  "Development standards",
+] as const;
+
+export const TA_NINE_LAYERS = [
+  "1. Clients & Interfaces",
+  "2. Edge, DNS & Traffic",
+  "3. APIs & Service Layer",
+  "4. Messaging & Workflows",
+  "5. Data, Storage & Cache",
+  "6. Search, Vector & Retrieval",
+  "7. AI, RAG & Agents (product)",
+  "8. Eval, Compute & Deployment",
+  "9. Security & Observability",
+] as const;
+
+/** Validate that a technologies.md body contains the core H2 sections. */
+export function validateTechDocumentStructure(techBody: string): {
+  ok: boolean;
+  missingHeadings: string[];
+  hasNineLayerMatrix: boolean;
+  message: string;
+} {
+  const text = (techBody || "").trim();
+  const coreHeadings = [
+    "Technology decisions",
+    "Folder architecture",
+    "Stacks",
+    "Hosting / publish target",
+    "Data persistence",
+    "Schemas / API exposure",
+    "Security",
+    "Development standards",
+  ];
+  const missingHeadings: string[] = [];
+  for (const h of coreHeadings) {
+    const escaped = h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`^##\\s+${escaped}\\b`, "im");
+    if (!re.test(text)) {
+      missingHeadings.push(h);
+    }
+  }
+  const hasNineLayerMatrix =
+    /\|\s*Layer\s*\|\s*Status/i.test(text) ||
+    (/Clients\s*&\s*Interfaces/i.test(text) &&
+      /Security\s*&\s*Observability/i.test(text) &&
+      /\b(adopt|defer|none)\b/i.test(text));
+
+  if (missingHeadings.length > 0) {
+    return {
+      ok: false,
+      missingHeadings,
+      hasNineLayerMatrix,
+      message: `missing required H2 headings: ${missingHeadings.map((h) => `## ${h}`).join(", ")}`,
+    };
+  }
+  return {
+    ok: true,
+    missingHeadings: [],
+    hasNineLayerMatrix,
+    message: "ok",
+  };
+}
+
 export function technologyArchitectPrompt(): string {
   return joinPrompt([
     ROLE_PERSONAS.technologyArchitect,
@@ -459,15 +533,19 @@ export function technologyArchitectPrompt(): string {
     "## Schemas / API exposure",
     "## Security",
     "## Development standards",
-    "Under Technology decisions: pick stack/tools that cover the requirements (≥90% fit) and say why.",
+    "Under Technology decisions: pick stack/tools that cover the requirements (≥90% fit), say why, AND include a compact 9-Layer System Design + AI Stack Matrix table (`| Layer | Status | Choice | Trigger / Notes |` where Status is `adopt`, `defer`, or `none`) covering all 9 layers:",
+    "1. Clients & Interfaces | 2. Edge, DNS & Traffic | 3. APIs & Service Layer | 4. Messaging & Workflows | 5. Data, Storage & Cache | 6. Search, Vector & Retrieval | 7. AI, RAG & Agents (product only — exclude the zteam orchestrator harness) | 8. Eval, Compute & Deployment | 9. Security & Observability.",
+    "Only expand in detail the layers marked `adopt`; keep `none`/`defer` layers to that single table row (zero bloat).",
     "Under Folder architecture: define the project folder layout agents must create and use",
     "(including .docs/, specs, source layout) — concrete tree, not vague folders.",
     "Under Stacks: name frameworks/libraries and why they fit publish/host targets.",
-    "Under Hosting / publish target: where the system is built, published, and hosted (local, Vercel, Docker, etc.).",
-    "Under Data persistence: storage choice (or explicit none) and how data is saved/loaded.",
+    "Under Hosting / publish target: where the system is built, published, and hosted (local, Vercel, Docker, etc.) + Edge/CDN/Compute choice.",
+    "Under Data persistence: DB, Object Storage (e.g. S3 or none), and Cache (e.g. Redis or none) — state explicit none when not needed and how data is saved/loaded.",
     "Under Scalability & growth: how the system should progress as usage grows.",
     "Under Cost-benefit & services: prefer good cost/benefit services for reliable operation; justify paid vs free.",
-    "Under Specialized services: call out queues, email, auth providers, CDN, analytics, etc. — or state none needed yet.",
+    "Under Specialized services: call out queues/workflows (SQS, Kafka, Temporal), search/vector (pgvector, OpenSearch), product AI/RAG, email, CDN, analytics — or state none needed yet.",
+    "Under Schemas / API exposure: API style (REST/GraphQL/gRPC or none), gateway vs direct, and core schemas.",
+    "Under Security: AuthN/AuthZ (OAuth2/OIDC/JWT or none), secrets (env/Vault), and observability (console logs, OpenTelemetry, Prometheus/Grafana, Datadog).",
     "Under Development standards: patterns/conventions that fit the requirements (clean code, naming, testing).",
     "No thinking aloud, no shell commands, no tool calls, no application source code dumps.",
     "After ===TECH===, you MUST answer this self-check (all answers must be yes;",

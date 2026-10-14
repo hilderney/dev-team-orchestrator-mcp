@@ -5,6 +5,7 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { getMetrics } from "./metrics.js";
 import { updatePipelineStage } from "./pipeline-state.js";
+import { emitLiveEvent } from "./live-dashboard.js";
 
 export const ARCHITECTURE_PROGRESS_PATH = ".docs/architecture-progress.json";
 export const MAX_ARCH_EVENTS = 40;
@@ -188,6 +189,13 @@ export async function archNotify(
     await updatePipelineStage(appRoot, {
       stage,
       workflow: undefined,
+    });
+    await emitLiveEvent({
+      appRoot,
+      stage,
+      message: prefixed,
+      status: /FAIL|error/i.test(message) ? "error" : "done",
+      specsTotal: next.specs.count || undefined,
     });
   } catch {
     /* best-effort */

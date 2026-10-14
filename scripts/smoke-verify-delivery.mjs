@@ -209,6 +209,30 @@ const results = [];
     gaps.some((g) => /favorites/i.test(g)),
     "favorites gap"
   );
+  // 9-Layer forward check: RAG/Vector requested in userIdea but missing from tech/specs
+  const ragGaps = findArchitectureCoverageGaps(
+    "Build a RAG chatbot with pgvector semantic search and OAuth2 login",
+    "## Stacks\n- React\n",
+    ["ui-shell"]
+  );
+  assert(
+    ragGaps.some((g) => /Layer 6\/7/i.test(g)),
+    `expected Layer 6/7 gap, got ${ragGaps.join("; ")}`
+  );
+  assert(
+    ragGaps.some((g) => /Layer 9/i.test(g)),
+    `expected Layer 9 gap, got ${ragGaps.join("; ")}`
+  );
+  // 9-Layer reverse check (orphan heavy layer adopted in matrix without spec)
+  const orphanGaps = findArchitectureCoverageGaps(
+    "Simple counter app",
+    "| 4. Messaging & Workflows | adopt | Kafka | event bus |\n",
+    ["counter-ui"]
+  );
+  assert(
+    orphanGaps.some((g) => /orphan layer/i.test(g)),
+    `expected orphan layer gap, got ${orphanGaps.join("; ")}`
+  );
   results.push("architecture gaps");
 }
 

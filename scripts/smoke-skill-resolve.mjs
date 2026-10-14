@@ -79,6 +79,17 @@ assert.equal(stageToSkillPhase("consult:sa->ta"), null);
 }
 
 {
+  const aiSkill = resolveSkillSync({
+    role: "qaEngineer",
+    phase: "tdd-red",
+    projectType: "ai-rag",
+  });
+  assert.ok(aiSkill, "ai-rag tdd-red resolves");
+  assert.equal(aiSkill.key, "qa-tdd-red-ai-rag");
+  assert.match(aiSkill.excerpt, /deterministic mock/i);
+}
+
+{
   const skill = await resolveSkill({
     role: "softwareEngineer",
     phase: "tdd-green",
@@ -138,3 +149,4 @@ assert.ok(
 );
 
 console.log("smoke-skill-resolve: ok");
+process.exit(0);

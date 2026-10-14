@@ -7,7 +7,7 @@
 After SE green: verify API/CRUD contract tests; mark `[x]` only when pass.
 
 ## Must deliver
-- Suite green for contract ACs
+- Suite green for contract ACs (API, DB/Cache persistence, queue/worker idempotency, and Auth 401/403 when in spec)
 - Auth/fail path coverage if in spec
 - Gap tests only when ACs still uncovered
 - `markTodoDone` on pass

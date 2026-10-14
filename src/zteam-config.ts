@@ -10,6 +10,10 @@ import {
   resolveSkillSync,
   stageToSkillPhase,
 } from "./skill-resolve.js";
+import {
+  DASHBOARD_HTML_REL_PATH,
+  ensureLiveDashboardFiles,
+} from "./live-dashboard.js";
 
 /** Orchestrator package root (this MCP server). */
 export const ZTEAM_PACKAGE_ROOT = join(
@@ -265,7 +269,7 @@ export function buildCursorDelegationPlaybook(opts: {
     instructions: string,
     expectedOutputs: string[]
   ): DelegationStage => {
-    let instr = `${instructions}\n\nConstraints: ${rootHint}. Idea: ${idea}`;
+    let instr = `${instructions}\n\nConstraints: ${rootHint}. Idea: ${idea}\n\nLive Canvas Observability (9Router style): Before and after running this stage via Cursor Task, call MCP \`get_pipeline_state\` with \`recordStage="${id}"\`, \`recordRole="${role}"\`, \`recordStatus="start"|"done"\`, and a 1-sentence \`recordMessage\` so \`.zteam/dashboard/index.html\` animates the agent call in real time. In the main Cursor chat, print ONLY the 1-line \`chatBanner\` returned by \`get_pipeline_state\` (keep long logs out of chat).`;
     let skillKey: string | undefined;
     const phase = stageToSkillPhase(id);
     if (phase) {
@@ -449,7 +453,7 @@ export function buildCursorDelegationPlaybook(opts: {
     maxTokens: opts.maxTokens,
     stages,
     resumeHint:
-      "llmRuntime=cursor: run each delegationPlaybook.stages entry via Cursor Task (subagentType + model from stage). Do NOT call 9router. After stages, optionally call run_development_pipeline with the same roots for verify-only / resume if needed.",
+      "llmRuntime=cursor: run each delegationPlaybook.stages entry via Cursor Task (subagentType + model from stage). Do NOT call 9router. Open `.zteam/dashboard/index.html` in a browser for the 9Router-style live canvas animation; before/after each Task call `get_pipeline_state` with `recordStage`/`recordStatus`/`recordMessage` and print ONLY the 1-line `chatBanner` in chat.",
   };
 }
 
@@ -955,13 +959,15 @@ export async function ensureZteamBootstrap(targetDir: string): Promise<{
   readme: Awaited<ReturnType<typeof ensureZteamReadme>>;
   skill: Awaited<ReturnType<typeof ensureZteamSkillCopy>>;
   langgraph: Awaited<ReturnType<typeof ensureZteamLanggraphStudio>>;
+  dashboard: Awaited<ReturnType<typeof ensureLiveDashboardFiles>>;
 }> {
   const dir = join(resolve(targetDir), ".zteam");
   await mkdir(dir, { recursive: true });
   const readme = await ensureZteamReadme(targetDir);
   const skill = await ensureZteamSkillCopy(targetDir);
   const langgraph = await ensureZteamLanggraphStudio(targetDir);
-  return { dir, readme, skill, langgraph };
+  const dashboard = await ensureLiveDashboardFiles(targetDir);
+  return { dir, readme, skill, langgraph, dashboard };
 }
 
 /** Template for client `.zteam/langgraph/dev.mjs` (runs CLI against MCP package). */
@@ -1228,7 +1234,8 @@ export async function ensureZteamSetup(opts: EnsureZteamSetupOpts): Promise<{
       skillResult.workspace.langgraph.dir,
       skillResult.workspace.langgraph.devPath,
       skillResult.workspace.langgraph.packageRootPath,
-      skillResult.workspace.langgraph.readmePath
+      skillResult.workspace.langgraph.readmePath,
+      skillResult.workspace.dashboard.htmlPath
     );
     if (skillResult.workspace.langgraph.mermaid.status !== "missing_source") {
       pathsTouched.push(skillResult.workspace.langgraph.mermaid.path);
@@ -1241,7 +1248,8 @@ export async function ensureZteamSetup(opts: EnsureZteamSetupOpts): Promise<{
         skillResult.app.langgraph.dir,
         skillResult.app.langgraph.devPath,
         skillResult.app.langgraph.packageRootPath,
-        skillResult.app.langgraph.readmePath
+        skillResult.app.langgraph.readmePath,
+        skillResult.app.dashboard.htmlPath
       );
       if (skillResult.app.langgraph.mermaid.status !== "missing_source") {
         pathsTouched.push(skillResult.app.langgraph.mermaid.path);

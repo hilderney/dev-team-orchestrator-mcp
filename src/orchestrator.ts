@@ -136,6 +136,7 @@ import {
   TA_SPEC_ENRICH_SELF_CHECK_KEYS,
   assertSpecUseCasesMinimum,
   technologyArchitectPrompt,
+  validateTechDocumentStructure,
   validateKeyedSelfCheck,
   validateSaRequirementsSelfCheck,
   TA_SELF_CHECK_KEYS,
@@ -186,6 +187,15 @@ import {
   readImplementationProgress,
   setImplementationPhase,
 } from "./implementation-progress.js";
+import {
+  DASHBOARD_HTML_REL_PATH,
+  LIVE_FEED_JS_PATH,
+  emitLiveEvent,
+  ensureLiveDashboardFiles,
+  formatCompactChatLine,
+  readLiveDashboardState,
+  stageToLiveNodeId,
+} from "./live-dashboard.js";
 
 /** Package root (this MCP server repo), resolved from this file. */
 export const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -1259,12 +1269,17 @@ function assertParsedSummaryAndRequirements(text: string, stage: string): void {
 
 function assertParsedTechSummaryAndBody(text: string, stage: string): void {
   assertUsableLlmText(text, stage);
-  if (!parseTechSummaryAndBody(text)) {
+  const parsed = parseTechSummaryAndBody(text);
+  if (!parsed) {
     throw new LlmContentError(
       stage,
       "parse_failed",
       "expected ===SUMMARY=== and ===TECH==="
     );
+  }
+  const structure = validateTechDocumentStructure(parsed.tech);
+  if (!structure.ok) {
+    throw new LlmContentError(stage, "parse_failed", structure.message);
   }
 }
 
@@ -1605,12 +1620,48 @@ async function invokeRoleLlm(
   const progress = getProgress();
   const llm = makeLLM(primary.model, primary.maxTokens);
   const withSkill = await messagesWithActiveSkill(role, messages, opts.stage);
+  const ctx = getRunContext();
+  const cfg = activeTeamConfig();
+  const charsIn = withSkill.reduce(
+    (acc, m) => acc + normalizeMessageContent(m.content).length,
+    0
+  );
+  if (ctx?.appRoot) {
+    await emitLiveEvent({
+      appRoot: ctx.appRoot,
+      stage: opts.stage,
+      role,
+      model: primary.model,
+      status: "start",
+      from: "orchestrator",
+      to: stageToLiveNodeId(opts.stage, role),
+      projectType: cfg.projectType,
+      charsIn,
+      message: `Calling ${role} (${primary.model})`,
+    });
+  }
   try {
     const res = await invokeWithRetry(llm, withSkill, {
       ...opts,
       modelName: primary.model,
       maxTokens: primary.maxTokens,
     });
+    const charsOut = normalizeMessageContent(res.content).length;
+    if (ctx?.appRoot) {
+      await emitLiveEvent({
+        appRoot: ctx.appRoot,
+        stage: opts.stage,
+        role,
+        model: primary.model,
+        status: "done",
+        from: stageToLiveNodeId(opts.stage, role),
+        to: "orchestrator",
+        projectType: cfg.projectType,
+        charsIn,
+        charsOut,
+        message: `${role} responded (${charsOut} chars)`,
+      });
+    }
     return { content: res.content, modelUsed: primary.model, handedOff: false };
   } catch (err) {
     const handoffWorthy =
@@ -1619,6 +1670,18 @@ async function invokeRoleLlm(
       isRetryableNetworkError(err);
     const fb = resolveRoleFallbackModel(activeTeamConfig(), role);
     if (!handoffWorthy || !fb || fb === primary.model) {
+      if (ctx?.appRoot) {
+        await emitLiveEvent({
+          appRoot: ctx.appRoot,
+          stage: opts.stage,
+          role,
+          model: primary.model,
+          status: "error",
+          from: stageToLiveNodeId(opts.stage, role),
+          to: "orchestrator",
+          message: `Error: ${errorText(err).slice(0, 140)}`,
+        });
+      }
       throw err;
     }
     progress.emit(
@@ -1627,12 +1690,39 @@ async function invokeRoleLlm(
       `handoff ${role}: primary ${primary.model} → fallback agent ${fb}`
     );
     recordRetry("model_handoff");
+    if (ctx?.appRoot) {
+      await emitLiveEvent({
+        appRoot: ctx.appRoot,
+        stage: opts.stage,
+        role,
+        model: fb,
+        status: "warn",
+        from: "orchestrator",
+        to: stageToLiveNodeId(opts.stage, role),
+        message: `Handoff ${primary.model} → ${fb}`,
+      });
+    }
     const llm2 = makeLLM(fb, primary.maxTokens);
     const res = await invokeWithRetry(llm2, withSkill, {
       ...opts,
       modelName: fb,
       maxTokens: primary.maxTokens,
     });
+    const charsOut = normalizeMessageContent(res.content).length;
+    if (ctx?.appRoot) {
+      await emitLiveEvent({
+        appRoot: ctx.appRoot,
+        stage: opts.stage,
+        role,
+        model: fb,
+        status: "done",
+        from: stageToLiveNodeId(opts.stage, role),
+        to: "orchestrator",
+        charsIn,
+        charsOut,
+        message: `${role} fallback (${fb}) responded (${charsOut} chars)`,
+      });
+    }
     return { content: res.content, modelUsed: fb, handedOff: true };
   }
 }
@@ -1723,6 +1813,20 @@ async function consultTeammate(opts: {
         "notify",
         `consult ok (${opts.asker}←${opts.advisor}, ${text.length} chars)`
       );
+      const ctx = getRunContext();
+      if (ctx?.appRoot) {
+        await emitLiveEvent({
+          appRoot: ctx.appRoot,
+          stage,
+          role: opts.advisor,
+          model: advisor.model,
+          status: "consult",
+          from: stageToLiveNodeId(stage, opts.asker),
+          to: stageToLiveNodeId(stage, opts.advisor),
+          charsOut: text.length,
+          message: `Consult ${opts.asker} → ${opts.advisor} (${text.length} chars)`,
+        });
+      }
     }
     return text;
   } catch (err) {
@@ -6045,7 +6149,7 @@ server.tool(
 
 server.tool(
   "get_pipeline_state",
-  "Read .docs/pipeline-state.json for a projectRoot (debug / resume).",
+  "Read (or push a live subagent event to) `.docs/pipeline-state.json` + `.zteam/dashboard/index.html` (9Router Canvas live view). When running Cursor Task subagents, pass `recordStage` + `recordMessage` (`recordStatus`: start|done|error) to animate the HTML dashboard while keeping only `chatBanner` (1 short line) in chat.",
   {
     workspaceRoot: workspaceRootArg,
     projectRoot: z
@@ -6053,22 +6157,92 @@ server.tool(
       .optional()
       .default(".")
       .describe("Relative project folder under workspaceRoot"),
+    recordStage: z
+      .string()
+      .optional()
+      .describe("Optional stage id to push into the live HTML dashboard (e.g. sa-requirements, qa-tdd-red, se-implement)"),
+    recordRole: z
+      .string()
+      .optional()
+      .describe("Optional role id (systemArchitect | uiUxDesigner | technologyArchitect | qaEngineer | softwareEngineer)"),
+    recordStatus: z
+      .enum(["start", "done", "error", "warn", "info"])
+      .optional()
+      .describe("Animation direction: start (Orchestrator -> Agent) or done/error (Agent -> Orchestrator)"),
+    recordMessage: z
+      .string()
+      .optional()
+      .describe("Short summary of what the subagent is doing or delivered"),
+    skillKey: z.string().optional().describe("Active role skill key if any"),
+    filesCount: z.number().optional().describe("Number of files written in this step"),
   },
-  async ({ workspaceRoot, projectRoot }) => {
+  async ({
+    workspaceRoot,
+    projectRoot,
+    recordStage,
+    recordRole,
+    recordStatus,
+    recordMessage,
+    skillKey,
+    filesCount,
+  }) => {
     const resolved = mcpResolveWorkspace(workspaceRoot);
     if (!resolved.ok) return resolved.result;
     const ws = resolved.ws;
     const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
     assertSafeAppRoot(appRoot, projectRoot || ".");
-    const state = await readPipelineState(appRoot);
+    const dashFiles = await ensureLiveDashboardFiles(appRoot);
+
+    if (recordStage) {
+      await updatePipelineStage(appRoot, { stage: recordStage });
+      await emitLiveEvent({
+        appRoot,
+        stage: recordStage,
+        role: recordRole,
+        skillKey,
+        status: recordStatus || "info",
+        message: recordMessage || `${recordStage} (${recordStatus || "info"})`,
+        filesCount,
+      });
+    }
+
+    const [state, live] = await Promise.all([
+      readPipelineState(appRoot),
+      readLiveDashboardState(appRoot),
+    ]);
+    const activeStage = recordStage || state?.stage || live?.activeStage || "idle";
+    const chatBanner = formatCompactChatLine({
+      workflow: state?.workflow || live?.workflow || "full",
+      stage: activeStage,
+      role: recordRole,
+      skillKey,
+      message:
+        recordMessage ||
+        live?.events?.[0]?.message ||
+        "Dashboard ready",
+      specsDone: live?.kpis?.specsDone,
+      specsTotal: live?.kpis?.specsTotal,
+    });
+
     return {
       content: [
         {
           type: "text" as const,
           text: JSON.stringify(
-            state || {
-              ok: false,
-              message: "no pipeline-state.json",
+            {
+              ok: Boolean(state || live),
+              chatBanner,
+              dashboardHtml: dashFiles.htmlPath,
+              liveFeedJs: dashFiles.liveJsPath,
+              state: state || null,
+              liveSummary: live
+                ? {
+                    activeStage: live.activeStage,
+                    activeNode: live.activeNode,
+                    kpis: live.kpis,
+                    recentEvents: (live.events || []).slice(0, 6),
+                  }
+                : null,
               workspace: diagnoseWorkspace(ws.root, ws.source),
               appRoot,
             },
