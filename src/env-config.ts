@@ -22,6 +22,20 @@ export const MCP_DOTENV_PATH = join(MCP_PACKAGE_ROOT, ".env");
 let dotenvLoaded = false;
 
 /**
+ * In-memory base URL for the current process when the configured tunnel is dead
+ * and the local 9router accepted the same key. Never written back to `.env`.
+ */
+let runtimeBaseUrlOverride: string | null = null;
+
+export function setRuntimeBaseUrlOverride(url: string | null): void {
+  runtimeBaseUrlOverride = url ? url.replace(/\/$/, "") : null;
+}
+
+export function getRuntimeBaseUrlOverride(): string | null {
+  return runtimeBaseUrlOverride;
+}
+
+/**
  * Load `dev-team-orchestrator/.env` (and optional `workspaceRoot/.env` fallback)
  * without throwing if `.env` is absent.
  */
@@ -82,6 +96,16 @@ export function resolveLlmEndpoint(
   preferredGateway?: string
 ): ResolvedLlmEndpoint {
   ensurePackageEnvLoaded();
+  const resolved = resolveLlmEndpointFromEnv(preferredGateway);
+  if (runtimeBaseUrlOverride) {
+    return { ...resolved, baseUrl: runtimeBaseUrlOverride };
+  }
+  return resolved;
+}
+
+function resolveLlmEndpointFromEnv(
+  preferredGateway?: string
+): ResolvedLlmEndpoint {
   const pref = (
     preferredGateway ||
     process.env.ZTEAM_LLM_GATEWAY ||

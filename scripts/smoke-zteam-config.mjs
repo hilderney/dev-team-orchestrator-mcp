@@ -921,6 +921,114 @@ try {
     }
   }
 
+  // --- Gateway doctor: dead tunnel fallback, 401, missing model (no real network) ---
+  {
+    const { diagnoseLlmGateway } = await import("../src/gateway-doctor.ts");
+    const { setRuntimeBaseUrlOverride } = await import("../src/env-config.ts");
+    const prevBase = process.env.NINEROUTER_BASE;
+    const prevKey = process.env.NINEROUTER_KEY;
+    const prevGateway = process.env.ZTEAM_LLM_GATEWAY;
+    delete process.env.ZTEAM_LLM_GATEWAY;
+    process.env.NINEROUTER_KEY = "sk-test-key-abcd";
+
+    /** @param {Record<string, { status?: number, json?: unknown, text?: string, error?: string }>} routes */
+    function mockFetch(routes) {
+      return async (url) => {
+        const hit = routes[String(url)];
+        if (!hit) throw new Error(`getaddrinfo ENOTFOUND ${url}`);
+        if (hit.error) throw new Error(hit.error);
+        const body =
+          hit.text ?? (hit.json ? JSON.stringify(hit.json) : "");
+        return {
+          ok: (hit.status ?? 500) >= 200 && (hit.status ?? 500) < 300,
+          status: hit.status ?? 500,
+          text: async () => body,
+        };
+      };
+    }
+
+    try {
+      process.env.NINEROUTER_BASE = "https://dead-tunnel.example/v1";
+      const fallback = await diagnoseLlmGateway({
+        requiredModelIds: ["9r-code-heavy", "9r-code-light"],
+        timeoutMs: 500,
+        fetchImpl: mockFetch({
+          "https://dead-tunnel.example/v1/models": {
+            status: 530,
+            text: "Error 530 cloudflare",
+          },
+          "http://127.0.0.1:20128/v1/models": {
+            status: 200,
+            json: {
+              data: [{ id: "9r-code-heavy" }, { id: "9r-code-light" }],
+            },
+          },
+        }),
+      });
+      assert(
+        fallback.ok && fallback.usedLocalFallback,
+        "dead tunnel falls back to localhost when the same key is accepted"
+      );
+      assert(
+        fallback.effectiveBaseUrl === "http://127.0.0.1:20128/v1",
+        `effective base is local, got ${fallback.effectiveBaseUrl}`
+      );
+      assert(
+        !JSON.stringify(fallback).includes("sk-test-key-abcd"),
+        "doctor output must not contain the API key"
+      );
+      assert(
+        fallback.keyHint.endsWith("abcd"),
+        `key hint is last 4, got ${fallback.keyHint}`
+      );
+
+      const auth = await diagnoseLlmGateway({
+        timeoutMs: 500,
+        fetchImpl: mockFetch({
+          "https://dead-tunnel.example/v1/models": {
+            error: "getaddrinfo ENOTFOUND dead-tunnel.example",
+          },
+          "http://127.0.0.1:20128/v1/models": {
+            status: 401,
+            text: "unauthorized",
+          },
+        }),
+      });
+      assert(
+        !auth.ok && auth.failureKind === "gateway_auth",
+        `local 401 is gateway_auth, got ${auth.failureKind}`
+      );
+
+      process.env.NINEROUTER_BASE = "http://127.0.0.1:20128/v1";
+      const missing = await diagnoseLlmGateway({
+        requiredModelIds: ["9r-code-heavy"],
+        timeoutMs: 500,
+        fetchImpl: mockFetch({
+          "http://127.0.0.1:20128/v1/models": {
+            status: 200,
+            json: { data: [{ id: "9r-code-light" }] },
+          },
+        }),
+      });
+      assert(
+        !missing.ok && missing.failureKind === "invalid_model",
+        `missing 9r-code-heavy is invalid_model, got ${missing.failureKind}`
+      );
+      assert(
+        missing.sampleModelIds.includes("9r-code-light"),
+        "sampleModelIds lists the 9r ids that exist"
+      );
+    } finally {
+      setRuntimeBaseUrlOverride(null);
+      if (prevBase === undefined) delete process.env.NINEROUTER_BASE;
+      else process.env.NINEROUTER_BASE = prevBase;
+      if (prevKey === undefined) delete process.env.NINEROUTER_KEY;
+      else process.env.NINEROUTER_KEY = prevKey;
+      if (prevGateway === undefined) delete process.env.ZTEAM_LLM_GATEWAY;
+      else process.env.ZTEAM_LLM_GATEWAY = prevGateway;
+    }
+  }
+
   console.log("smoke:zteam-config OK");
 } finally {
   if (prevWs === undefined) delete process.env.WORKSPACE_ROOT;

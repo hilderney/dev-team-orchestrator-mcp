@@ -1,7 +1,9 @@
 /**
  * 9router / OmniRoute / OpenRouter healthcheck (P1-4).
+ * Classification (401 vs tunnel vs local fallback) lives in gateway-doctor.
  */
-import { resolveLlmEndpoint } from "./env-config.js";
+import { getRuntimeBaseUrlOverride, resolveLlmEndpoint } from "./env-config.js";
+import { diagnoseLlmGateway } from "./gateway-doctor.js";
 
 export type HealthcheckResult = {
   ok: boolean;
@@ -9,6 +11,7 @@ export type HealthcheckResult = {
   status?: number;
   gateway?: string;
   baseUrl?: string;
+  failureKind?: string;
   message: string;
 };
 
@@ -40,97 +43,21 @@ export async function healthcheckNineRouter(
   }
 
   const ep = resolveLlmEndpoint(opts?.gateway);
-  const rawEnvBase = (
-    baseUrl ||
-    process.env.NINEROUTER_BASE ||
-    process.env.OMNIROUTE_BASE ||
-    process.env.OPENROUTER_BASE ||
-    process.env.OPENAI_BASE_URL ||
-    (process.env.OPENROUTER_API_KEY ? ep.baseUrl : "")
-  ).replace(/\/$/, "");
-
-  if (!rawEnvBase) {
-    const result: HealthcheckResult = {
-      ok: false,
-      ms: 0,
-      gateway: ep.gateway,
-      message: `NINEROUTER_BASE not set — ${TUNNEL_HINT}`,
-    };
-    return result;
-  }
-
-  const url = `${rawEnvBase}/models`;
-  const started = Date.now();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const res = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${ep.apiKey || "none"}`,
-        ...ep.defaultHeaders,
-      },
-    });
-    const ms = Date.now() - started;
-    const text = await res.text().catch(() => "");
-    const cloudflareDown =
-      /error code 1016|Error 530|cloudflare/i.test(text) ||
-      res.status === 530 ||
-      res.status === 502;
-
-    if (cloudflareDown) {
-      const result: HealthcheckResult = {
-        ok: false,
-        ms,
-        status: res.status,
-        gateway: ep.gateway,
-        baseUrl: rawEnvBase,
-        message: `${ep.gateway} tunnel/DNS down (Cloudflare ${res.status}/1016) in ${ms}ms — ${TUNNEL_HINT}`,
-      };
-      cached = { at: now, result };
-      return result;
-    }
-
-    if (!res.ok && res.status >= 500) {
-      const result: HealthcheckResult = {
-        ok: false,
-        ms,
-        status: res.status,
-        gateway: ep.gateway,
-        baseUrl: rawEnvBase,
-        message: `${ep.gateway} unhealthy HTTP ${res.status} in ${ms}ms — ${TUNNEL_HINT}`,
-      };
-      cached = { at: now, result };
-      return result;
-    }
-
-    const result: HealthcheckResult = {
-      ok: true,
-      ms,
-      status: res.status,
-      gateway: ep.gateway,
-      baseUrl: rawEnvBase,
-      message: `${ep.gateway} ok HTTP ${res.status} in ${ms}ms`,
-    };
-    cached = { at: now, result };
-    return result;
-  } catch (err) {
-    const ms = Date.now() - started;
-    const msg = err instanceof Error ? err.message : String(err);
-    const result: HealthcheckResult = {
-      ok: false,
-      ms,
-      gateway: ep.gateway,
-      baseUrl: rawEnvBase,
-      message: `${ep.gateway} healthcheck failed in ${ms}ms: ${msg} — ${TUNNEL_HINT}`,
-    };
-    cached = { at: now, result };
-    return result;
-  } finally {
-    clearTimeout(timer);
-  }
+  const doctor = await diagnoseLlmGateway({ timeoutMs });
+  const ms = doctor.probes.reduce((sum, probe) => sum + probe.ms, 0);
+  const result: HealthcheckResult = {
+    ok: doctor.ok,
+    ms,
+    status: doctor.probes.at(-1)?.status,
+    gateway: ep.gateway,
+    baseUrl: doctor.effectiveBaseUrl,
+    failureKind: doctor.failureKind,
+    message: doctor.ok
+      ? doctor.message
+      : `${doctor.message} — ${TUNNEL_HINT}`,
+  };
+  cached = { at: now, result };
+  return result;
 }
 
 export function shouldHealthcheckForWorkflow(workflow: string): boolean {
@@ -145,6 +72,7 @@ export async function listNineRouterModelIds(
   const ep = resolveLlmEndpoint(opts?.gateway);
   const base = (
     baseUrl ||
+    getRuntimeBaseUrlOverride() ||
     process.env.NINEROUTER_BASE ||
     process.env.OMNIROUTE_BASE ||
     process.env.OPENROUTER_BASE ||

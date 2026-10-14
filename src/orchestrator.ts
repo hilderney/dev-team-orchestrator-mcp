@@ -3,6 +3,10 @@ import {
   ensurePackageEnvLoaded,
   resolveLlmEndpoint,
 } from "./env-config.js";
+import {
+  diagnoseLlmGateway,
+  summarizeGatewayDoctor,
+} from "./gateway-doctor.js";
 import { spawn } from "node:child_process";
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import {
@@ -66,12 +70,6 @@ import {
   unmarkTodoSlugs,
   verifyDelivery,
 } from "./verify-delivery.js";
-import {
-  healthcheckNineRouter,
-  listNineRouterModelIds,
-  missingNineRouterModels,
-  shouldHealthcheckForWorkflow,
-} from "./healthcheck.js";
 import {
   coercePathForContent,
   extractWriteFileToolCalls,
@@ -164,6 +162,7 @@ import {
   resolveRoleFallbackModel,
   writeTeamConfig,
   resolveTeamRuntime,
+  isCursorModelAlias,
   buildCursorDelegationPlaybook,
   writeZteamConfigToolShape,
   getPipelineStateToolShape,
@@ -5823,48 +5822,55 @@ server.tool(
             assertExpectedWorkspace(ws.root);
             assertPathInsideWorkspace(ws.root, appRoot);
 
-            if (shouldHealthcheckForWorkflow(explicit || "full")) {
-              const health = await healthcheckNineRouter();
-              session.emit(
-                "pipeline",
-                health.ok ? "notify" : "error",
-                health.message
-              );
-              if (!health.ok) {
-                const err = new Error(health.message);
-                (err as Error & { failureKind?: string }).failureKind =
-                  "healthcheck";
-                throw err;
-              }
-            }
-
-            {
-              const listed = await listNineRouterModelIds();
-              if (!listed.ok) {
-                const err = new Error(
-                  `Could not list 9router models: ${listed.message}`
-                );
-                (err as Error & { failureKind?: string }).failureKind =
-                  "invalid_model";
-                throw err;
-              }
-              const missing = missingNineRouterModels(
-                teamConfig,
-                listed.ids
-              );
-              if (missing.length > 0) {
-                const err = new Error(
-                  `Models not found on 9router: ${missing.join("; ")}`
-                );
-                (err as Error & { failureKind?: string }).failureKind =
-                  "invalid_model";
-                throw err;
-              }
-              session.emit(
-                "pipeline",
-                "notify",
-                `models validated against 9router (${listed.message})`
-              );
+            const requiredModelIds = [
+              ...new Set(
+                (
+                  [
+                    "systemArchitect",
+                    "technologyArchitect",
+                    "uiUxDesigner",
+                    "softwareEngineer",
+                    "qaEngineer",
+                  ] as const
+                )
+                  .map((role) => teamConfig.models[role]?.trim() || "")
+                  .filter(
+                    (id) => id && !isCursorModelAlias(id)
+                  )
+              ),
+            ];
+            const doctor = await diagnoseLlmGateway({ requiredModelIds });
+            session.emit(
+              "pipeline",
+              doctor.ok ? "notify" : "error",
+              doctor.message
+            );
+            if (!doctor.ok) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: JSON.stringify(
+                      {
+                        ok: false,
+                        failureKind: doctor.failureKind,
+                        error: doctor.message,
+                        resumeHint: doctor.resumeHint,
+                        gatewayDoctor: summarizeGatewayDoctor(doctor),
+                        appRoot,
+                        workspaceRoot: ws.root,
+                        projectRoot: root,
+                        models: teamConfig.models,
+                        notifications: session.lines,
+                        ms: Date.now() - started,
+                      },
+                      null,
+                      2
+                    ),
+                  },
+                ],
+                isError: true,
+              };
             }
 
             const result = await compiledGraph.invoke(
@@ -6002,6 +6008,26 @@ server.tool(
     const bootstrap = await ensureZteamBootstrapRoots(ws.root, appRoot);
     const teamConfig = await loadTeamConfig(ws.root, appRoot);
     const runtimeRes = resolveTeamRuntime(teamConfig);
+    const gatewayDoctor = summarizeGatewayDoctor(
+      await diagnoseLlmGateway({
+        requiredModelIds: [
+          ...new Set(
+            (
+              [
+                "systemArchitect",
+                "technologyArchitect",
+                "uiUxDesigner",
+                "softwareEngineer",
+                "qaEngineer",
+              ] as const
+            )
+              .map((role) => teamConfig.models[role]?.trim() || "")
+              .filter((id) => id && !isCursorModelAlias(id))
+          ),
+        ],
+        timeoutMs: 4_000,
+      })
+    );
     const ep = resolveLlmEndpoint();
     const payload = {
       ok: true,
@@ -6022,6 +6048,7 @@ server.tool(
         sourceEnvKey: ep.sourceEnvKey,
         packageDotenvPath: MCP_DOTENV_PATH,
       },
+      gatewayDoctor,
       runtimeError: runtimeRes.ok
         ? null
         : {

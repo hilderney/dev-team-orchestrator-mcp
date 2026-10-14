@@ -713,7 +713,7 @@ To use your **9router**, **OmniRoute**, or **OpenRouter** models across roles sa
 1. **Credentials in `dev-team-orchestrator/.env` (NEVER in `~/.cursor/mcp.json`):**
    - `src/env-config.ts` loads `c:\Users\htzc\mcp-servers\dev-team-orchestrator\.env` via an explicit absolute path (`import.meta.url`), regardless of Cursor's working directory when spawning `npx tsx`.
    - Copy `.env.example` to `.env` and set the **same OpenAI-compatible Base URL + API key** used in Cursor's OpenAPI override:
-     - **9Router:** `NINEROUTER_BASE=https://.../v1` and `NINEROUTER_KEY=sk-...`
+     - **9Router (local app):** `NINEROUTER_BASE=http://127.0.0.1:20128/v1` and `NINEROUTER_KEY` copied from the 9router UI (not from its SQLite file)
      - **OmniRoute:** `OMNIROUTE_BASE=https://.../v1` and `OMNIROUTE_KEY=sk-...` (or `ZTEAM_LLM_GATEWAY=omniroute`)
      - **OpenRouter:** `OPENROUTER_API_KEY=sk-or-v1-...` (defaults to `https://openrouter.ai/api/v1`)
    - Keep `~/.cursor/mcp.json` free of secrets (`"env": { "NODE_NO_WARNINGS": "1" }`).
@@ -725,6 +725,16 @@ To use your **9router**, **OmniRoute**, or **OpenRouter** models across roles sa
 | **Path A (`cursor-task` or `hybrid` with 1 model / `inherit`)** | Cursor `Task` (`llmRuntime="cursor"`) | Every `stage.model` is `"inherit"` (or an allowlisted `cursorModels` slug) and `stage.requestedModel` keeps the `9r-*` ID. Select `9r-code-heavy` in the Cursor parent chat picker → all `Task(model="inherit")` subagents run on `9r-code-heavy`. |
 | **Path B (`ninerouter-direct` or `hybrid` with heavy ≠ light)** | MCP Role-Agents (`llmRuntime="ninerouter"`) | When roles use distinct custom models (e.g. `SA/TA/SE = 9r-code-heavy` and `UX/QA = 9r-code-light`), MCP runs isolated LangGraph role-agents via `ChatOpenAI` against the `.env` gateway. |
 
+Before Path B starts, `diagnoseLlmGateway` probes `GET {NINEROUTER_BASE}/models` and, only when that remote URL is a dead tunnel, `http://127.0.0.1:20128/v1/models` with the same key. The `.env` file is not rewritten. `get_zteam_config.gatewayDoctor` and a failed `run_development_pipeline` use these `failureKind` values:
+
+| Result | `failureKind` | Meaning |
+|---|---|---|
+| Configured base returns 200 and lists the role ids | — | Pipeline continues. |
+| Tunnel is dead (530 / 1016 / DNS) and localhost accepts the same key | — (`usedLocalFallback: true`) | This run uses `http://127.0.0.1:20128/v1`. Update `NINEROUTER_BASE`. |
+| Local 9router returns 401/403 | `gateway_auth` | Process is up; replace `NINEROUTER_KEY` with the key from the 9router UI. |
+| Nothing answers | `gateway_down` | Start 9router on port 20128 or fix `NINEROUTER_BASE`. |
+| 200 but `9r-code-heavy` / `9r-code-light` are absent | `invalid_model` | Create those combo ids. `sampleModelIds` lists `9r*` ids that do exist. |
+
 While the pipeline runs (MCP tool or CLI):
 
 - **stage** start/done with pending-spec hints
@@ -732,7 +742,7 @@ While the pipeline runs (MCP tool or CLI):
 - **partial** truncated preview after a heartbeat if stream text is interesting (`===FILE===` / section markers)
 - MCP: `notifications/message` (logging) + `notifications/progress` when the client sends `progressToken`
 - CLI: same lines on **stderr**; final `notifications[]` matches the live log
-- Pre-pipeline **healthcheck** on 9router/tunnel for `full`/`docs`/`feature` (&lt;30s fail-fast)
+- Pre-pipeline **gateway doctor** (`gateway_auth` / `gateway_down` / `invalid_model`) before the graph on the 9router path
 
 ## CLI
 

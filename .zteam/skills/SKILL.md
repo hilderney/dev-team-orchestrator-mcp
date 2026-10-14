@@ -47,6 +47,20 @@ To run your 9router / OmniRoute / OpenRouter models across isolated team roles, 
 | **Path A — Cursor Task (`inherit`)** | `provider: "cursor-task"`, OR all primaries are `"inherit"`, OR all 5 roles share **one** custom model (e.g. all `9r-code-heavy` with `provider: "hybrid"`) | **`cursor`** | MCP returns `delegationPlaybook` where every `stage.model` is `"inherit"` (or an allowlisted `cursorModels` slug) and `stage.requestedModel` records the desired `9r-*` id. Select `9r-code-heavy` in the Cursor parent chat picker → all `Task(model: "inherit")` subagents run on `9r-code-heavy`! |
 | **Path B — MCP Role-Agents (`.env` Gateway)** | `provider: "ninerouter-direct"`, OR `provider: "hybrid"` with **multiple distinct** custom models across roles (e.g. `SA/TA/SE = 9r-code-heavy`, `UX/QA = 9r-code-light`) | **`ninerouter`** | MCP runs LangGraph role-agents via `ChatOpenAI` directly against the OpenAI-compatible gateway configured in `dev-team-orchestrator/.env` (`NINEROUTER_BASE`/`NINEROUTER_KEY`, `OMNIROUTE_*`, or `OPENROUTER_API_KEY`). Secrets stay in `.env`, **never** in `~/.cursor/mcp.json`. |
 
+### Gateway doctor (before any Path B run)
+
+`get_zteam_config` returns `gatewayDoctor`. `run_development_pipeline` on `llmRuntime=ninerouter` stops **before** the graph when the gateway is not usable.
+
+| `gatewayDoctor.failureKind` | What you tell the user | What you must not do |
+|---|---|---|
+| *(absent, `ok: true`)* | Continue. If `usedLocalFallback` is true, say this run used `http://127.0.0.1:20128/v1` because the configured tunnel is dead, and they should set `NINEROUTER_BASE` to that URL. | — |
+| `gateway_auth` | 9router is up but rejected `NINEROUTER_KEY` (hint is only the last 4 characters). Copy the API key from the **9router UI** and set `NINEROUTER_BASE=http://127.0.0.1:20128/v1`. | Do not read `%AppData%\\Roaming\\9router` SQLite. That `key` column is not a Bearer token. |
+| `gateway_down` | Open the 9router app on port 20128, or point `NINEROUTER_BASE` at a host that answers `GET /v1/models`. | Do not probe random trycloudflare hostnames. |
+| `invalid_model` | The gateway is up and is missing the role ids (`9r-code-heavy` / `9r-code-light`). Quote `sampleModelIds`. | Do not start the pipeline. |
+| `missing_env_credentials` | Fill `dev-team-orchestrator/.env` from `.env.example`. | Do not put the key in `mcp.json`. |
+
+If `gatewayDoctor.ok === false`, stop. Do not start the game pipeline.
+
 ### After `run_development_pipeline` (Path A: `llmRuntime === "cursor"`) — 2-Wave Playbook, Mechanical Gates & Live Canvas Dashboard
 
 When `run_development_pipeline` runs on `llmRuntime="cursor"`, it writes `.docs/host.json` (Node/SQLite/native-compile probe), `.zteam/dashboard/index.html`, and returns a **2-wave `delegationPlaybook`**:
