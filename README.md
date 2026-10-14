@@ -688,7 +688,13 @@ Hard guard: refuses to write when `projectRoot` is `.` and `appRoot` equals the 
 
 ## Live progress & 9Router-style Canvas Dashboard (`.zteam/dashboard/index.html`)
 
-Every bootstrapped project automatically gets **`.zteam/dashboard/index.html`** — a self-contained dark Canvas UI inspired by the **9Router overview** that works directly from disk (`file://`, zero web server required):
+Every bootstrapped project automatically gets **`.zteam/dashboard/index.html`** — a self-contained dark Canvas UI inspired by the **9Router overview** that works directly from disk (`file://`, zero web server required).
+
+**Open while the pipeline runs:** from the project folder (e.g. `samples/pacman-z2`), open `.zteam/dashboard/index.html` in a browser. The page polls `.docs/zteam-live.js` (~1s); no local server needed.
+
+![zTeam Live Orchestrator — example during a full pipeline run (pacman-z2)](.docs/images/zteam-live-dashboard-example.png)
+
+*Example: active System Architect (`sa-todo-and-specs`), KPI cards, radial agent canvas, and recent activity feed.*
 
 - **Animated Radial Canvas:** central `zTeam Orchestrator` hub firing glowing Bézier particles to/from `System Architect`, `UI/UX Designer`, `Tech Architect`, `QA TDD Red`, `Software Engineer`, `QA TDD Verify`, and `Critics & Gates` as each agent is called or consults a teammate.
 - **Top KPI Cards:** *Total Events*, *Payload Chars In*, *Specs Progress*, *Output Chars*, and *Retries / Fixes*.
