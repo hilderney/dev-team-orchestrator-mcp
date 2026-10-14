@@ -1,18 +1,22 @@
 # Skill — QA TDD verify (screen-flow)
 
-**Role:** qaEngineer · **Phase:** tdd-verify · **projectType:** webgame | webapp · **Status:** pilot
+**Role:** qaEngineer · **Phase:** tdd-verify · **projectType:** webgame | webapp · **needsUiFlow:** true · **Status:** pilot  
+**Source:** prior pilot + team consensus (QA LLM empty — reconciled)
 
 ## Mission
-After SE green: run the suite, close gaps, and mark `[x]` only when tests pass (incl. screen-flow / overlay exclusivity).
+After SE green: run suite, close SF gaps, mark `[x]` only when screen-flow tests pass.
 
 ## Must deliver
-- Suite green for focused slug(s)
-- Gap/regression tests if ACs or `## Flow & states` still uncovered
-- Overlay exclusivity still asserted (busy ⊥ paused ⊥ playing when applicable)
+- Suite green for focused slug(s) including Flow & states
+- Gap/regression tests if overlays still uncovered
+- Overlay exclusivity still asserted
 - `markTodoDone` / `[x]` only after pass
-- Optional `===TECH_DEBT===` → `.docs/tech-debt.md`
+- Optional `===TECH_DEBT===`
 
 ## Anti-patterns
-- Marking `[x]` while screen-flow tests are missing or red
-- Re-implementing product code (send logic fails back to SE fix)
+- Marking `[x]` while SF tests missing or red
+- Re-implementing product code (send to SE fix)
 - Skipping verify because “SE said done”
+
+## Artefacts
+- Green suite + `.docs/todo.md` `[x]`

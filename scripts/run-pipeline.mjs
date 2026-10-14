@@ -19,6 +19,8 @@ const WORKFLOW_ALIASES = new Set([
   "punch",
   "fix",
   "resume",
+  "tests",
+  "analyze",
 ]);
 
 function parseArgs(argv) {
@@ -27,6 +29,9 @@ function parseArgs(argv) {
   let workspaceRoot = "";
   let workflow = "";
   let skipConfigGate = false;
+  let slug = "";
+  let role = "";
+  let scope = "";
   const ideaParts = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -63,6 +68,30 @@ function parseArgs(argv) {
       workspaceRoot = a.slice("--workspace-root=".length) || "";
       continue;
     }
+    if (a === "--slug") {
+      slug = (argv[++i] || "").trim();
+      continue;
+    }
+    if (a.startsWith("--slug=")) {
+      slug = a.slice("--slug=".length).trim();
+      continue;
+    }
+    if (a === "--role") {
+      role = (argv[++i] || "").trim();
+      continue;
+    }
+    if (a.startsWith("--role=")) {
+      role = a.slice("--role=".length).trim();
+      continue;
+    }
+    if (a === "--scope") {
+      scope = (argv[++i] || "").trim();
+      continue;
+    }
+    if (a.startsWith("--scope=")) {
+      scope = a.slice("--scope=".length).trim();
+      continue;
+    }
     ideaParts.push(a);
   }
 
@@ -78,6 +107,9 @@ function parseArgs(argv) {
     projectRoot,
     workspaceRoot,
     skipConfigGate,
+    slug,
+    role,
+    scope,
     userIdea: ideaParts.join(" ").trim(),
   };
 }
@@ -105,6 +137,9 @@ async function main() {
     projectRoot,
     workspaceRoot: workspaceArg,
     skipConfigGate,
+    slug,
+    role,
+    scope,
     userIdea: ideaArg,
   } = parseArgs(process.argv.slice(2));
   const userIdea = ideaArg || DEFAULT_IDEA;
@@ -209,6 +244,7 @@ async function main() {
       {
         workspaceRoot: ws.root,
         workspaceSource: ws.source,
+        appRoot,
         teamConfig,
       },
       () =>
@@ -230,6 +266,10 @@ async function main() {
               pendingSpecs: [],
               completedSpecs: [],
               pendingQaSpecs: [],
+              pendingTddRedSpecs: [],
+              focusSlug: (slug || "").trim(),
+              analyzeRole: (role || "").trim(),
+              analyzeScope: (scope || slug || "").trim(),
               qaFixRound: 0,
               deliveryFixRound: 0,
               deliveryVerifyFeedback: "",

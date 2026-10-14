@@ -27,12 +27,13 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
 | **`@zteam/tests`** | Só testes (TDD red → verify) para um requisito. | `run_development_pipeline` com `workflow: "tests"` + `slug` |
 | **`@zteam`** / **`/zteam`** | Pipeline completo ou o workflow que pedires (`full` \| `docs` \| `feature` \| `punch` \| `fix` \| `resume` \| `tests` \| `analyze`). | `run_development_pipeline` (ou Task playbook se runtime=cursor) |
 | **`ensure_zteam_setup`** | Stubs skill + `.docs` (+ template config opcional), sem LLM. | MCP `ensure_zteam_setup` |
+| **LangGraph Studio** | Topologia do pipeline (nós/edges). `node .zteam/langgraph/dev.mjs` | Agent Server no pacote MCP |
 
 ### Exemplos
 
 ```text
 @zteam/models
-→ mostra modelos atuais + defaults → pergunta SA/TA/UX/SE/QA/fallback → grava .zteam/config.json
+→ mostra modelos atuais + defaults → pergunta SA/TA/SE/QA/fallback → grava .zteam/config.json
 
 @zteam/config
 → pergunta modelos / escopo / maxTokens → grava .zteam/config.json (+ .gitignore para config)
@@ -40,14 +41,15 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
 @zteam/documentation samples/pacman — canvas TS, infinite lives
 → workflow=docs, projectRoot=samples/pacman
 
-@zteam/tests samples/pacman — slug=screens-flow
-→ workflow=tests + slug, projectRoot=samples/pacman
+@zteam/tests samples/pacman
+→ analisa specs/código e corre pipeline de testes
 
 @zteam build a todo API in samples/todo-api
 → auto ou full/feature conforme contexto
-```
 
-**TDD (implementação):** QA-red (testes a falhar) → SE green (sem `[x]`) → delivery critic → QA-verify (`markTodoDone` só aqui).
+node .zteam/langgraph/dev.mjs
+→ sobe Agent Server no pacote MCP; abre Studio (topologia SA/TA/SE/QA), não traces ao vivo
+```
 
 ## Ficheiros
 
@@ -56,7 +58,20 @@ Use estes atalhos no chat Cursor (skill `zteam` / `@zteam`). O agent **sempre** 
 | `.zteam/config.json` | **Verdade absoluta** — modelos e maxTokens por papel |
 | `.zteam/README.MD` | Este guia (comandos) |
 | `.zteam/skills/SKILL.md` | Cópia local da skill Cursor zteam (sincronizada ao criar `.zteam/`) |
+| `.zteam/langgraph/` | Launcher LangGraph Studio (topologia; ver README nessa pasta) |
 | `.docs/*` | Artefactos da pipeline (requirements, technologies, specs, progress, …) |
+| `.docs/langgraph.mmd` | Dump Mermaid offline do grafo (copiado do pacote MCP) |
+
+## LangGraph Studio (topologia)
+
+Cada bootstrap de `.zteam/` materializa `.zteam/langgraph/` com um launcher que aponta para o pacote MCP (onde o grafo e as deps vivem).
+
+```text
+node .zteam/langgraph/dev.mjs
+→ https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024
+```
+
+Isto mostra a **topologia** do fluxo (workflowRouter → SA → TA → SE → QA → …). Não espelha runs MCP ao vivo (sem LangSmith tracing). Dump estático: `.docs/langgraph.mmd` ou, no pacote MCP, `npm run graph` / `npm run studio`.
 
 ### Exemplo `config.json` (9router)
 

@@ -24,6 +24,7 @@ console.log(
       dir: result.dir,
       readme: result.readme,
       skill: result.skill,
+      langgraph: result.langgraph,
       skillSource: ZTEAM_SKILL_SOURCE,
     },
     null,

@@ -8,6 +8,8 @@ export type RunContext = {
   /** Absolute workspace root for this MCP/CLI invocation */
   workspaceRoot: string;
   workspaceSource: "arg" | "env" | "cwd";
+  /** Absolute app root (project under workspace) — used for skill resolution. */
+  appRoot?: string;
   teamConfig?: ResolvedTeamConfig;
 };
 

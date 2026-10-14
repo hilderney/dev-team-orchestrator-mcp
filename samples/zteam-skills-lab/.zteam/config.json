@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "projectType": "other",
+  "models": {
+    "systemArchitect": "9RSA-system-architect-free",
+    "systemArchitectFallback": "",
+    "technologyArchitect": "9RTA-technology-architect-free",
+    "technologyArchitectFallback": "",
+    "uiUxDesigner": "9RSA-system-architect-free",
+    "uiUxDesignerFallback": "",
+    "softwareEngineer": "9RSE-software-engineer-free",
+    "softwareEngineerFallback": "",
+    "qaEngineer": "9RQA-qa-free",
+    "qaEngineerFallback": "",
+    "fallback": ""
+  }
+}

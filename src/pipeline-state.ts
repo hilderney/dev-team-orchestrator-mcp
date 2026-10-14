@@ -135,6 +135,9 @@ export function stageBudgetMs(stage: string): number {
     uiUxSpecEnrich: 5 * 60_000,
     technologyArchitectSpecEnrich: 6 * 60_000,
     systemArchitectSpecs: 8 * 60_000,
+    analyzePrepare: 45 * 60_000,
+    "analyze:qaEngineer": 8 * 60_000,
+    "analyze:softwareEngineer": 8 * 60_000,
   };
   return defaults[stage] ?? 15 * 60_000;
 }

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "traceId": "9deff425-1f21-4b9f-bf3c-b0241718ca07",
+  "phase": "done",
+  "specs": {
+    "total": 0,
+    "completed": 0,
+    "current": "",
+    "batch": [],
+    "pending": []
+  },
+  "qa": {
+    "current": "",
+    "passed": [],
+    "failed": [],
+    "lastErrorClass": null,
+    "fixRound": 0,
+    "bootstrapRound": 0
+  },
+  "lastWrite": {
+    "count": 0,
+    "files": []
+  },
+  "scaffold": {
+    "applied": false,
+    "files": []
+  },
+  "events": [],
+  "updatedAt": "2026-09-26T12:59:35.160Z"
+}

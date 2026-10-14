@@ -1,0 +1,86 @@
+%% spec-driven pipeline (workflowRouter → full|docs|feature|punch|fix|resume|tests|analyze)
+%% Dump via `npm run graph` — edges include TDD: scaffoldPrepare → qaTddRed → softwareEngineer → deliveryCriticDelivery → qaEngineer
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	workflowRouter(workflowRouter)
+	punchPrepare(punchPrepare)
+	fixPrepare(fixPrepare)
+	resumePrepare(resumePrepare)
+	orchestratorBootstrapReadme(orchestratorBootstrapReadme)
+	systemArchitectReqItem(systemArchitectReqItem)
+	orchestratorAfterPreReq(orchestratorAfterPreReq)
+	orchestratorCleanReadme(orchestratorCleanReadme)
+	uiUxRequirements(uiUxRequirements)
+	fidelityCriticRequirements(fidelityCriticRequirements)
+	technologyArchitect(technologyArchitect)
+	uiUxDesignSystem(uiUxDesignSystem)
+	systemArchitectTodoPlan(systemArchitectTodoPlan)
+	systemArchitectSpecItem(systemArchitectSpecItem)
+	uiUxSpecEnrich(uiUxSpecEnrich)
+	technologyArchitectSpecEnrich(technologyArchitectSpecEnrich)
+	deliveryCriticArchitecture(deliveryCriticArchitecture)
+	scaffoldPrepare(scaffoldPrepare)
+	bootstrapFix(bootstrapFix)
+	qaTddRed(qaTddRed)
+	analyzePrepare(analyzePrepare)
+	softwareEngineer(softwareEngineer)
+	deliveryCriticDelivery(deliveryCriticDelivery)
+	softwareEngineerFix(softwareEngineerFix)
+	qaEngineer(qaEngineer)
+	systemArchitectProjectSummary(systemArchitectProjectSummary)
+	systemArchitectTechDebtReview(systemArchitectTechDebtReview)
+	orchestratorFinalize(orchestratorFinalize)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> workflowRouter;
+	analyzePrepare --> orchestratorFinalize;
+	bootstrapFix --> qaEngineer;
+	fixPrepare --> softwareEngineerFix;
+	orchestratorBootstrapReadme --> systemArchitectReqItem;
+	orchestratorCleanReadme --> uiUxRequirements;
+	orchestratorFinalize --> __end__;
+	punchPrepare --> qaTddRed;
+	scaffoldPrepare --> qaTddRed;
+	softwareEngineerFix --> qaEngineer;
+	systemArchitectReqItem --> orchestratorAfterPreReq;
+	systemArchitectSpecItem --> uiUxSpecEnrich;
+	systemArchitectTechDebtReview --> orchestratorFinalize;
+	systemArchitectTodoPlan --> systemArchitectSpecItem;
+	technologyArchitect --> uiUxDesignSystem;
+	uiUxDesignSystem --> systemArchitectTodoPlan;
+	uiUxRequirements --> fidelityCriticRequirements;
+	uiUxSpecEnrich --> technologyArchitectSpecEnrich;
+	workflowRouter -.-> orchestratorBootstrapReadme;
+	workflowRouter -.-> systemArchitectTodoPlan;
+	workflowRouter -.-> punchPrepare;
+	workflowRouter -.-> fixPrepare;
+	workflowRouter -.-> resumePrepare;
+	workflowRouter -.-> qaTddRed;
+	workflowRouter -.-> analyzePrepare;
+	orchestratorAfterPreReq -.-> systemArchitectReqItem;
+	orchestratorAfterPreReq -.-> orchestratorCleanReadme;
+	fidelityCriticRequirements -.-> systemArchitectReqItem;
+	fidelityCriticRequirements -.-> technologyArchitect;
+	technologyArchitectSpecEnrich -.-> systemArchitectSpecItem;
+	technologyArchitectSpecEnrich -.-> deliveryCriticArchitecture;
+	deliveryCriticArchitecture -.-> technologyArchitect;
+	deliveryCriticArchitecture -.-> scaffoldPrepare;
+	deliveryCriticArchitecture -.-> orchestratorFinalize;
+	resumePrepare -.-> scaffoldPrepare;
+	resumePrepare -.-> orchestratorFinalize;
+	qaTddRed -.-> softwareEngineer;
+	qaTddRed -.-> qaEngineer;
+	softwareEngineer -.-> deliveryCriticDelivery;
+	deliveryCriticDelivery -.-> softwareEngineer;
+	deliveryCriticDelivery -.-> qaEngineer;
+	qaEngineer -.-> softwareEngineerFix;
+	qaEngineer -.-> bootstrapFix;
+	qaEngineer -.-> systemArchitectProjectSummary;
+	systemArchitectProjectSummary -.-> systemArchitectTechDebtReview;
+	systemArchitectProjectSummary -.-> orchestratorFinalize;
+	qaTddRed -.-> qaTddRed;
+	softwareEngineer -.-> softwareEngineer;
+	qaEngineer -.-> qaEngineer;
+	classDef default fill:#f2f0ff,line-height:1.2;
+	classDef first fill-opacity:0;
+	classDef last fill:#bfb6fc;

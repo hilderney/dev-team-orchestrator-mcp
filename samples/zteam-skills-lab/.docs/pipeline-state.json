@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "appRoot": "C:\\Users\\htzc\\mcp-servers\\dev-team-orchestrator\\samples\\zteam-skills-lab",
+  "stage": "implementation:done",
+  "pendingSpecs": [],
+  "completedSpecs": [],
+  "pendingQaSpecs": [],
+  "filesWritten": [],
+  "errorClass": null,
+  "gates": {
+    "approveReq": "auto",
+    "approveTech": "auto",
+    "paused": false
+  },
+  "budgets": {
+    "bootstrapFixRounds": 0,
+    "featureFixRounds": 0,
+    "maxBootstrapFix": 1,
+    "maxFeatureFix": 3
+  },
+  "updatedAt": "2026-09-26T12:59:35.173Z"
+}

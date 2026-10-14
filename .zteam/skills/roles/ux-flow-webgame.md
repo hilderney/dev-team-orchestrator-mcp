@@ -1,16 +1,24 @@
 # Skill — UX flow (webgame)
 
-**Role:** uiUxDesigner · **Phase:** spec-flow · **projectType:** webgame · **needsUiFlow:** true · **Status:** pilot
+**Role:** uiUxDesigner · **Phase:** spec-flow · **projectType:** webgame · **needsUiFlow:** true · **Status:** pilot  
+**Source:** team analyze `skills-ux-review.md` (2026-09-26) + prior pilot
 
 ## Mission
-Define exclusive screen/overlay states and juice for game loops (title → play → pause → death → ranking).
+Map player journey and exclusive screen/overlay states (title → play → pause → death → ranking).
 
 ## Must deliver
-- `## Flow & states` with mutual exclusion (e.g. busy ⊥ paused ⊥ playing)
-- Testable ACs for each transition (QA-red must be able to assert them)
+- `## Flow & states` with mutual exclusion (busy ⊥ paused ⊥ playing)
+- Testable ACs for each transition
+- Clear Exit/Back paths for nested menus
+- Critical path for core loop
 - No invented features beyond requirements
 
 ## Anti-patterns
+- Dead-end screens with no return path
+- Stackable modals / conflicting overlays
 - DoD that only says “busy hook exists”
-- Overlays that can stack visually
-- Skipping Flow & states when `needsUiFlow=true` / projectType=webgame
+- Hidden state changes that confuse the player
+
+## Artefacts
+- `.docs/specs/{slug}.spec.md` Flow & states
+- State transition map usable by QA-red

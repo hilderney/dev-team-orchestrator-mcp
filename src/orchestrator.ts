@@ -165,6 +165,11 @@ import {
 } from "./zteam-config.js";
 import { pickSpecBatch, resolveSeMaxBatch } from "./spec-batch.js";
 import {
+  formatSkillPromptBlock,
+  resolveSkill,
+  stageToSkillPhase,
+} from "./skill-resolve.js";
+import {
   archNotify,
   architectureSnapshot,
   extractSectionTitle,
@@ -1599,8 +1604,9 @@ async function invokeRoleLlm(
   const primary = roleLlm(role);
   const progress = getProgress();
   const llm = makeLLM(primary.model, primary.maxTokens);
+  const withSkill = await messagesWithActiveSkill(role, messages, opts.stage);
   try {
-    const res = await invokeWithRetry(llm, messages, {
+    const res = await invokeWithRetry(llm, withSkill, {
       ...opts,
       modelName: primary.model,
       maxTokens: primary.maxTokens,
@@ -1622,12 +1628,55 @@ async function invokeRoleLlm(
     );
     recordRetry("model_handoff");
     const llm2 = makeLLM(fb, primary.maxTokens);
-    const res = await invokeWithRetry(llm2, messages, {
+    const res = await invokeWithRetry(llm2, withSkill, {
       ...opts,
       modelName: fb,
       maxTokens: primary.maxTokens,
     });
     return { content: res.content, modelUsed: fb, handedOff: true };
+  }
+}
+
+/** Prepend resolved role skill excerpt as an extra SystemMessage (after identity prompts). */
+async function messagesWithActiveSkill(
+  role: TeamRole,
+  messages: BaseMessage[],
+  stage: string
+): Promise<BaseMessage[]> {
+  const phase = stageToSkillPhase(stage);
+  if (!phase) return messages;
+  const ctx = getRunContext();
+  const cfg = activeTeamConfig();
+  try {
+    const skill = await resolveSkill({
+      role,
+      phase,
+      projectType: cfg.projectType,
+      appRoot: ctx?.appRoot,
+      workspaceRoot: ctx?.workspaceRoot,
+    });
+    if (!skill) return messages;
+    getProgress().emit(
+      stage,
+      "notify",
+      `skill ${skill.key} (${role}/${phase})`
+    );
+    const block = new SystemMessage(formatSkillPromptBlock(skill));
+    // Insert after the first SystemMessage(s) so identity/role prompts stay first.
+    let insertAt = 0;
+    while (
+      insertAt < messages.length &&
+      messages[insertAt] instanceof SystemMessage
+    ) {
+      insertAt += 1;
+    }
+    return [
+      ...messages.slice(0, insertAt),
+      block,
+      ...messages.slice(insertAt),
+    ];
+  } catch {
+    return messages;
   }
 }
 
@@ -3427,12 +3476,14 @@ async function analyzePrepareNode(
           "qaEngineer",
         ];
 
-    const [readme, requirements, technologies, todo] = await Promise.all([
-      readDoc(appRoot, README_PATH),
-      readDoc(appRoot, REQUIREMENTS_PATH),
-      readDoc(appRoot, TECHNOLOGIES_PATH),
-      readDoc(appRoot, TODO_PATH),
-    ]);
+    const [readme, requirements, technologies, todo, skillBrief] =
+      await Promise.all([
+        readDoc(appRoot, README_PATH),
+        readDoc(appRoot, REQUIREMENTS_PATH),
+        readDoc(appRoot, TECHNOLOGIES_PATH),
+        readDoc(appRoot, TODO_PATH),
+        readDoc(appRoot, ".docs/skill-briefing.md"),
+      ]);
 
     const sections: string[] = [
       `# Analysis — ${scope}`,
@@ -3451,7 +3502,11 @@ async function analyzePrepareNode(
             new SystemMessage(
               [
                 `You are analyzing (read-only) scope "${scope}". Do NOT implement code or mark todos done.`,
-                "Write a short markdown opinion: risks, gaps vs requirements/specs, DoD weaknesses.",
+                `Your role for this pass is ONLY: ${role}.`,
+                "Propose Must-deliver / Anti-patterns / Artefacts ONLY for skill files listed under YOUR role in the Skill briefing.",
+                "Do NOT invent proposals for other roles (e.g. softwareEngineer must not propose sa-* or ux-* skills, and SA/UX/TA/QA must not propose se-* skills unless you are softwareEngineer).",
+                "Use headings like ### skill-file-name.md for each skill you own (P0 first).",
+                "Keep each skill proposal ≤12 lines.",
                 "Output ONLY the markdown body (no FILE markers).",
               ].join("\n")
             ),
@@ -3471,6 +3526,11 @@ async function analyzePrepareNode(
                 "",
                 "## Todo",
                 todo.slice(0, 3000),
+                "",
+                "## Skill briefing (Phase 9 stubs)",
+                skillBrief.startsWith("[Document missing:")
+                  ? "(none)"
+                  : skillBrief.slice(0, 12000),
               ].join("\n")
             ),
           ],
@@ -5535,6 +5595,7 @@ server.tool(
         appRoot,
         models: teamConfig.models,
         maxTokens: teamConfig.maxTokens,
+        projectType: teamConfig.projectType,
       });
       session.emit(
         "pipeline",
@@ -5574,6 +5635,7 @@ server.tool(
       {
         workspaceRoot: ws.root,
         workspaceSource: ws.source,
+        appRoot,
         teamConfig,
       },
       () =>

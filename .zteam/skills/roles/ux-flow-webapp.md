@@ -1,17 +1,23 @@
 # Skill — UX flow (webapp)
 
-**Role:** uiUxDesigner · **Phase:** spec-flow · **projectType:** webapp · **needsUiFlow:** true · **Status:** stub
+**Role:** uiUxDesigner · **Phase:** spec-flow · **projectType:** webapp · **needsUiFlow:** true · **Status:** pilot  
+**Source:** team analyze `skills-ux-review.md` (2026-09-26)
 
 ## Mission
-Add ## Flow & states for webapp nav/forms with testable transitions.
+Design efficient navigation and task flows for webapp/CRUD-style UI.
 
 ## Must deliver
-- ## Flow & states for routes/forms
-- Empty/error/loading mutual rules
+- `## Flow & states` for routes/forms
+- Linear create/edit flows with clear Save/Cancel
+- Validation error placement + recovery
+- Empty state designs for lists
+- Confirmation loops for destructive actions
 
 ## Anti-patterns
-- Only happy-path screens
+- Forcing game-like animations on productivity tasks
+- Deeply nested menus hiding primary actions
 - Unreachable error states
 
 ## Artefacts
-- .docs/specs/{slug}.spec.md
+- `.docs/specs/{slug}.spec.md` Flow & states
+- Sitemap / wireflow notes

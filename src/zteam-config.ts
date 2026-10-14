@@ -5,6 +5,11 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import {
+  formatSkillPromptBlock,
+  resolveSkillSync,
+  stageToSkillPhase,
+} from "./skill-resolve.js";
 
 /** Orchestrator package root (this MCP server). */
 export const ZTEAM_PACKAGE_ROOT = join(
@@ -220,6 +225,8 @@ export type DelegationStage = {
   title: string;
   instructions: string;
   expectedOutputs: string[];
+  /** Resolved skill key when a role skill was injected into instructions. */
+  skillKey?: string;
 };
 
 export type CursorDelegationPlaybook = {
@@ -244,10 +251,12 @@ export function buildCursorDelegationPlaybook(opts: {
   appRoot: string;
   models: ResolvedTeamConfig["models"];
   maxTokens: ResolvedTeamConfig["maxTokens"];
+  projectType?: string;
 }): CursorDelegationPlaybook {
   const wf = opts.workflow || "full";
   const idea = opts.userIdea.trim();
   const rootHint = `workspaceRoot=${opts.workspaceRoot} projectRoot=${opts.projectRoot} appRoot=${opts.appRoot}`;
+  const projectType = (opts.projectType || "").trim();
 
   const stage = (
     id: string,
@@ -255,15 +264,34 @@ export function buildCursorDelegationPlaybook(opts: {
     title: string,
     instructions: string,
     expectedOutputs: string[]
-  ): DelegationStage => ({
-    id,
-    role,
-    subagentType: ROLE_TO_SUBAGENT[role],
-    model: opts.models[role],
-    title,
-    instructions: `${instructions}\n\nConstraints: ${rootHint}. Idea: ${idea}`,
-    expectedOutputs,
-  });
+  ): DelegationStage => {
+    let instr = `${instructions}\n\nConstraints: ${rootHint}. Idea: ${idea}`;
+    let skillKey: string | undefined;
+    const phase = stageToSkillPhase(id);
+    if (phase) {
+      const skill = resolveSkillSync({
+        role,
+        phase,
+        projectType,
+        appRoot: opts.appRoot,
+        workspaceRoot: opts.workspaceRoot,
+      });
+      if (skill) {
+        skillKey = skill.key;
+        instr = `${instr}\n\n${formatSkillPromptBlock(skill)}`;
+      }
+    }
+    return {
+      id,
+      role,
+      subagentType: ROLE_TO_SUBAGENT[role],
+      model: opts.models[role],
+      title,
+      instructions: instr,
+      expectedOutputs,
+      skillKey,
+    };
+  };
 
   const stages: DelegationStage[] = [];
   const needsArch = ["full", "docs", "feature", ""].includes(wf);
@@ -564,7 +592,7 @@ const maxTokensSchema = z
 export const zteamConfigFileSchema = z
   .object({
     version: z.number().int().positive().default(1),
-    /** webgame | crud | webapp | mobile | cli-dos | backend | frontend | fullstack | library | desktop | other */
+    /** webgame | godotgame | crud | webapp | mobile | cli-dos | backend | frontend | fullstack | library | desktop | other */
     projectType: z.string().min(1).optional(),
     models: modelsSchema.optional(),
     maxTokens: maxTokensSchema.optional(),
@@ -575,6 +603,7 @@ export const zteamConfigFileSchema = z
 
 export const PROJECT_TYPES_NEEDING_UI_FLOW = new Set([
   "webgame",
+  "godotgame",
   "webapp",
   "mobile",
   "frontend",
@@ -593,6 +622,8 @@ export function needsUiFlow(projectType?: string | null): boolean {
 export type ZteamConfigFile = z.infer<typeof zteamConfigFileSchema>;
 
 export type ResolvedTeamConfig = {
+  /** From .zteam/config.json — drives skill resolution (webgame, crud, …). */
+  projectType: string;
   models: {
     systemArchitect: string;
     technologyArchitect: string;
@@ -727,6 +758,7 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 | **\`@zteam/tests\`** | Só testes (TDD red → verify) para um requisito. | \`run_development_pipeline\` com \`workflow: "tests"\` + \`slug\` |
 | **\`@zteam\`** / **\`/zteam\`** | Pipeline completo ou o workflow que pedires (\`full\` \\| \`docs\` \\| \`feature\` \\| \`punch\` \\| \`fix\` \\| \`resume\` \\| \`tests\` \\| \`analyze\`). | \`run_development_pipeline\` (ou Task playbook se runtime=cursor) |
 | **\`ensure_zteam_setup\`** | Stubs skill + \`.docs\` (+ template config opcional), sem LLM. | MCP \`ensure_zteam_setup\` |
+| **LangGraph Studio** | Topologia do pipeline (nós/edges). \`node .zteam/langgraph/dev.mjs\` | Agent Server no pacote MCP |
 
 ### Exemplos
 
@@ -745,6 +777,9 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 
 @zteam build a todo API in samples/todo-api
 → auto ou full/feature conforme contexto
+
+node .zteam/langgraph/dev.mjs
+→ sobe Agent Server no pacote MCP; abre Studio (topologia SA/TA/SE/QA), não traces ao vivo
 \`\`\`
 
 ## Ficheiros
@@ -754,7 +789,20 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 | \`.zteam/config.json\` | **Verdade absoluta** — modelos e maxTokens por papel |
 | \`.zteam/README.MD\` | Este guia (comandos) |
 | \`.zteam/skills/SKILL.md\` | Cópia local da skill Cursor zteam (sincronizada ao criar \`.zteam/\`) |
+| \`.zteam/langgraph/\` | Launcher LangGraph Studio (topologia; ver README nessa pasta) |
 | \`.docs/*\` | Artefactos da pipeline (requirements, technologies, specs, progress, …) |
+| \`.docs/langgraph.mmd\` | Dump Mermaid offline do grafo (copiado do pacote MCP) |
+
+## LangGraph Studio (topologia)
+
+Cada bootstrap de \`.zteam/\` materializa \`.zteam/langgraph/\` com um launcher que aponta para o pacote MCP (onde o grafo e as deps vivem).
+
+\`\`\`text
+node .zteam/langgraph/dev.mjs
+→ https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024
+\`\`\`
+
+Isto mostra a **topologia** do fluxo (workflowRouter → SA → TA → SE → QA → …). Não espelha runs MCP ao vivo (sem LangSmith tracing). Dump estático: \`.docs/langgraph.mmd\` ou, no pacote MCP, \`npm run graph\` / \`npm run studio\`.
 
 ### Exemplo \`config.json\` (9router)
 
@@ -899,19 +947,203 @@ export async function ensureZteamSkillCopy(
 }
 
 /**
- * Create `.zteam/` and materialize README + local skill copy.
+ * Create `.zteam/` and materialize README + local skill copy + LangGraph Studio launcher.
  * Call this before any pipeline / LLM work (and whenever `.zteam/` is created).
  */
 export async function ensureZteamBootstrap(targetDir: string): Promise<{
   dir: string;
   readme: Awaited<ReturnType<typeof ensureZteamReadme>>;
   skill: Awaited<ReturnType<typeof ensureZteamSkillCopy>>;
+  langgraph: Awaited<ReturnType<typeof ensureZteamLanggraphStudio>>;
 }> {
   const dir = join(resolve(targetDir), ".zteam");
   await mkdir(dir, { recursive: true });
   const readme = await ensureZteamReadme(targetDir);
   const skill = await ensureZteamSkillCopy(targetDir);
-  return { dir, readme, skill };
+  const langgraph = await ensureZteamLanggraphStudio(targetDir);
+  return { dir, readme, skill, langgraph };
+}
+
+/** Template for client `.zteam/langgraph/dev.mjs` (runs CLI against MCP package). */
+export function buildLanggraphDevMjs(): string {
+  return `#!/usr/bin/env node
+/**
+ * Launch LangGraph Studio Agent Server for the zteam pipeline graph.
+ * Topology only — does not mirror live MCP pipeline runs.
+ */
+import { spawn } from "node:child_process";
+import { access, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const metaPath = join(here, "package-root.json");
+
+async function main() {
+  let packageRoot;
+  try {
+    const meta = JSON.parse(await readFile(metaPath, "utf8"));
+    packageRoot = meta.packageRoot;
+  } catch (err) {
+    console.error(
+      "[zteam/langgraph] missing or invalid package-root.json:",
+      err instanceof Error ? err.message : err
+    );
+    process.exit(1);
+  }
+  if (typeof packageRoot !== "string" || !packageRoot.trim()) {
+    console.error("[zteam/langgraph] packageRoot is empty in package-root.json");
+    process.exit(1);
+  }
+  const configPath = join(packageRoot, "langgraph.json");
+  try {
+    await access(configPath);
+  } catch {
+    console.error(
+      "[zteam/langgraph] langgraph.json not found at:",
+      configPath,
+      "\\nRe-run ensure_zteam_setup / get_zteam_config after fixing the MCP package path."
+    );
+    process.exit(1);
+  }
+
+  console.error("[zteam/langgraph] starting Studio Agent Server…");
+  console.error(
+    "[zteam/langgraph] Studio UI: https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024"
+  );
+  console.error("[zteam/langgraph] cwd:", packageRoot);
+
+  const child = spawn(
+    "npx",
+    ["@langchain/langgraph-cli", "dev", "-c", "langgraph.json"],
+    {
+      cwd: packageRoot,
+      stdio: "inherit",
+      shell: true,
+      env: process.env,
+    }
+  );
+  child.on("exit", (code, signal) => {
+    if (signal) process.exit(1);
+    process.exit(code ?? 0);
+  });
+}
+
+main().catch((err) => {
+  console.error("[zteam/langgraph] failed:", err);
+  process.exit(1);
+});
+`;
+}
+
+/** Template for client `.zteam/langgraph/README.md`. */
+export function buildLanggraphStudioReadme(): string {
+  return `# LangGraph Studio (zteam)
+
+Topologia do pipeline zteam (nós/edges: workflowRouter → SA → TA → SE → QA → …).
+
+**Não** espelha runs MCP ao vivo — só a estrutura do grafo.
+
+## Abrir
+
+\`\`\`bash
+node .zteam/langgraph/dev.mjs
+\`\`\`
+
+Depois abre:
+
+https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024
+
+O launcher corre o Agent Server no **pacote MCP** (onde \`langgraph.json\` e as deps vivem). O path está em \`package-root.json\` (atualizado em cada bootstrap).
+
+## Offline
+
+Dump Mermaid: \`.docs/langgraph.mmd\` (copiado do pacote MCP quando disponível).
+
+No pacote MCP: \`npm run studio\` ou \`npm run graph\`.
+`;
+}
+
+/**
+ * Materialize `.zteam/langgraph/` launcher pointing at this MCP package.
+ * Also copies `.docs/langgraph.mmd` when present in the package.
+ */
+export async function ensureZteamLanggraphStudio(targetDir: string): Promise<{
+  dir: string;
+  packageRootPath: string;
+  devPath: string;
+  readmePath: string;
+  mermaid: { path: string; status: "copied" | "unchanged" | "missing_source" };
+  status: "written" | "unchanged";
+}> {
+  const root = resolve(targetDir);
+  const dir = join(root, ".zteam", "langgraph");
+  await mkdir(dir, { recursive: true });
+
+  const packageRootJson = `${JSON.stringify(
+    { packageRoot: resolve(ZTEAM_PACKAGE_ROOT) },
+    null,
+    2
+  )}\n`;
+  const packageRootPath = join(dir, "package-root.json");
+  const devPath = join(dir, "dev.mjs");
+  const readmePath = join(dir, "README.md");
+  const devBody = buildLanggraphDevMjs();
+  const readmeBody = buildLanggraphStudioReadme();
+
+  let status: "written" | "unchanged" = "unchanged";
+  for (const [abs, next] of [
+    [packageRootPath, packageRootJson],
+    [devPath, devBody],
+    [readmePath, readmeBody],
+  ] as const) {
+    let prev = "";
+    try {
+      prev = await readFile(abs, "utf8");
+    } catch {
+      /* missing */
+    }
+    if (prev !== next) {
+      await writeFile(abs, next, "utf8");
+      status = "written";
+    }
+  }
+
+  const mermaid = await ensureLanggraphMermaidCopy(root);
+  return {
+    dir,
+    packageRootPath,
+    devPath,
+    readmePath,
+    mermaid,
+    status,
+  };
+}
+
+/** Copy package `.docs/langgraph.mmd` → `{target}/.docs/langgraph.mmd` when source exists. */
+export async function ensureLanggraphMermaidCopy(targetDir: string): Promise<{
+  path: string;
+  status: "copied" | "unchanged" | "missing_source";
+}> {
+  const docsDir = join(resolve(targetDir), ".docs");
+  await mkdir(docsDir, { recursive: true });
+  const dest = join(docsDir, "langgraph.mmd");
+  const source = join(ZTEAM_PACKAGE_ROOT, ".docs", "langgraph.mmd");
+  if (!(await pathExists(source))) {
+    return { path: dest, status: "missing_source" };
+  }
+  const srcText = await readFile(source, "utf8");
+  let prev = "";
+  try {
+    prev = await readFile(dest, "utf8");
+  } catch {
+    /* missing */
+  }
+  if (prev === srcText) {
+    return { path: dest, status: "unchanged" };
+  }
+  await writeFile(dest, srcText, "utf8");
+  return { path: dest, status: "copied" };
 }
 
 /**
@@ -992,14 +1224,28 @@ export async function ensureZteamSetup(opts: EnsureZteamSetupOpts): Promise<{
     pathsTouched.push(
       skillResult.workspace.dir,
       skillResult.workspace.skill.path,
-      skillResult.workspace.readme.path
+      skillResult.workspace.readme.path,
+      skillResult.workspace.langgraph.dir,
+      skillResult.workspace.langgraph.devPath,
+      skillResult.workspace.langgraph.packageRootPath,
+      skillResult.workspace.langgraph.readmePath
     );
+    if (skillResult.workspace.langgraph.mermaid.status !== "missing_source") {
+      pathsTouched.push(skillResult.workspace.langgraph.mermaid.path);
+    }
     if (skillResult.app) {
       pathsTouched.push(
         skillResult.app.dir,
         skillResult.app.skill.path,
-        skillResult.app.readme.path
+        skillResult.app.readme.path,
+        skillResult.app.langgraph.dir,
+        skillResult.app.langgraph.devPath,
+        skillResult.app.langgraph.packageRootPath,
+        skillResult.app.langgraph.readmePath
       );
+      if (skillResult.app.langgraph.mermaid.status !== "missing_source") {
+        pathsTouched.push(skillResult.app.langgraph.mermaid.path);
+      }
     }
   }
 
@@ -1059,6 +1305,7 @@ export function envDefaultsTeamConfig(): Omit<
   "sources" | "exists"
 > {
   return {
+    projectType: process.env.ZTEAM_PROJECT_TYPE?.trim() || "",
     models: {
       systemArchitect:
         process.env.MODEL_SYSTEM_ARCHITECT?.trim() ||
@@ -1125,6 +1372,7 @@ export function defaultsOnlyTeamConfig(): Omit<
   "sources" | "exists"
 > {
   return {
+    projectType: "",
     models: { ...DEFAULT_MODELS },
     maxTokens: { ...DEFAULT_MAX_TOKENS },
   };
@@ -1164,6 +1412,8 @@ function mergeLayer(
   if (!layer) return base;
   const lm = layer.models;
   return {
+    projectType:
+      (layer.projectType || "").trim() || base.projectType || "",
     models: {
       systemArchitect:
         lm?.systemArchitect?.trim() ||
@@ -1335,6 +1585,8 @@ export type WriteTeamConfigInput = {
     qaEngineerFallback?: string;
   };
   maxTokens?: Partial<ResolvedTeamConfig["maxTokens"]>;
+  /** Optional; preserved from existing file when omitted. */
+  projectType?: string;
 };
 
 export async function writeTeamConfig(
@@ -1347,17 +1599,23 @@ export async function writeTeamConfig(
   const abs = join(dir, "config.json");
 
   let createdAt = now;
+  let prevProjectType = "";
   if (await pathExists(abs)) {
     try {
       const prev = await readConfigFile(abs);
       if (prev?.createdAt) createdAt = prev.createdAt;
+      if (prev?.projectType) prevProjectType = prev.projectType.trim();
     } catch {
       /* rewrite */
     }
   }
 
+  const projectType =
+    (input.projectType || "").trim() || prevProjectType || undefined;
+
   const config: ZteamConfigFile = zteamConfigFileSchema.parse({
     version: 1,
+    ...(projectType ? { projectType } : {}),
     models: {
       systemArchitect: input.models.systemArchitect.trim(),
       technologyArchitect: input.models.technologyArchitect.trim(),

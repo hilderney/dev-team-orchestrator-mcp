@@ -5,7 +5,7 @@
 process.env.NINEROUTER_KEY ??= "smoke-dummy-key";
 
 import "dotenv/config";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -447,6 +447,32 @@ try {
       await readFile(join(app, ".zteam", "config.json"), "utf8")
     );
     assert(cfg.models.uiUxDesigner === "inherit", "cursor template has UX");
+
+    const lgDir = join(app, ".zteam", "langgraph");
+    const pkgMeta = JSON.parse(
+      await readFile(join(lgDir, "package-root.json"), "utf8")
+    );
+    assert(
+      typeof pkgMeta.packageRoot === "string" && pkgMeta.packageRoot.length > 0,
+      "langgraph packageRoot set"
+    );
+    await access(join(pkgMeta.packageRoot, "langgraph.json"));
+    assert(
+      (await readFile(join(lgDir, "dev.mjs"), "utf8")).includes(
+        "@langchain/langgraph-cli"
+      ),
+      "langgraph dev.mjs present"
+    );
+    assert(
+      (await readFile(join(lgDir, "README.md"), "utf8")).includes(
+        "LangGraph Studio"
+      ),
+      "langgraph README present"
+    );
+    assert(
+      r.pathsTouched.some((p) => /[\\/]\.zteam[\\/]langgraph/.test(p)),
+      "setup pathsTouched includes langgraph"
+    );
   }
 
   console.log("smoke:zteam-config OK");

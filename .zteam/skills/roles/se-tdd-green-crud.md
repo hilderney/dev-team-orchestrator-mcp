@@ -1,17 +1,23 @@
 # Skill — SE TDD green (crud)
 
-**Role:** softwareEngineer · **Phase:** tdd-green · **projectType:** crud · **needsUiFlow:** varies · **Status:** stub
+**Role:** softwareEngineer · **Phase:** tdd-green · **projectType:** crud · **needsUiFlow:** varies · **Status:** pilot  
+**Source:** team analyze `skills-catalog-review.md` (SE section, 2026-09-26)
 
 ## Mission
-Make CRUD/forms/API red tests pass with validation and empty states.
+TDD green for CRUD/API validation and alt paths without forced arcade UX.
 
 ## Must deliver
-- Green create/read/update/delete paths in scope
-- Validation fail behavior
+- Make red contract/validation tests pass
+- Boundary validation (fail fast)
+- Explicit error responses for listed 4xx paths
+- Happy + alt paths from the spec
+- Do **not** mark todos `[x]`
 
 ## Anti-patterns
-- Silent swallow of validation errors
-- Marking [x]
+- Full ORM/migration scaffold before validation tests pass
+- Coupling auth beyond scoped ACs
+- Pagination/caching before basic CRUD is green
+- Swallowing errors in empty catch blocks
 
 ## Artefacts
-- src/**
+- `src/**` + green contract tests from red phase

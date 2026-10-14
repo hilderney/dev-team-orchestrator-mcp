@@ -4,7 +4,7 @@ Skills focadas por **(role × phase × projectType|qualifier)**.
 Catálogo completo + backlog: [`.docs/todo-skills.md`](../../../.docs/todo-skills.md)  
 Charter: [`.docs/postmortems/9-skills-catalog.md`](../../../.docs/postmortems/9-skills-catalog.md)
 
-## Resolução (futuro runtime)
+## Resolução (runtime H4)
 
 ```text
 skillKey = resolve(role, phase, projectType)
@@ -12,7 +12,11 @@ skillKey = resolve(role, phase, projectType)
   → else fall:  {role}-{phase}-core
 ```
 
-`needsUiFlow(projectType)` em `src/zteam-config.ts` decide se fases UX / screenflow são obrigatórias.
+Implementação: [`src/skill-resolve.ts`](../../../src/skill-resolve.ts) — inject em `invokeRoleLlm` + playbook Cursor (`skillKey`).
+
+`needsUiFlow(projectType)` em `src/zteam-config.ts` decide se fases UX / screenflow são obrigatórias (`webgame`, `godotgame`, `webapp`, `crud`, … vs `backend` / `library` / `cli-dos`).
+
+**Docs (fluxo + árvore de decisão):** [README — Role skills injection](../../../README.md#role-skills-injection).
 
 ## Header obrigatório
 

@@ -227,6 +227,172 @@ flowchart TD
 
 Matches LangGraph dump: [`.docs/langgraph.mmd`](.docs/langgraph.mmd) (`scaffoldPrepare → qaTddRed → softwareEngineer → … → qaEngineer`).
 
+## Role skills injection
+
+Role skills (`.zteam/skills/roles/`) are **focused** prompts per `(role × phase × projectType|qualifier)`. Runtime ([`src/skill-resolve.ts`](src/skill-resolve.ts)) injects an excerpt into every LLM stage via `invokeRoleLlm`, and into Cursor playbook `instructions` (`skillKey`). Catalog: [`.docs/todo-skills.md`](.docs/todo-skills.md). Index: [`.zteam/skills/roles/README.md`](.zteam/skills/roles/README.md).
+
+Set `projectType` in `.zteam/config.json` (or env `ZTEAM_PROJECT_TYPE`) so the resolver can pick the right file. Values are lowercase ids, e.g. `crud`, `webgame`, `godotgame`, `webapp`, `backend`.
+
+### How the runtime chooses which skill to inject
+
+Decision order is fixed and auditable — no silent “best guess” beyond this chain:
+
+```mermaid
+flowchart TD
+  cfg["Read projectType from .zteam/config.json or ZTEAM_PROJECT_TYPE"]
+  stage["Map LangGraph stage id to skill phase via stageToSkillPhase"]
+  ui{"needsUiFlow projectType?"}
+  exact["Try role-phase-projectType.md e.g. sa-requirements-crud"]
+  qual["QA/UX qualifiers: screenflow api-contract forms ux-flow-*"]
+  core["Fall back to role-phase-core.md"]
+  inject["Inject excerpt as SystemMessage / playbook skillKey"]
+  noSkill["Heuristic nodes: no skill inject"]
+
+  cfg --> stage
+  stage -->|LLM role stage| ui
+  stage -->|fidelity scaffold archCritic finalize| noSkill
+  ui -->|yes games web UI| exact
+  ui -->|no backend library cli-dos| exact
+  exact -->|file exists| inject
+  exact -->|miss| qual
+  qual -->|file exists| inject
+  qual -->|miss| core --> inject
+```
+
+| `projectType` | `needsUiFlow` | Typical exact / qualifier hit (examples) | If exact missing |
+|---------------|---------------|------------------------------------------|------------------|
+| `crud` | true* (forms) | `sa-requirements-crud`, `ta-technologies-crud`, `qa-tdd-red-forms` → screenflow/forms path | `*-core` / `se-implement-tdd-green` |
+| `webgame` | true | `sa-requirements-webgame`, `ux-juice-webgame`, `ux-flow-webgame`, `qa-tdd-red-screenflow`, `se-tdd-green-webgame` | same chain → core |
+| `godotgame` | true | Prefer `*-godotgame.md` when on disk; QA uses **screenflow** (UI game) | core + screenflow qualifier until Godot pilots exist |
+| `backend` | false | `sa-requirements-backend`, `ta-technologies-backend`, `qa-tdd-red-api-contract` | `*-core` |
+| unset / unknown | true (prefer UI rigor) | try exact only if typed; else qualifier + core | always ends at `*-core` |
+
+\* `crud` is in `PROJECT_TYPES_NEEDING_UI_FLOW` so forms/empty states stay strict; API-only backends should use `backend`.
+
+### Overview — skills along the full pipeline
+
+```mermaid
+flowchart TD
+  bootstrap["sa-bootstrap-core"]
+  reqs["sa-requirements-*"]
+  juice["ux-juice-*"]
+  fidelity["fidelityCritic noSkill"]
+  tech["ta-technologies-*"]
+  look["ux-look-and-feel-*"]
+  todo["sa-todo-plan-core"]
+  saSpec["sa-spec-write-core"]
+  uxFlow["ux-spec-flow / ux-flow-*"]
+  taSpec["ta-spec-tech-*"]
+  archCritic["deliveryCriticArchitecture noSkill"]
+  scaffold["scaffoldPrepare noSkill"]
+  qaRed["qa-tdd-red-*"]
+  seGreen["se-tdd-green-*"]
+  delCritic["se-delivery-critic-core"]
+  qaVerify["qa-tdd-verify-*"]
+  summary["sa-summary-core"]
+  debt["sa-tech-debt-core"]
+
+  bootstrap --> reqs --> juice --> fidelity --> tech --> look --> todo
+  todo --> saSpec --> uxFlow --> taSpec --> archCritic --> scaffold
+  scaffold --> qaRed --> seGreen --> delCritic --> qaVerify --> summary --> debt
+```
+
+### 1 — System + technology + UX architecture
+
+Bootstrap → requirements loop → juice → (fidelity) → technologies → look-and-feel.
+
+```mermaid
+flowchart TD
+  boot["orchestratorBootstrapReadme → sa-bootstrap-core"]
+  saReq["systemArchitectReqItem → sa-requirements-projectType"]
+  uxJuice["uiUxRequirements → ux-juice-projectType"]
+  fid["fidelityCritic noSkill"]
+  ta["technologyArchitect → ta-technologies-projectType"]
+  uxLook["uiUxDesignSystem → ux-look-and-feel-projectType"]
+
+  boot --> saReq --> uxJuice --> fid --> ta --> uxLook
+```
+
+| Stage | Phase | Skill examples |
+|-------|-------|----------------|
+| Bootstrap README | `bootstrap` | `sa-bootstrap-core` |
+| Expand pré-reqs | `requirements` | `sa-requirements-crud` / `webgame` / `godotgame`* / `backend` → else `sa-requirements-core` |
+| UX juice | `juice` | `ux-juice-webgame` → `ux-juice-core` |
+| TA stack | `technologies` | `ta-technologies-webgame` / `crud` / `backend` → core |
+| Look-and-feel | `look-and-feel` | `ux-look-and-feel-webgame` → core |
+
+\* `*-godotgame.md` when authored; until then resolve falls through to core while `needsUiFlow=true` keeps UX/QA on the screen-flow path.
+
+### 2 — Todo plan + three-handed specs
+
+```mermaid
+flowchart TD
+  todo["systemArchitectTodoPlan → sa-todo-plan-core"]
+  sa["systemArchitectSpecItem → sa-spec-write-core"]
+  ux["uiUxSpecEnrich → ux-flow-projectType or ux-spec-flow-core"]
+  ta["technologyArchitectSpecEnrich → ta-spec-tech-projectType"]
+
+  todo --> sa --> ux --> ta
+```
+
+| Stage | Phase | Skill examples |
+|-------|-------|----------------|
+| Todo checklist | `todo-plan` | `sa-todo-plan-core` |
+| Spec draft | `spec-write` | `sa-spec-write-core` |
+| Flow & states | `spec-flow` | `ux-flow-webgame` / `ux-flow-webapp` → `ux-spec-flow-core` |
+| Tech how-to | `spec-tech` | `ta-spec-tech-webgame` → `ta-spec-tech-core` |
+
+### 3 — QA and tests
+
+```mermaid
+flowchart TD
+  redUi["needsUiFlow true → qa-tdd-red-screenflow / forms"]
+  redApi["needsUiFlow false → qa-tdd-red-api-contract"]
+  green["SE implements under red tests"]
+  verifyUi["qa-tdd-verify-screenflow"]
+  verifyApi["qa-tdd-verify-api-contract"]
+
+  redUi --> green --> verifyUi
+  redApi --> green --> verifyApi
+```
+
+| Stage | Phase | Skill examples |
+|-------|-------|----------------|
+| TDD red | `tdd-red` | `webgame`/`godotgame`/`webapp`/`crud` → screenflow (+ forms for crud/webapp); `backend` → api-contract → `qa-tdd-red-core` |
+| TDD verify | `tdd-verify` | same UI vs API split → `qa-tdd-verify-core` |
+
+Workflow `tests` runs only this block (no SE). Docs-only stops before it.
+
+### 4 — Development (TDD green + delivery spot-check)
+
+```mermaid
+flowchart TD
+  se["softwareEngineer → se-tdd-green-projectType or se-implement-tdd-green"]
+  critic["deliveryCriticDelivery → se-delivery-critic-core"]
+  fix["softwareEngineerFix → se-fix-core"]
+
+  se --> critic
+  critic -->|reopen| se
+  critic -->|PASS| qaVerifyNode[qa-tdd-verify]
+  fix -.->|workflow fix / verify fail| se
+```
+
+| Stage | Phase | Skill examples |
+|-------|-------|----------------|
+| Implement | `tdd-green` | `se-tdd-green-webgame` / `se-tdd-green-crud` → `se-implement-tdd-green` → `se-tdd-green-core` |
+| Spot-check | `delivery-critic` | `se-delivery-critic-core` (playbook + when LLM critic is used) |
+| Bug fix | `fix` | `se-fix-core` |
+
+### 5 — Close-out + analyze shortcut
+
+| Stage | Phase | Skill |
+|-------|-------|-------|
+| Owner report | `summary` | `sa-summary-core` |
+| Tech-debt plan | `tech-debt` | `sa-tech-debt-core` |
+| `workflow=analyze` | `analyze` | `sa|ta|ux|se-analyze-core`, `qa-analyze-coverage` |
+
+**No skill inject:** `fidelityCritic`, `deliveryCriticArchitecture`, `scaffoldPrepare`, `bootstrapFix`, `orchestratorFinalize` (heuristic / non-role LLM).
+
 ## Setup
 
 1. `cp .env.example .env` and fill in `NINEROUTER_BASE` / `NINEROUTER_KEY` (optional `MODEL_*`, `GRAPH_RECURSION_LIMIT`, `MAX_QA_FIX_ROUNDS`, `MAX_DELIVERY_FIX_ROUNDS`, `PROGRESS_HEARTBEAT_MS`).
@@ -264,6 +430,7 @@ Example:
 ```json
 {
   "version": 1,
+  "projectType": "webgame",
   "models": {
     "systemArchitect": "9RSA-system-architect-free",
     "technologyArchitect": "9RTA-technology-architect-free",
@@ -281,6 +448,8 @@ Example:
   }
 }
 ```
+
+`projectType` drives role-skill resolution (`crud` | `webgame` | `godotgame` | `backend` | …) — see [Role skills injection](#role-skills-injection).
 
 MCP tools: `get_zteam_config`, `write_zteam_config`, `ensure_zteam_setup`, `run_development_pipeline`, `get_pipeline_state`, `approve_gate`.
 
@@ -462,6 +631,7 @@ npm run pipeline -- --project-root samples/my-app "idea…"   # workspace from e
 npm run pipeline:feature -- --project-root samples/my-app "add CSV export"
 npm run pipeline:resume -- --project-root samples/my-app "resume pending"
 npm run graph
+npm run studio          # LangGraph Studio (topology of the pipeline graph)
 npm run smoke
 npm run smoke:workflows
 npm run smoke:reqs
@@ -476,6 +646,8 @@ npm run smoke:all
 ```
 
 Use `--workspace-root` + `projectRoot` so generated docs land in the app folder, not this MCP package.
+
+**LangGraph Studio:** `npm run studio` (or from a client project: `node .zteam/langgraph/dev.mjs`) opens the Agent Server; UI at `https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024`. Shows pipeline **topology** only — not live MCP run traces. Client bootstrap always materializes `.zteam/langgraph/` + copies `.docs/langgraph.mmd` when available.
 
 ### Smoke
 
