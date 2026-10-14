@@ -73,6 +73,37 @@ export const CURSOR_MODEL_ALIASES = new Set([
 
 export type LlmRuntime = "cursor" | "ninerouter";
 
+/**
+ * Provider strategy (Hybrid 9router / OmniRoute / OpenRouter + Cursor Task):
+ * - `"cursor-task"`: Always Path A (Cursor Task subagents with `stage.model = "inherit"` or native Cursor allowlist slug; custom 9r/BYOK ids go into `stage.requestedModel` + picker banner).
+ * - `"ninerouter-direct"`: Always Path B (MCP LangGraph `ChatOpenAI` against `.env` OpenAI-compatible gateway: 9router, OmniRoute, OpenRouter).
+ * - `"hybrid"` (default):
+ *   - All primaries are Cursor aliases (`inherit` / `auto`) → Path A (`cursor`).
+ *   - All primaries are the SAME custom 9r/BYOK model id (e.g. all `9r-code-heavy`) AND `provider` is explicitly `"hybrid"` with `preferTaskWhenSingleCustomModel` OR `provider === "cursor-task"` → Path A (`cursor`, `stage.model = "inherit"`, `requestedModel = "9r-code-heavy"`, banner tells user to select `9r-code-heavy` in parent chat picker).
+ *   - Primaries have >1 distinct custom model (e.g. `9r-code-heavy` + `9r-code-light`) → Path B (`ninerouter`, MCP role-agents via `.env` endpoint).
+ */
+export type TeamProviderMode = "cursor-task" | "ninerouter-direct" | "hybrid";
+
+/** Official Cursor Task allowlist (BYOK / custom `9r-*` models are rejected by Cursor Task if passed as `model`). */
+export const CURSOR_NATIVE_TASK_ALLOWLIST = new Set([
+  "inherit",
+  "claude-4.6-sonnet-medium-thinking",
+  "claude-fable-5-1-thinking-high",
+  "claude-opus-5-5-medium",
+  "claude-sonnet-5-5-high",
+  "composer-2.5",
+  "composer-2.5-fast",
+  "gemini-3.1-pro",
+  "gemini-3.8-flash-high",
+  "gemini-4-argon-medium",
+]);
+
+export function isCursorTaskAllowlistedModel(model: string): boolean {
+  const m = (model || "").trim();
+  if (!m) return false;
+  return CURSOR_NATIVE_TASK_ALLOWLIST.has(m);
+}
+
 export type CursorSubagentType =
   | "system-architect"
   | "technology-architect"
@@ -106,6 +137,10 @@ export function isCursorModelAlias(model: string): boolean {
 export type TeamRuntimeOk = {
   ok: true;
   runtime: LlmRuntime;
+  provider: TeamProviderMode;
+  /** Set when Path A (`cursor-task` / `hybrid` single custom model) delegates a 9r/BYOK model via parent picker + `Task(model="inherit")`. */
+  parentPickerModel?: string;
+  reason?: string;
 };
 
 export type TeamRuntimeErr = {
@@ -165,15 +200,23 @@ export function officialConfigModelsTemplate(
       uiUxDesigner: "inherit",
       softwareEngineer: "inherit",
       qaEngineer: "inherit",
-      fallback: "",
-      systemArchitectFallback: "",
-      technologyArchitectFallback: "",
-      uiUxDesignerFallback: "",
-      softwareEngineerFallback: "",
-      qaEngineerFallback: "",
+      fallback: "inherit",
+      systemArchitectFallback: "inherit",
+      technologyArchitectFallback: "inherit",
+      uiUxDesignerFallback: "inherit",
+      softwareEngineerFallback: "inherit",
+      qaEngineerFallback: "inherit",
     };
   }
-  return { ...DEFAULT_MODELS };
+  return {
+    ...DEFAULT_MODELS,
+    fallback: "inherit",
+    systemArchitectFallback: "inherit",
+    technologyArchitectFallback: "inherit",
+    uiUxDesignerFallback: "inherit",
+    softwareEngineerFallback: "inherit",
+    qaEngineerFallback: "inherit",
+  };
 }
 
 /** Snippet for mixed_runtime / missing_role resumeHint. */
@@ -183,13 +226,30 @@ export function suggestedHomogeneousConfigSnippet(
   const models = officialConfigModelsTemplate(
     prefer === "cursor" ? "cursor" : "ninerouter"
   );
-  return JSON.stringify({ version: 1, models }, null, 2);
+  return JSON.stringify(
+    { version: 1, provider: "hybrid", models },
+    null,
+    2
+  );
 }
 
-/** Homogeneous runtime from primary models; mix → mixed_runtime. */
+/**
+ * Resolve runtime (`cursor` Path A vs `ninerouter` Path B) from `provider` + primary `models`:
+ * - Mix of cursor aliases (`inherit`) and custom 9r ids in primaries → `mixed_runtime` error (unless `provider === "cursor-task"`).
+ * - `provider === "cursor-task"`: always returns `runtime: "cursor"` (Path A), with `stage.model = "inherit"` for any non-allowlisted `9r-*` id.
+ * - `provider === "ninerouter-direct"`: when primaries are custom ids, forces `runtime: "ninerouter"` (Path B MCP ChatOpenAI).
+ * - `provider === "hybrid"` (default):
+ *   - All primaries are Cursor aliases (`inherit`/`auto`) → `runtime: "cursor"`.
+ *   - All 5 primaries request the **exact same** custom id (e.g. all `9r-code-heavy`) AND `cfg.provider === "hybrid"` was explicitly configured → `runtime: "cursor"` (Path A: run parent chat on `9r-code-heavy` and spawn Tasks with `model: "inherit"`).
+ *   - Primaries request **multiple distinct** custom ids (e.g. `SA=9r-code-heavy`, `QA=9r-code-light`) → `runtime: "ninerouter"` (Path B: MCP role-agents call OpenAI-compatible `.env` endpoint per role).
+ */
 export function resolveTeamRuntime(
-  cfg: Pick<ResolvedTeamConfig, "models">
+  cfg: Pick<ResolvedTeamConfig, "models"> & {
+    provider?: TeamProviderMode;
+    explicitProvider?: boolean;
+  }
 ): TeamRuntimeResolution {
+  const provider: TeamProviderMode = cfg.provider || "hybrid";
   const roles = {} as Record<
     TeamRole,
     { model: string; runtime: LlmRuntime }
@@ -201,6 +261,27 @@ export function resolveTeamRuntime(
       runtime: isCursorModelAlias(model) ? "cursor" : "ninerouter",
     };
   }
+
+  if (provider === "cursor-task") {
+    const customIds = [
+      ...new Set(
+        TEAM_ROLES.map((r) => roles[r].model).filter(
+          (m) => m && !isCursorModelAlias(m)
+        )
+      ),
+    ];
+    return {
+      ok: true,
+      runtime: "cursor",
+      provider: "cursor-task",
+      parentPickerModel: customIds[0],
+      reason:
+        customIds.length > 0
+          ? `provider=cursor-task: select '${customIds[0]}' in Cursor parent chat picker; all Task subagents use model='inherit'`
+          : "provider=cursor-task: all Task subagents use Cursor runtime",
+    };
+  }
+
   const runtimes = new Set(TEAM_ROLES.map((r) => roles[r].runtime));
   if (runtimes.size > 1) {
     const detail = TEAM_ROLES.map(
@@ -214,14 +295,52 @@ export function resolveTeamRuntime(
     return {
       ok: false,
       failureKind: "mixed_runtime",
-      message: `All primary models must share one runtime (cursor aliases OR 9router ids). Got mixed: ${detail}`,
+      message: `All primary models must share one runtime (cursor aliases OR 9router/OpenAPI ids). Got mixed: ${detail}`,
       roles,
       suggestedConfigSnippet: suggestedHomogeneousConfigSnippet(prefer),
     };
   }
+
+  const baseRuntime = [...runtimes][0] ?? "ninerouter";
+  if (baseRuntime === "cursor") {
+    return {
+      ok: true,
+      runtime: "cursor",
+      provider,
+      reason: "all primaries are Cursor aliases (inherit)",
+    };
+  }
+
+  // All primaries are non-alias (e.g. 9r-code-heavy / 9r-code-light)
+  const distinctCustomIds = [
+    ...new Set(TEAM_ROLES.map((r) => roles[r].model).filter(Boolean)),
+  ];
+
+  // Hybrid Path A: when all 5 roles share the exact same custom model (e.g. all 9r-code-heavy)
+  // and provider is not forced to "ninerouter-direct", prefer Path A (Task + inherit) if provider was explicitly set to "hybrid"
+  if (
+    provider === "hybrid" &&
+    cfg.explicitProvider &&
+    distinctCustomIds.length === 1
+  ) {
+    const singleModel = distinctCustomIds[0];
+    return {
+      ok: true,
+      runtime: "cursor",
+      provider: "hybrid",
+      parentPickerModel: singleModel,
+      reason: `hybrid single-model (${singleModel}): select '${singleModel}' in Cursor parent chat picker; Task subagents run with model='inherit'`,
+    };
+  }
+
   return {
     ok: true,
-    runtime: [...runtimes][0] ?? "ninerouter",
+    runtime: "ninerouter",
+    provider,
+    reason:
+      distinctCustomIds.length > 1
+        ? `hybrid multi-model (${distinctCustomIds.join(", ")}): running MCP role-agents against .env OpenAI-compatible gateway`
+        : "ninerouter-direct: running MCP role-agents against .env OpenAI-compatible gateway",
   };
 }
 
@@ -229,7 +348,12 @@ export type DelegationStage = {
   id: string;
   role: TeamRole;
   subagentType: CursorSubagentType;
+  /** Safe Cursor Task model slug (ALWAYS `"inherit"` or an official Cursor allowlisted slug; NEVER a raw `9r-*` BYOK id). */
   model: string;
+  /** Original model requested in `.zteam/config.json` (e.g. `"9r-code-heavy"` when `model` was coerced to `"inherit"`). */
+  requestedModel?: string;
+  /** Fallback model for Cursor Task (always `"inherit"`, never `"auto"`). */
+  fallbackModel?: string;
   title: string;
   instructions: string;
   expectedOutputs: string[];
@@ -241,6 +365,9 @@ export type DelegationStage = {
 
 export type CursorDelegationPlaybook = {
   llmRuntime: "cursor";
+  provider: TeamProviderMode;
+  /** Banner when Path A delegates custom/BYOK models (e.g. `9r-code-heavy`) via parent chat picker + `Task(model="inherit")`. */
+  parentPickerBanner?: string;
   workflow: string;
   wave: 1 | 2;
   userIdea: string;
@@ -334,10 +461,12 @@ export function buildCursorDelegationPlaybook(opts: {
   cursorModels?: CursorRoleModels;
   maxTokens: ResolvedTeamConfig["maxTokens"];
   projectType?: string;
+  provider?: TeamProviderMode;
   focusSlug?: string;
   completedStageRecords?: Record<string, CursorPlaybookStageRecord>;
 }): CursorDelegationPlaybook {
   const wf = opts.workflow || "full";
+  const provider: TeamProviderMode = opts.provider || "hybrid";
   const idea = opts.userIdea.trim();
   const shortIdea = idea.length > 260 ? `${idea.slice(0, 260)}…` : idea;
   const rootHint = `appRoot=${opts.appRoot}`;
@@ -347,11 +476,55 @@ export function buildCursorDelegationPlaybook(opts: {
     ? loadCompletedStageIdsSync(opts.appRoot, opts.completedStageRecords)
     : new Set<string>();
 
-  const resolveTaskModel = (role: TeamRole): string => {
+  const coercedCustomModels = new Set<string>();
+
+  /**
+   * Cursor Task allowlist guard:
+   * - Never pass `"auto"` or custom BYOK/9router ids (`9r-code-heavy`, `9r-code-light`, etc.) into `stage.model`
+   *   because Cursor's Task tool explicitly rejects non-allowlisted BYOK models.
+   * - Native Cursor allowlisted slugs (`composer-2.5`, `composer-2.5-fast`, `claude-sonnet-5-5-high`, etc.) or `"inherit"` are allowed.
+   * - Any custom/BYOK id is coerced to `"inherit"` and preserved in `stage.requestedModel`.
+   */
+  const resolveTaskModel = (
+    role: TeamRole
+  ): { model: string; requestedModel: string; fallbackModel: string } => {
     const cm = opts.cursorModels?.[role]?.trim();
-    if (cm) return cm;
-    const primary = opts.models[role]?.trim();
-    return primary || "inherit";
+    const primary = opts.models[role]?.trim() || "inherit";
+    const desired = cm || primary;
+    const lower = desired.toLowerCase();
+
+    if (lower === "inherit" || lower === "auto" || lower === "cursor" || lower === "cursor-auto") {
+      return {
+        model: "inherit",
+        requestedModel: primary,
+        fallbackModel: "inherit",
+      };
+    }
+
+    if (isCursorTaskAllowlistedModel(desired)) {
+      return {
+        model: desired,
+        requestedModel: desired,
+        fallbackModel: "inherit",
+      };
+    }
+
+    // Legacy `cursor:...` prefix used in smoke tests
+    if (lower.startsWith("cursor:")) {
+      return {
+        model: desired,
+        requestedModel: desired,
+        fallbackModel: "inherit",
+      };
+    }
+
+    // Custom / BYOK / 9router model id (e.g. `9r-code-heavy`) -> coerce Task model to `inherit`
+    coercedCustomModels.add(desired);
+    return {
+      model: "inherit",
+      requestedModel: desired,
+      fallbackModel: "inherit",
+    };
   };
 
   const stage = (
@@ -378,11 +551,14 @@ export function buildCursorDelegationPlaybook(opts: {
         instr = `${instr}\n\n${formatSkillPromptBlock(skill)}`;
       }
     }
+    const resolvedModel = resolveTaskModel(role);
     return {
       id,
       role,
       subagentType: ROLE_TO_SUBAGENT[role],
-      model: resolveTaskModel(role),
+      model: resolvedModel.model,
+      requestedModel: resolvedModel.requestedModel,
+      fallbackModel: resolvedModel.fallbackModel,
       title,
       instructions: instr,
       expectedOutputs,
@@ -419,8 +595,15 @@ export function buildCursorDelegationPlaybook(opts: {
         [".docs/reviews/*.md"]
       )
     );
+    const pickerList = [...coercedCustomModels];
+    const parentPickerBanner =
+      pickerList.length > 0
+        ? `Run this Cursor chat with model '${pickerList[0]}' selected in the picker — Task subagents use model="inherit" (Cursor blocks custom/BYOK slugs in Task.model).`
+        : undefined;
     return {
       llmRuntime: "cursor",
+      provider,
+      ...(parentPickerBanner ? { parentPickerBanner } : {}),
       workflow: wf,
       wave: 1,
       userIdea: idea,
@@ -432,6 +615,7 @@ export function buildCursorDelegationPlaybook(opts: {
       maxTokens: opts.maxTokens,
       stages,
       resumeHint:
+        (parentPickerBanner ? `${parentPickerBanner} ` : "") +
         "llmRuntime=cursor: run each delegationPlaybook.stages entry via Cursor Task. Do NOT call 9router.",
     };
   }
@@ -647,8 +831,16 @@ export function buildCursorDelegationPlaybook(opts: {
     ? stages.filter((s) => !doneStageIds.has(s.id))
     : stages;
 
+  const pickerList = [...coercedCustomModels];
+  const parentPickerBanner =
+    pickerList.length > 0
+      ? `Run this Cursor chat with model '${pickerList[0]}' selected in the picker — Task subagents use model="inherit" (Cursor blocks custom/BYOK slugs in Task.model; requested: ${pickerList.join(", ")}).`
+      : undefined;
+
   return {
     llmRuntime: "cursor",
+    provider,
+    ...(parentPickerBanner ? { parentPickerBanner } : {}),
     workflow: wf,
     wave,
     userIdea: idea,
@@ -660,7 +852,8 @@ export function buildCursorDelegationPlaybook(opts: {
     maxTokens: opts.maxTokens,
     stages: filteredStages,
     resumeHint:
-      "HOST INSTRUCTIONS (llmRuntime=cursor): Run each delegationPlaybook.stages entry via Cursor Task using `subagent_type: stage.subagentType` and `model: stage.model`. Do NOT call 9router. Before each Task call `get_pipeline_state({ workspaceRoot, projectRoot, recordStage: stage.id, recordRole: stage.role, recordStatus: 'start', skillKey: stage.skillKey })`; after each Task call `get_pipeline_state({ ..., recordStatus: 'done', checkGate: true })` (if `gate.ok === false`, fix before advancing). When `.docs/todo.md` is created after `sa-todo-and-specs`, call `run_development_pipeline` with `workflow: 'resume'` to expand Wave 2 per-slug stages. At the end of the pipeline, call `get_pipeline_state({ ..., recordStage: 'pipeline', recordStatus: 'done', recordMessage: 'Pipeline completed' })` so `.zteam/dashboard/index.html` shows Completed.",
+      (parentPickerBanner ? `${parentPickerBanner} ` : "") +
+      "HOST INSTRUCTIONS (llmRuntime=cursor): Run each delegationPlaybook.stages entry via Cursor Task using `subagent_type: stage.subagentType` and `model: stage.model` (NEVER pass raw 9r-* BYOK ids in Task.model — always use stage.model which is 'inherit' or an allowlisted Cursor slug). Do NOT call 9router. Before each Task call `get_pipeline_state({ workspaceRoot, projectRoot, recordStage: stage.id, recordRole: stage.role, recordStatus: 'start', skillKey: stage.skillKey })`; after each Task call `get_pipeline_state({ ..., recordStatus: 'done', checkGate: true })` (if `gate.ok === false`, fix before advancing). When `.docs/todo.md` is created after `sa-todo-and-specs`, call `run_development_pipeline` with `workflow: 'resume'` to expand Wave 2 per-slug stages. At the end of the pipeline, call `get_pipeline_state({ ..., recordStage: 'pipeline', recordStatus: 'done', recordMessage: 'Pipeline completed' })` so `.zteam/dashboard/index.html` shows Completed.",
   };
 }
 
@@ -810,13 +1003,21 @@ const maxTokensSchema = z
   })
   .passthrough();
 
+export const providerModeSchema = z.enum([
+  "cursor-task",
+  "ninerouter-direct",
+  "hybrid",
+]);
+
 export const zteamConfigFileSchema = z
   .object({
     version: z.number().int().positive().default(1),
+    /** Strategy: "cursor-task" (Path A: Task + inherit), "ninerouter-direct" (Path B: MCP ChatOpenAI via .env), or "hybrid" (default auto A/B). */
+    provider: providerModeSchema.optional(),
     /** webgame | godotgame | crud | webapp | mobile | cli-dos | backend | frontend | fullstack | library | desktop | ai-rag | other */
     projectType: z.string().min(1).optional(),
     models: modelsSchema.optional(),
-    /** Optional Cursor Task model slugs per role (e.g. "composer-2.5", "claude-sonnet-5-5-high") when models.* are "inherit". */
+    /** Optional Cursor Task model slugs per role (e.g. "composer-2.5", "composer-2.5-fast") when models.* are "inherit". */
     cursorModels: cursorModelsSchema.optional(),
     maxTokens: maxTokensSchema.optional(),
     createdAt: z.string().optional(),
@@ -845,6 +1046,10 @@ export function needsUiFlow(projectType?: string | null): boolean {
 export type ZteamConfigFile = z.infer<typeof zteamConfigFileSchema>;
 
 export type ResolvedTeamConfig = {
+  /** Strategy: "cursor-task" | "ninerouter-direct" | "hybrid" (default "hybrid"). */
+  provider: TeamProviderMode;
+  /** True when `provider` was explicitly set in `.zteam/config.json`. */
+  explicitProvider?: boolean;
   /** From .zteam/config.json — drives skill resolution (webgame, crud, …). */
   projectType: string;
   models: {
@@ -924,19 +1129,24 @@ export const MODEL_QUESTIONS = [
   "Gravar neste projeto: workspace (raiz aberta), app (projectRoot), ou ambos?",
 ] as const;
 
-/** Resolve per-role fallback model id (role-specific → legacy global for SE). */
+/** Resolve per-role fallback model id (role-specific → legacy global for SE). Ignores Cursor aliases (`inherit`/`auto`) when resolving 9router fallback. */
 export function resolveRoleFallbackModel(
   cfg: ResolvedTeamConfig,
   role: TeamRole
 ): string {
+  const cleanNineFallback = (v: string | undefined): string => {
+    const t = (v || "").trim();
+    if (!t || isCursorModelAlias(t)) return "";
+    return t;
+  };
   const key = `${role}Fallback` as const;
-  const perRole = (cfg.models as Record<string, string>)[key]?.trim() || "";
+  const perRole = cleanNineFallback((cfg.models as Record<string, string>)[key]);
   if (perRole) return perRole;
   if (role === "softwareEngineer") {
     return (
-      cfg.models.fallback?.trim() ||
-      process.env.MODEL_FALLBACK?.trim() ||
-      process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK?.trim() ||
+      cleanNineFallback(cfg.models.fallback) ||
+      cleanNineFallback(process.env.MODEL_FALLBACK) ||
+      cleanNineFallback(process.env.MODEL_SOFTWARE_ENGINEER_FALLBACK) ||
       ""
     );
   }
@@ -952,7 +1162,7 @@ export function resolveRoleFallbackModel(
             : role === "softwareEngineer"
               ? "MODEL_SOFTWARE_ENGINEER_FALLBACK"
               : "";
-  if (envKey && process.env[envKey]?.trim()) return process.env[envKey]!.trim();
+  if (envKey) return cleanNineFallback(process.env[envKey]);
   return "";
 }
 
@@ -1544,7 +1754,16 @@ export function envDefaultsTeamConfig(): Omit<
   ResolvedTeamConfig,
   "sources" | "exists"
 > {
+  const envProv = (process.env.ZTEAM_PROVIDER || "").trim();
+  const provider: TeamProviderMode =
+    envProv === "cursor-task" ||
+    envProv === "ninerouter-direct" ||
+    envProv === "hybrid"
+      ? envProv
+      : "hybrid";
   return {
+    provider,
+    explicitProvider: Boolean(envProv),
     projectType: process.env.ZTEAM_PROJECT_TYPE?.trim() || "",
     models: {
       systemArchitect:
@@ -1613,6 +1832,8 @@ export function defaultsOnlyTeamConfig(): Omit<
   "sources" | "exists"
 > {
   return {
+    provider: "hybrid",
+    explicitProvider: false,
     projectType: "",
     models: { ...DEFAULT_MODELS },
     cursorModels: {},
@@ -1667,6 +1888,8 @@ function mergeLayer(
   if (!layer) return base;
   const lm = layer.models;
   return {
+    provider: layer.provider ?? base.provider ?? "hybrid",
+    explicitProvider: Boolean(layer.provider || base.explicitProvider),
     projectType:
       (layer.projectType || "").trim() || base.projectType || "",
     models: {
@@ -1823,6 +2046,7 @@ export function needsWorkspaceRootPayload(): Record<string, unknown> {
 }
 
 export type WriteTeamConfigInput = {
+  provider?: TeamProviderMode;
   models: {
     systemArchitect: string;
     technologyArchitect: string;
@@ -1853,12 +2077,14 @@ export async function writeTeamConfig(
 
   let createdAt = now;
   let prevProjectType = "";
+  let prevProvider: TeamProviderMode | undefined;
   let prevCursorModels: CursorRoleModels = {};
   if (await pathExists(abs)) {
     try {
       const prev = await readConfigFile(abs);
       if (prev?.createdAt) createdAt = prev.createdAt;
       if (prev?.projectType) prevProjectType = prev.projectType.trim();
+      if (prev?.provider) prevProvider = prev.provider;
       if (prev?.cursorModels) prevCursorModels = prev.cursorModels;
     } catch {
       /* rewrite */
@@ -1867,11 +2093,19 @@ export async function writeTeamConfig(
 
   const projectType =
     (input.projectType || "").trim() || prevProjectType || undefined;
+  const provider = input.provider || prevProvider || undefined;
   const cursorModels = mergeCursorModels(prevCursorModels, input.cursorModels);
   const hasCursorModels = Object.keys(cursorModels).length > 0;
 
+  // Normalize "auto" fallback to "inherit" so Cursor Task fallback never uses "auto"
+  const normFb = (v: string | undefined): string => {
+    const t = (v ?? "").trim();
+    return t.toLowerCase() === "auto" ? "inherit" : t;
+  };
+
   const config: ZteamConfigFile = zteamConfigFileSchema.parse({
     version: 1,
+    ...(provider ? { provider } : {}),
     ...(projectType ? { projectType } : {}),
     models: {
       systemArchitect: input.models.systemArchitect.trim(),
@@ -1891,21 +2125,14 @@ export async function writeTeamConfig(
       ).trim(),
       softwareEngineer: input.models.softwareEngineer.trim(),
       qaEngineer: input.models.qaEngineer.trim(),
-      fallback: (input.models.fallback ?? "").trim(),
-      systemArchitectFallback: (
-        input.models.systemArchitectFallback ??
-        ""
-      ).trim(),
-      technologyArchitectFallback: (
-        input.models.technologyArchitectFallback ??
-        ""
-      ).trim(),
-      uiUxDesignerFallback: (input.models.uiUxDesignerFallback ?? "").trim(),
-      softwareEngineerFallback: (
-        input.models.softwareEngineerFallback ??
-        ""
-      ).trim(),
-      qaEngineerFallback: (input.models.qaEngineerFallback ?? "").trim(),
+      fallback: normFb(input.models.fallback),
+      systemArchitectFallback: normFb(input.models.systemArchitectFallback),
+      technologyArchitectFallback: normFb(
+        input.models.technologyArchitectFallback
+      ),
+      uiUxDesignerFallback: normFb(input.models.uiUxDesignerFallback),
+      softwareEngineerFallback: normFb(input.models.softwareEngineerFallback),
+      qaEngineerFallback: normFb(input.models.qaEngineerFallback),
     },
     ...(hasCursorModels ? { cursorModels } : {}),
     maxTokens: {
@@ -2035,6 +2262,11 @@ export const writeZteamConfigToolShape = {
     ),
   projectRoot: z.string().optional().default("."),
   scope: z.enum(["workspace", "app", "both"]),
+  provider: providerModeSchema
+    .optional()
+    .describe(
+      "Execution strategy: 'hybrid' (default: Path A Task+inherit when 1 custom model or inherit; Path B MCP ChatOpenAI via .env when multi-model like heavy+light), 'cursor-task' (force Path A), or 'ninerouter-direct' (force Path B)"
+    ),
   projectType: z
     .string()
     .optional()

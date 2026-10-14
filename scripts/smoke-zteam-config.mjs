@@ -786,6 +786,141 @@ try {
     );
   }
 
+  // --- Hybrid 9router / OmniRoute / OpenRouter + Path A / Path B routing ---
+  {
+    const { resolveLlmEndpoint, MCP_DOTENV_PATH } = await import(
+      "../src/env-config.ts"
+    );
+    assert(
+      MCP_DOTENV_PATH.endsWith(".env"),
+      "MCP_DOTENV_PATH points to package .env"
+    );
+
+    // 1. Multi-model hybrid (SA/TA/SE = 9r-code-heavy, UX/QA = 9r-code-light, fallbacks = auto -> normalized to inherit)
+    const multiDir = join(base, "hybrid-multi");
+    await mkdir(multiDir, { recursive: true });
+    await writeTeamConfig(multiDir, {
+      provider: "hybrid",
+      projectType: "webgame",
+      models: {
+        systemArchitect: "9r-code-heavy",
+        technologyArchitect: "9r-code-heavy",
+        uiUxDesigner: "9r-code-light",
+        softwareEngineer: "9r-code-heavy",
+        qaEngineer: "9r-code-light",
+        fallback: "auto",
+        systemArchitectFallback: "auto",
+      },
+    });
+    const multiCfg = await loadTeamConfig(multiDir, multiDir);
+    assert(multiCfg.provider === "hybrid", "provider hybrid saved");
+    assert(
+      multiCfg.models.fallback === "inherit" &&
+        multiCfg.models.systemArchitectFallback === "inherit",
+      "auto fallback normalized to inherit"
+    );
+    const rtMulti = resolveTeamRuntime(multiCfg);
+    assert(
+      rtMulti.ok && rtMulti.runtime === "ninerouter",
+      "hybrid with heavy != light chooses Path B (ninerouter MCP role-agents)"
+    );
+    // missingNineRouterModels ignores 'inherit' fallbacks
+    const missingMulti = missingNineRouterModels(
+      multiCfg,
+      new Set(["9r-code-heavy", "9r-code-light"])
+    );
+    assert(
+      missingMulti.length === 0,
+      `inherit fallbacks must not fail 9router /models check, got ${missingMulti.join(",")}`
+    );
+
+    // 2. Single custom model with explicit provider="hybrid" -> Path A (cursor Task + inherit + parentPickerModel)
+    const singleDir = join(base, "hybrid-single");
+    await mkdir(singleDir, { recursive: true });
+    await writeTeamConfig(singleDir, {
+      provider: "hybrid",
+      projectType: "webgame",
+      models: {
+        systemArchitect: "9r-code-heavy",
+        technologyArchitect: "9r-code-heavy",
+        uiUxDesigner: "9r-code-heavy",
+        softwareEngineer: "9r-code-heavy",
+        qaEngineer: "9r-code-heavy",
+        fallback: "inherit",
+      },
+    });
+    const singleCfg = await loadTeamConfig(singleDir, singleDir);
+    const rtSingle = resolveTeamRuntime(singleCfg);
+    assert(
+      rtSingle.ok &&
+        rtSingle.runtime === "cursor" &&
+        rtSingle.parentPickerModel === "9r-code-heavy",
+      "hybrid with single custom 9r model chooses Path A (cursor Task + inherit + parentPickerModel)"
+    );
+    const pbSingle = buildCursorDelegationPlaybook({
+      workflow: "docs",
+      userIdea: "Grid Pursuit",
+      workspaceRoot: singleDir,
+      projectRoot: ".",
+      appRoot: singleDir,
+      models: singleCfg.models,
+      maxTokens: singleCfg.maxTokens,
+      projectType: singleCfg.projectType,
+      provider: singleCfg.provider,
+    });
+    assert(
+      pbSingle.stages.every(
+        (s) =>
+          s.model === "inherit" &&
+          s.requestedModel === "9r-code-heavy" &&
+          s.fallbackModel === "inherit"
+      ),
+      "Path A playbook coerces 9r-code-heavy to stage.model='inherit' and keeps stage.requestedModel='9r-code-heavy'"
+    );
+    assert(
+      typeof pbSingle.parentPickerBanner === "string" &&
+        pbSingle.parentPickerBanner.includes("9r-code-heavy"),
+      "Path A playbook includes parentPickerBanner"
+    );
+
+    // 3. Multi-gateway .env resolver (OmniRoute & OpenRouter)
+    const prevGate = process.env.ZTEAM_LLM_GATEWAY;
+    const prevOmniKey = process.env.OMNIROUTE_KEY;
+    const prevOmniBase = process.env.OMNIROUTE_BASE;
+    const prevOrKey = process.env.OPENROUTER_API_KEY;
+    try {
+      process.env.ZTEAM_LLM_GATEWAY = "omniroute";
+      process.env.OMNIROUTE_BASE = "https://omni.example.com/v1";
+      process.env.OMNIROUTE_KEY = "sk-omni-test";
+      const epOmni = resolveLlmEndpoint();
+      assert(
+        epOmni.gateway === "omniroute" &&
+          epOmni.baseUrl === "https://omni.example.com/v1" &&
+          epOmni.apiKey === "sk-omni-test",
+        "OmniRoute gateway resolved from env"
+      );
+
+      process.env.ZTEAM_LLM_GATEWAY = "openrouter";
+      process.env.OPENROUTER_API_KEY = "sk-or-test";
+      const epOr = resolveLlmEndpoint();
+      assert(
+        epOr.gateway === "openrouter" &&
+          epOr.baseUrl === "https://openrouter.ai/api/v1" &&
+          epOr.apiKey === "sk-or-test",
+        "OpenRouter gateway resolved from env"
+      );
+    } finally {
+      if (prevGate === undefined) delete process.env.ZTEAM_LLM_GATEWAY;
+      else process.env.ZTEAM_LLM_GATEWAY = prevGate;
+      if (prevOmniKey === undefined) delete process.env.OMNIROUTE_KEY;
+      else process.env.OMNIROUTE_KEY = prevOmniKey;
+      if (prevOmniBase === undefined) delete process.env.OMNIROUTE_BASE;
+      else process.env.OMNIROUTE_BASE = prevOmniBase;
+      if (prevOrKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = prevOrKey;
+    }
+  }
+
   console.log("smoke:zteam-config OK");
 } finally {
   if (prevWs === undefined) delete process.env.WORKSPACE_ROOT;

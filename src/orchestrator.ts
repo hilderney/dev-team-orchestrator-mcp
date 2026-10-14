@@ -1,4 +1,8 @@
-import "dotenv/config";
+import {
+  MCP_DOTENV_PATH,
+  ensurePackageEnvLoaded,
+  resolveLlmEndpoint,
+} from "./env-config.js";
 import { spawn } from "node:child_process";
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import {
@@ -1360,13 +1364,35 @@ function contentKindOf(err: unknown): string {
 }
 
 // ============================================================
-// 1. 9Router OpenAI-compatible provider
+// 1. OpenAI-compatible provider (9Router / OmniRoute / OpenRouter via .env)
 // ============================================================
-const NINEROUTER_BASE = process.env.NINEROUTER_BASE ?? "http://localhost:20128/v1";
-const NINEROUTER_KEY = process.env.NINEROUTER_KEY;
-
-if (!NINEROUTER_KEY) {
-  throw new Error("NINEROUTER_KEY não definida no .env");
+// Lazy credential resolution: never throw at boot time so Path A (`cursor-task` / `inherit`)
+// works even before `.env` is configured. Path B (`ninerouter-direct` / multi-model `hybrid`)
+// validates `.env` credentials when `makeLLM` or `run_development_pipeline` executes.
+function makeLLM(model: string, maxTokens: number): ChatOpenAI {
+  const ep = resolveLlmEndpoint();
+  if (!ep.configured) {
+    const err = new Error(
+      `OpenAI-compatible API key not configured for model '${model}'. Set NINEROUTER_BASE + NINEROUTER_KEY (or OMNIROUTE_KEY / OPENROUTER_API_KEY) in ${MCP_DOTENV_PATH} (do not store secrets in ~/.cursor/mcp.json).`
+    );
+    (err as Error & { failureKind?: string }).failureKind = "missing_env_credentials";
+    throw err;
+  }
+  const traceId = getMetrics().traceId;
+  return new ChatOpenAI({
+    model,
+    configuration: {
+      baseURL: ep.baseUrl,
+      apiKey: ep.apiKey,
+      defaultHeaders: {
+        ...ep.defaultHeaders,
+        "X-Request-Id": traceId,
+        "X-Zteam-Trace-Id": traceId,
+      },
+    },
+    temperature: 0.2,
+    maxTokens,
+  });
 }
 
 const MAX_QA_FIX_ROUNDS = parseMaxQaFixRounds();
@@ -1401,23 +1427,6 @@ function roleLlm(role: TeamRole): { model: string; maxTokens: number } {
     model: cfg.models[role],
     maxTokens: cfg.maxTokens[role],
   };
-}
-
-function makeLLM(model: string, maxTokens: number): ChatOpenAI {
-  const traceId = getMetrics().traceId;
-  return new ChatOpenAI({
-    model,
-    configuration: {
-      baseURL: NINEROUTER_BASE,
-      apiKey: NINEROUTER_KEY,
-      defaultHeaders: {
-        "X-Request-Id": traceId,
-        "X-Zteam-Trace-Id": traceId,
-      },
-    },
-    temperature: 0.2,
-    maxTokens,
-  });
 }
 
 async function streamLlmContent(
@@ -5724,6 +5733,7 @@ server.tool(
         cursorModels: teamConfig.cursorModels,
         maxTokens: teamConfig.maxTokens,
         projectType: teamConfig.projectType,
+        provider: teamConfig.provider,
         focusSlug: (slug || "").trim() || undefined,
         completedStageRecords: existingState?.stages,
       });
@@ -5752,7 +5762,7 @@ server.tool(
       session.emit(
         "pipeline",
         "notify",
-        `llmRuntime=cursor — returning delegationPlaybook (wave=${playbook.wave}, ${playbook.stages.length} stages); skill must run Cursor Task`
+        `llmRuntime=cursor (provider=${teamConfig.provider}) — returning delegationPlaybook (wave=${playbook.wave}, ${playbook.stages.length} stages); skill must run Cursor Task`
       );
       session.close();
       return {
@@ -5763,6 +5773,13 @@ server.tool(
               {
                 ok: true,
                 llmRuntime: "cursor",
+                provider: teamConfig.provider,
+                ...(runtimeRes.parentPickerModel
+                  ? { parentPickerModel: runtimeRes.parentPickerModel }
+                  : {}),
+                ...(playbook.parentPickerBanner
+                  ? { parentPickerBanner: playbook.parentPickerBanner }
+                  : {}),
                 delegated: true,
                 workflow: explicit || mode,
                 wave: playbook.wave,
@@ -5980,19 +5997,31 @@ server.tool(
     const resolved = mcpResolveWorkspace(workspaceRoot);
     if (!resolved.ok) return resolved.result;
     const ws = resolved.ws;
+    ensurePackageEnvLoaded(ws.root);
     const appRoot = resolveAppRoot(projectRoot || ".", ws.root);
     const bootstrap = await ensureZteamBootstrapRoots(ws.root, appRoot);
     const teamConfig = await loadTeamConfig(ws.root, appRoot);
     const runtimeRes = resolveTeamRuntime(teamConfig);
+    const ep = resolveLlmEndpoint();
     const payload = {
       ok: true,
       exists: teamConfig.exists,
       sources: teamConfig.sources,
+      provider: teamConfig.provider,
       projectType: teamConfig.projectType || "",
       models: teamConfig.models,
       cursorModels: teamConfig.cursorModels,
       maxTokens: teamConfig.maxTokens,
       llmRuntime: runtimeRes.ok ? runtimeRes.runtime : null,
+      parentPickerModel: runtimeRes.ok ? runtimeRes.parentPickerModel ?? null : null,
+      runtimeReason: runtimeRes.ok ? runtimeRes.reason ?? null : null,
+      envEndpoint: {
+        gateway: ep.gateway,
+        baseUrl: ep.baseUrl,
+        configured: ep.configured,
+        sourceEnvKey: ep.sourceEnvKey,
+        packageDotenvPath: MCP_DOTENV_PATH,
+      },
       runtimeError: runtimeRes.ok
         ? null
         : {
@@ -6006,6 +6035,7 @@ server.tool(
       modelQuestions: [...MODEL_QUESTIONS],
       modelSuggestions: ROLE_MODEL_SUGGESTIONS,
       suggestedDefaults: {
+        provider: teamConfig.provider,
         projectType: teamConfig.projectType || "",
         models: teamConfig.models,
         cursorModels: teamConfig.cursorModels,
@@ -6031,12 +6061,13 @@ server.tool(
 
 server.tool(
   "write_zteam_config",
-  "Write .zteam/config.json to workspace, app, or both (including projectType, models, cursorModels, maxTokens); optionally update .gitignore.",
+  "Write .zteam/config.json to workspace, app, or both (including provider, projectType, models, cursorModels, maxTokens); optionally update .gitignore.",
   writeZteamConfigToolShape,
   async ({
     workspaceRoot,
     projectRoot,
     scope,
+    provider,
     projectType,
     models,
     cursorModels,
@@ -6061,6 +6092,7 @@ server.tool(
 
     for (const dir of unique) {
       const { path } = await writeTeamConfig(dir, {
+        provider,
         projectType,
         models,
         cursorModels,
@@ -6089,6 +6121,7 @@ server.tool(
               ok: true,
               written,
               gitignore,
+              provider: teamConfig.provider,
               projectType: teamConfig.projectType,
               models: teamConfig.models,
               cursorModels: teamConfig.cursorModels,

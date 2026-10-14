@@ -1,11 +1,14 @@
 /**
- * 9router / tunnel healthcheck (P1-4).
+ * 9router / OmniRoute / OpenRouter healthcheck (P1-4).
  */
+import { resolveLlmEndpoint } from "./env-config.js";
 
 export type HealthcheckResult = {
   ok: boolean;
   ms: number;
   status?: number;
+  gateway?: string;
+  baseUrl?: string;
   message: string;
 };
 
@@ -16,7 +19,7 @@ export const SUCCESS_CACHE_MS = 3 * 60_000;
 export const FAIL_CACHE_MS = 20_000;
 
 const TUNNEL_HINT =
-  "reinicie MCP / verifique túnel 9router (Cloudflare 1016)";
+  "configure NINEROUTER_BASE / OMNIROUTE_BASE / OPENROUTER_API_KEY in dev-team-orchestrator/.env (do not put secrets in ~/.cursor/mcp.json)";
 
 export function clearHealthcheckCache(): void {
   cached = null;
@@ -28,7 +31,7 @@ function cacheTtlMs(result: HealthcheckResult): number {
 
 export async function healthcheckNineRouter(
   baseUrl?: string,
-  opts?: { timeoutMs?: number; force?: boolean }
+  opts?: { timeoutMs?: number; force?: boolean; gateway?: string }
 ): Promise<HealthcheckResult> {
   const timeoutMs = opts?.timeoutMs ?? 5_000;
   const now = Date.now();
@@ -36,18 +39,27 @@ export async function healthcheckNineRouter(
     return { ...cached.result, message: `${cached.result.message} (cached)` };
   }
 
-  const base = (baseUrl || process.env.NINEROUTER_BASE || "").replace(/\/$/, "");
-  if (!base) {
+  const ep = resolveLlmEndpoint(opts?.gateway);
+  const rawEnvBase = (
+    baseUrl ||
+    process.env.NINEROUTER_BASE ||
+    process.env.OMNIROUTE_BASE ||
+    process.env.OPENROUTER_BASE ||
+    process.env.OPENAI_BASE_URL ||
+    (process.env.OPENROUTER_API_KEY ? ep.baseUrl : "")
+  ).replace(/\/$/, "");
+
+  if (!rawEnvBase) {
     const result: HealthcheckResult = {
       ok: false,
       ms: 0,
+      gateway: ep.gateway,
       message: `NINEROUTER_BASE not set — ${TUNNEL_HINT}`,
     };
     return result;
   }
 
-  // Cheap GET — models list or root; OpenAI-compat often has /models
-  const url = `${base}/models`;
+  const url = `${rawEnvBase}/models`;
   const started = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -57,7 +69,8 @@ export async function healthcheckNineRouter(
       method: "GET",
       signal: controller.signal,
       headers: {
-        Authorization: `Bearer ${process.env.NINEROUTER_KEY || "none"}`,
+        Authorization: `Bearer ${ep.apiKey || "none"}`,
+        ...ep.defaultHeaders,
       },
     });
     const ms = Date.now() - started;
@@ -72,7 +85,9 @@ export async function healthcheckNineRouter(
         ok: false,
         ms,
         status: res.status,
-        message: `9router tunnel/DNS down (Cloudflare ${res.status}/1016) in ${ms}ms — ${TUNNEL_HINT}`,
+        gateway: ep.gateway,
+        baseUrl: rawEnvBase,
+        message: `${ep.gateway} tunnel/DNS down (Cloudflare ${res.status}/1016) in ${ms}ms — ${TUNNEL_HINT}`,
       };
       cached = { at: now, result };
       return result;
@@ -83,7 +98,9 @@ export async function healthcheckNineRouter(
         ok: false,
         ms,
         status: res.status,
-        message: `9router unhealthy HTTP ${res.status} in ${ms}ms — ${TUNNEL_HINT}`,
+        gateway: ep.gateway,
+        baseUrl: rawEnvBase,
+        message: `${ep.gateway} unhealthy HTTP ${res.status} in ${ms}ms — ${TUNNEL_HINT}`,
       };
       cached = { at: now, result };
       return result;
@@ -93,7 +110,9 @@ export async function healthcheckNineRouter(
       ok: true,
       ms,
       status: res.status,
-      message: `9router ok HTTP ${res.status} in ${ms}ms`,
+      gateway: ep.gateway,
+      baseUrl: rawEnvBase,
+      message: `${ep.gateway} ok HTTP ${res.status} in ${ms}ms`,
     };
     cached = { at: now, result };
     return result;
@@ -103,7 +122,9 @@ export async function healthcheckNineRouter(
     const result: HealthcheckResult = {
       ok: false,
       ms,
-      message: `9router healthcheck failed in ${ms}ms: ${msg} — ${TUNNEL_HINT}`,
+      gateway: ep.gateway,
+      baseUrl: rawEnvBase,
+      message: `${ep.gateway} healthcheck failed in ${ms}ms: ${msg} — ${TUNNEL_HINT}`,
     };
     cached = { at: now, result };
     return result;
@@ -119,9 +140,17 @@ export function shouldHealthcheckForWorkflow(workflow: string): boolean {
 /** Fetch model ids from OpenAI-compat GET /models (for early invalid_model). */
 export async function listNineRouterModelIds(
   baseUrl?: string,
-  opts?: { timeoutMs?: number }
+  opts?: { timeoutMs?: number; gateway?: string }
 ): Promise<{ ok: boolean; ids: Set<string>; message: string }> {
-  const base = (baseUrl || process.env.NINEROUTER_BASE || "").replace(/\/$/, "");
+  const ep = resolveLlmEndpoint(opts?.gateway);
+  const base = (
+    baseUrl ||
+    process.env.NINEROUTER_BASE ||
+    process.env.OMNIROUTE_BASE ||
+    process.env.OPENROUTER_BASE ||
+    process.env.OPENAI_BASE_URL ||
+    (process.env.OPENROUTER_API_KEY ? ep.baseUrl : "")
+  ).replace(/\/$/, "");
   if (!base) {
     return {
       ok: false,
@@ -137,7 +166,8 @@ export async function listNineRouterModelIds(
       method: "GET",
       signal: controller.signal,
       headers: {
-        Authorization: `Bearer ${process.env.NINEROUTER_KEY || "none"}`,
+        Authorization: `Bearer ${ep.apiKey || "none"}`,
+        ...ep.defaultHeaders,
       },
     });
     if (!res.ok) {
@@ -164,19 +194,25 @@ export async function listNineRouterModelIds(
   }
 }
 
-/** Primary (+ non-empty fallbacks) must exist in 9router /models. */
+/**
+ * Primary (+ non-empty non-alias fallbacks) must exist in 9router/OmniRoute/OpenRouter `/models`.
+ * Note: `inherit` / `auto` / `cursor` in `*Fallback` are ignored here because they are
+ * Cursor Task fallbacks (Path A), not OpenAI-compatible model IDs.
+ */
 export function missingNineRouterModels(
   cfg: {
     models: Record<string, string>;
   },
   available: Set<string>
 ): string[] {
-  const keys = [
+  const primaryKeys = [
     "systemArchitect",
     "technologyArchitect",
     "uiUxDesigner",
     "softwareEngineer",
     "qaEngineer",
+  ];
+  const fallbackKeys = [
     "systemArchitectFallback",
     "technologyArchitectFallback",
     "uiUxDesignerFallback",
@@ -184,10 +220,16 @@ export function missingNineRouterModels(
     "qaEngineerFallback",
     "fallback",
   ];
+  const cursorAliases = new Set(["inherit", "auto", "cursor", "cursor-auto"]);
   const missing: string[] = [];
-  for (const key of keys) {
+  for (const key of primaryKeys) {
     const id = (cfg.models[key] || "").trim();
-    if (!id) continue;
+    if (!id || cursorAliases.has(id.toLowerCase())) continue;
+    if (!available.has(id)) missing.push(`${key}=${id}`);
+  }
+  for (const key of fallbackKeys) {
+    const id = (cfg.models[key] || "").trim();
+    if (!id || cursorAliases.has(id.toLowerCase())) continue;
     if (!available.has(id)) missing.push(`${key}=${id}`);
   }
   return missing;

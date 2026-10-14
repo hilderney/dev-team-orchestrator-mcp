@@ -1,11 +1,11 @@
 ---
 name: zteam
 description: >-
-  Run the Dev Team Orchestrator MCP pipeline (config-driven dual runtime:
-  Cursor Task for inherit/auto + optional cursorModels per role, or 9router
-  LangGraph for other model ids). Use when the user invokes /zteam, @zteam,
-  @zteam/config, @zteam/models, @zteam/documentation, @zteam/tests, or asks
-  to run the full team / orchestrator on an idea under a project root.
+  Run the Dev Team Orchestrator MCP pipeline (hybrid runtime: Path A Cursor Task
+  with inherit / allowlisted slugs, or Path B MCP role-agents on 9router /
+  OmniRoute / OpenRouter via package .env). Use when the user invokes /zteam,
+  @zteam, @zteam/config, @zteam/models, @zteam/documentation, @zteam/tests, or
+  asks to run the full team / orchestrator on an idea under a project root.
 disable-model-invocation: true
 ---
 
@@ -17,8 +17,8 @@ When the user invokes a **subcommand**, follow that path **before** a generic fu
 
 | Trigger | Action |
 |---------|--------|
-| **`@zteam/config`** / `/zteam config` | Full setup — `.zteam/config.json` (`projectType`, `models`, `cursorModels`, `maxTokens`, `scope`, `gitignoreIgnore`). Do **not** start the pipeline unless the user also asked to run it. |
-| **`@zteam/models`** / `/zteam models` | **LLMs only** — guided questions for SA/TA/**UX**/SE/QA (+ fallback or `cursorModels` per role) → update `models` / `cursorModels` in this project's `.zteam/config.json`. |
+| **`@zteam/config`** / `/zteam config` | Full setup — `.zteam/config.json` (`provider`, `projectType`, `models`, `cursorModels`, `maxTokens`, `scope`, `gitignoreIgnore`). Do **not** start the pipeline unless the user also asked to run it. |
+| **`@zteam/models`** / `/zteam models` | **LLMs only** — guided questions for SA/TA/**UX**/SE/QA (+ fallback or `cursorModels` per role) → update `models` / `cursorModels` / `provider` in this project's `.zteam/config.json`. |
 | **`@zteam/documentation`** / `/zteam documentation` / `/zteam docs` | Docs-only — `workflow: "docs"`. |
 | **`@zteam/tests`** / `/zteam tests` | TDD tests only — `workflow: "tests"` + `slug` (QA-red → QA-verify). |
 | **`@zteam`** / `/zteam` (no subcommand) | Normal pipeline; pick workflow from the table below. |
@@ -27,40 +27,27 @@ When the user invokes a **subcommand**, follow that path **before** a generic fu
 
 | Tool | Purpose |
 |------|---------|
-| `get_zteam_config` | Read merged config, `projectType`, `cursorModels`, `needsConfig`, `llmRuntime`, suggestions |
-| `write_zteam_config` | Write `.zteam/config.json` (always include **uiUxDesigner**, optional `projectType` & `cursorModels`) |
+| `get_zteam_config` | Read merged config, `provider`, `projectType`, `cursorModels`, `envEndpoint`, `needsConfig`, `llmRuntime`, suggestions |
+| `write_zteam_config` | Write `.zteam/config.json` (always include **uiUxDesigner**, optional `provider`, `projectType` & `cursorModels`) |
 | `ensure_zteam_setup` | Skill + `.docs` stubs + optional config template (no LLM) |
 | `run_development_pipeline` | Pipeline / 2-wave playbook (`workspaceRoot` **required**, `workflow` optional) |
 | `get_pipeline_state` | Live Canvas Dashboard state + push subagent telemetry (`recordStage`, `recordRole`, `recordStatus`, `recordMessage`, `checkGate`) |
 | `approve_gate` | HITL when `ZTEAM_HITL=1` |
 
-If GetDynamicTools shows an outdated schema (missing `projectType`, `cursorModels`, or `recordStage`), **restart the zteam MCP server** so Cursor reloads `src/orchestrator.ts`.
+If GetDynamicTools shows an outdated schema (missing `provider`, `projectType`, `cursorModels`, or `recordStage`), **restart the zteam MCP server** so Cursor reloads `src/orchestrator.ts`.
 
-## Capability matrix (isolated vs pipeline)
+## Hybrid Strategy: Using 9router / OmniRoute / OpenRouter Models as Subagents
 
-| Need | Tool / workflow | Writes |
-|------|-----------------|--------|
-| Só skill + `.docs` stubs (+ optional config template) | `ensure_zteam_setup` | `.zteam/**`, `.docs/**` — never `src/**` |
-| Só models / config | `get_zteam_config` → `write_zteam_config` | `.zteam/config.json` (`projectType`, `models`, `cursorModels`) |
-| Só docs/specs | `workflow: "docs"` | `.docs/**` |
-| Uma feature (1 slug) | `workflow: "feature"` + `slug` | that slug only |
-| Só testes de um requisito | `workflow: "tests"` + `slug` | `*.{test,spec}.*` |
-| Análise (time ou 1 papel) | `workflow: "analyze"` + `scope` + optional `role` | `.docs/reviews/**` |
-| Pipeline completo | `workflow: "full"` / omit | app + docs |
+Cursor's `Task` tool **intentionally blocks custom / BYOK / OpenAPI model slugs** (like `9r-code-heavy` or `9r-code-light`) in `Task({ model })` — only `"inherit"` and native Cursor allowlisted slugs (`composer-2.5-fast`, `claude-sonnet-5-5-high`, etc.) are accepted. Also, never pass `"auto"` to `Task({ model })` — always use `"inherit"`.
 
-**Role skills** (`.zteam/skills/roles/`): pick by `(role, phase, projectType)` — e.g. `sa-todo-plan-webgame`, `ta-technologies-webgame`, `qa-tdd-red-screenflow`, `se-implement-tdd-green`, `qa-tdd-verify-screenflow`.
+To run your 9router / OmniRoute / OpenRouter models across isolated team roles, `.zteam/config.json` supports **`provider`: `"hybrid"` (default) | `"cursor-task"` | `"ninerouter-direct"`**:
 
-## Dual runtime & `cursorModels` (config is absolute truth)
+| Path | Condition (`provider: "hybrid"`) | `llmRuntime` | How it executes |
+|------|----------------------------------|--------------|-----------------|
+| **Path A — Cursor Task (`inherit`)** | `provider: "cursor-task"`, OR all primaries are `"inherit"`, OR all 5 roles share **one** custom model (e.g. all `9r-code-heavy` with `provider: "hybrid"`) | **`cursor`** | MCP returns `delegationPlaybook` where every `stage.model` is `"inherit"` (or an allowlisted `cursorModels` slug) and `stage.requestedModel` records the desired `9r-*` id. Select `9r-code-heavy` in the Cursor parent chat picker → all `Task(model: "inherit")` subagents run on `9r-code-heavy`! |
+| **Path B — MCP Role-Agents (`.env` Gateway)** | `provider: "ninerouter-direct"`, OR `provider: "hybrid"` with **multiple distinct** custom models across roles (e.g. `SA/TA/SE = 9r-code-heavy`, `UX/QA = 9r-code-light`) | **`ninerouter`** | MCP runs LangGraph role-agents via `ChatOpenAI` directly against the OpenAI-compatible gateway configured in `dev-team-orchestrator/.env` (`NINEROUTER_BASE`/`NINEROUTER_KEY`, `OMNIROUTE_*`, or `OPENROUTER_API_KEY`). Secrets stay in `.env`, **never** in `~/.cursor/mcp.json`. |
 
-`.zteam/config.json` **primaries** (`models.*`) pick the runtime. **Do not mix** families in one config.
-
-| Config `models.*` primary values | `llmRuntime` | What you do |
-|----------------------|--------------|-------------|
-| All `inherit` / `auto` / `cursor` / `cursor-auto` | **cursor** | MCP returns `delegationPlaybook` — run each stage with Cursor **Task** (`subagent_type: stage.subagentType`, `model: stage.model`). Optional `cursorModels` per role (e.g. `"softwareEngineer": "composer-2.5"`) populates `stage.model` without triggering 9router validation! |
-| All other ids (`9RSA-…`, `cu/default`, …) | **ninerouter** | Call `run_development_pipeline` and let MCP drive ChatOpenAI → 9router. Do **not** rewrite with Task. |
-| Mix | `mixed_runtime` | Fix config so all primaries share one family; re-run. |
-
-### After `run_development_pipeline` (cursor) — 2-Wave Playbook, Mechanical Gates & Live Canvas Dashboard
+### After `run_development_pipeline` (Path A: `llmRuntime === "cursor"`) — 2-Wave Playbook, Mechanical Gates & Live Canvas Dashboard
 
 When `run_development_pipeline` runs on `llmRuntime="cursor"`, it writes `.docs/host.json` (Node/SQLite/native-compile probe), `.zteam/dashboard/index.html`, and returns a **2-wave `delegationPlaybook`**:
 
@@ -73,6 +60,7 @@ When `run_development_pipeline` runs on `llmRuntime="cursor"`, it writes `.docs/
 ```text
 If response.llmRuntime === "cursor" (or delegated === true):
 0. Tell the user once: "Live Canvas Dashboard: `.zteam/dashboard/index.html`"
+   If response.parentPickerBanner is present, show it once so the user knows which 9r model to select in the parent chat picker.
 1. For each stage in delegationPlaybook.stages (in order):
    a) HOST ONLY: Call get_pipeline_state({
         workspaceRoot, projectRoot,
@@ -83,7 +71,7 @@ If response.llmRuntime === "cursor" (or delegated === true):
       Print ONLY the 1-line `chatBanner` in chat (keep chat ultra-clean).
    b) Run Task({
         subagent_type: stage.subagentType,  // system-architect | technology-architect | generalPurpose | software-engineer | qa-engineer
-        model: stage.model,                 // from cursorModels[role] or "inherit"
+        model: stage.model,                 // ALWAYS "inherit" or allowlisted Cursor slug; NEVER pass 9r-* or "auto" here!
         description: stage.title,
         prompt: stage.instructions + "\n\nFull User Idea / Constraints:\n" + delegationPlaybook.userIdea + "\n\nWrite expected outputs: " + stage.expectedOutputs.join(", ")
       })
@@ -109,19 +97,19 @@ If response.llmRuntime === "cursor" (or delegated === true):
 
 ### `@zteam/models`
 
-Help the user choose models for **this** project (Cursor aliases + optional `cursorModels` **or** 9router ids — one family). Do **not** start a pipeline.
+Help the user choose models for **this** project (`provider: "hybrid"` | `"cursor-task"` | `"ninerouter-direct"`, Cursor aliases, or 9router/OmniRoute/OpenRouter ids). Do **not** start a pipeline.
 
 ```text
 1. workspaceRoot = absolute Cursor open folder
 2. projectRoot = user app folder if given (else ".")
 3. get_zteam_config({ workspaceRoot, projectRoot })
-4. Show current models + cursorModels + projectType + llmRuntime + cursorAliases + modelSuggestions
-5. Ask modelQuestions: for EACH role (SA/TA/**uiUxDesigner**/SE/QA) pick primary AND fallback (or cursorModels slug like "composer-2.5" when using Cursor runtime)
+4. Show current provider + models + cursorModels + projectType + llmRuntime + envEndpoint + modelSuggestions
+5. Ask modelQuestions: for EACH role (SA/TA/**uiUxDesigner**/SE/QA) pick primary AND fallback (default fallbacks to "inherit", never "auto")
 6. Prefer scope:
    - projectRoot != "." → "app" (write {appRoot}/.zteam/config.json)
    - else → "workspace" (write {workspaceRoot}/.zteam/config.json)
-7. write_zteam_config({ workspaceRoot, projectRoot, scope, projectType, models, cursorModels, maxTokens: keep existing })
-8. Confirm path written + final models + cursorModels + llmRuntime; point to .zteam/config.json
+7. write_zteam_config({ workspaceRoot, projectRoot, scope, provider, projectType, models, cursorModels, maxTokens: keep existing })
+8. Confirm path written + final provider + models + llmRuntime; point to .zteam/config.json
 9. Stop (unless user asked to run a pipeline next)
 ```
 
@@ -131,8 +119,8 @@ Help the user choose models for **this** project (Cursor aliases + optional `cur
 1. workspaceRoot = absolute Cursor open folder (Workspace Path)
 2. projectRoot = user app folder if given (else ".")
 3. get_zteam_config({ workspaceRoot, projectRoot })
-4. Ask setup questions — projectType (webgame/webapp/crud/backend/...), models, cursorModels, maxTokens, gitignoreIgnore
-5. write_zteam_config({ workspaceRoot, projectRoot, scope, projectType, models, cursorModels, maxTokens?, gitignoreIgnore })
+4. Ask setup questions — provider (hybrid/cursor-task/ninerouter-direct), projectType (webgame/webapp/crud/backend/...), models (fallbacks="inherit"), cursorModels, maxTokens, gitignoreIgnore
+5. write_zteam_config({ workspaceRoot, projectRoot, scope, provider, projectType, models, cursorModels, maxTokens?, gitignoreIgnore })
 6. Confirm paths written; point user to .zteam/config.json and .zteam/README.MD
 7. Stop (unless user asked to run a pipeline next)
 ```

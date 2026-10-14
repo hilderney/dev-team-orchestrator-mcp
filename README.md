@@ -704,6 +704,27 @@ Every bootstrapped project automatically gets **`.zteam/dashboard/index.html`** 
 - **Clean Chat Contract & Host-Only Telemetry:** when running in Cursor (`delegationPlaybook`), the host agent pushes subagent `start`/`done` events + mechanical stage gates (`checkGate: true`) via `get_pipeline_state` while the Cursor chat prints **only the 1-line `chatBanner`**. Subagent prompts stay lean and never call `get_pipeline_state` themselves.
 - **`cursorModels` per Role + 2-Wave Per-Slug Playbook:** `.zteam/config.json` supports `projectType` (`webgame`, `webapp`, `crud`, `backend`, `ai-rag`, …) and optional `cursorModels` per role (e.g. `{ "softwareEngineer": "composer-2.5" }`) alongside `models.*: "inherit"`, expanding Wave 1 (architecture + critics + `.docs/host.json` probe) and Wave 2 (3-handed spec + `qa-tdd-red:{slug}` → `se-implement:{slug}` → `delivery-critic:{slug}` per todo item, with `workflow=resume` checkpointing in `.docs/pipeline-state.json`).
 
+## Hybrid Strategy (9router / OmniRoute / OpenRouter + Cursor Task) & Secure `.env`
+
+Cursor's `Task` subagent tool **blocks custom BYOK / OpenAPI model IDs** (such as `9r-code-heavy` or `9r-code-light`) in `Task({ model })` — only `"inherit"` and native Cursor allowlisted slugs (`composer-2.5-fast`, `claude-sonnet-5-5-high`, etc.) are accepted. Also, never use `"auto"` in `Task({ model })` or `*Fallback` — always use `"inherit"`.
+
+To use your **9router**, **OmniRoute**, or **OpenRouter** models across roles safely:
+
+1. **Credentials in `dev-team-orchestrator/.env` (NEVER in `~/.cursor/mcp.json`):**
+   - `src/env-config.ts` loads `c:\Users\htzc\mcp-servers\dev-team-orchestrator\.env` via an explicit absolute path (`import.meta.url`), regardless of Cursor's working directory when spawning `npx tsx`.
+   - Copy `.env.example` to `.env` and set the **same OpenAI-compatible Base URL + API key** used in Cursor's OpenAPI override:
+     - **9Router:** `NINEROUTER_BASE=https://.../v1` and `NINEROUTER_KEY=sk-...`
+     - **OmniRoute:** `OMNIROUTE_BASE=https://.../v1` and `OMNIROUTE_KEY=sk-...` (or `ZTEAM_LLM_GATEWAY=omniroute`)
+     - **OpenRouter:** `OPENROUTER_API_KEY=sk-or-v1-...` (defaults to `https://openrouter.ai/api/v1`)
+   - Keep `~/.cursor/mcp.json` free of secrets (`"env": { "NODE_NO_WARNINGS": "1" }`).
+
+2. **Hybrid Routing (`provider`: `"hybrid"` | `"cursor-task"` | `"ninerouter-direct"` in `.zteam/config.json`):**
+
+| Mode / Condition | Path | How it works |
+|---|---|---|
+| **Path A (`cursor-task` or `hybrid` with 1 model / `inherit`)** | Cursor `Task` (`llmRuntime="cursor"`) | Every `stage.model` is `"inherit"` (or an allowlisted `cursorModels` slug) and `stage.requestedModel` keeps the `9r-*` ID. Select `9r-code-heavy` in the Cursor parent chat picker → all `Task(model="inherit")` subagents run on `9r-code-heavy`. |
+| **Path B (`ninerouter-direct` or `hybrid` with heavy ≠ light)** | MCP Role-Agents (`llmRuntime="ninerouter"`) | When roles use distinct custom models (e.g. `SA/TA/SE = 9r-code-heavy` and `UX/QA = 9r-code-light`), MCP runs isolated LangGraph role-agents via `ChatOpenAI` against the `.env` gateway. |
+
 While the pipeline runs (MCP tool or CLI):
 
 - **stage** start/done with pending-spec hints
