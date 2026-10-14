@@ -2,10 +2,10 @@
 name: zteam
 description: >-
   Run the Dev Team Orchestrator MCP pipeline (config-driven dual runtime:
-  Cursor Task for inherit/auto, or 9router LangGraph for other model ids).
-  Use when the user invokes /zteam, @zteam, @zteam/config, @zteam/models,
-  @zteam/documentation, @zteam/tests, or asks to run the full team /
-  orchestrator on an idea under a project root.
+  Cursor Task for inherit/auto + optional cursorModels per role, or 9router
+  LangGraph for other model ids). Use when the user invokes /zteam, @zteam,
+  @zteam/config, @zteam/models, @zteam/documentation, @zteam/tests, or asks
+  to run the full team / orchestrator on an idea under a project root.
 disable-model-invocation: true
 ---
 
@@ -17,8 +17,8 @@ When the user invokes a **subcommand**, follow that path **before** a generic fu
 
 | Trigger | Action |
 |---------|--------|
-| **`@zteam/config`** / `/zteam config` | Full setup — `.zteam/config.json` (models, maxTokens, scope, gitignore). Do **not** start the pipeline unless the user also asked to run it. |
-| **`@zteam/models`** / `/zteam models` | **LLMs only** — guided questions for SA/TA/**UX**/SE/QA (+ fallback) → update `models` in this project's `.zteam/config.json`. |
+| **`@zteam/config`** / `/zteam config` | Full setup — `.zteam/config.json` (`projectType`, `models`, `cursorModels`, `maxTokens`, `scope`, `gitignoreIgnore`). Do **not** start the pipeline unless the user also asked to run it. |
+| **`@zteam/models`** / `/zteam models` | **LLMs only** — guided questions for SA/TA/**UX**/SE/QA (+ fallback or `cursorModels` per role) → update `models` / `cursorModels` in this project's `.zteam/config.json`. |
 | **`@zteam/documentation`** / `/zteam documentation` / `/zteam docs` | Docs-only — `workflow: "docs"`. |
 | **`@zteam/tests`** / `/zteam tests` | TDD tests only — `workflow: "tests"` + `slug` (QA-red → QA-verify). |
 | **`@zteam`** / `/zteam` (no subcommand) | Normal pipeline; pick workflow from the table below. |
@@ -27,50 +27,54 @@ When the user invokes a **subcommand**, follow that path **before** a generic fu
 
 | Tool | Purpose |
 |------|---------|
-| `get_zteam_config` | Read merged config, `needsConfig`, `llmRuntime`, suggestions |
-| `write_zteam_config` | Write `.zteam/config.json` (always include **uiUxDesigner**) |
-| `ensure_zteam_setup` | Skill + `.docs` stubs + optional config template (no LLM) — if present |
-| `run_development_pipeline` | Pipeline / playbook (`workspaceRoot` **required**, `workflow` optional) |
-| `get_pipeline_state` | Live Canvas Dashboard state + push subagent telemetry (`recordStage`, `recordRole`, `recordStatus`, `recordMessage`) |
+| `get_zteam_config` | Read merged config, `projectType`, `cursorModels`, `needsConfig`, `llmRuntime`, suggestions |
+| `write_zteam_config` | Write `.zteam/config.json` (always include **uiUxDesigner**, optional `projectType` & `cursorModels`) |
+| `ensure_zteam_setup` | Skill + `.docs` stubs + optional config template (no LLM) |
+| `run_development_pipeline` | Pipeline / 2-wave playbook (`workspaceRoot` **required**, `workflow` optional) |
+| `get_pipeline_state` | Live Canvas Dashboard state + push subagent telemetry (`recordStage`, `recordRole`, `recordStatus`, `recordMessage`, `checkGate`) |
 | `approve_gate` | HITL when `ZTEAM_HITL=1` |
 
-If GetDynamicTools shows only an old `run_development_pipeline` schema (no `workspaceRoot`), **restart the zteam MCP server** so Cursor reloads `src/orchestrator.ts`.
+If GetDynamicTools shows an outdated schema (missing `projectType`, `cursorModels`, or `recordStage`), **restart the zteam MCP server** so Cursor reloads `src/orchestrator.ts`.
 
 ## Capability matrix (isolated vs pipeline)
 
 | Need | Tool / workflow | Writes |
 |------|-----------------|--------|
 | Só skill + `.docs` stubs (+ optional config template) | `ensure_zteam_setup` | `.zteam/**`, `.docs/**` — never `src/**` |
-| Só models / config | `get_zteam_config` → `write_zteam_config` | `.zteam/config.json` (+ optional `projectType`) |
+| Só models / config | `get_zteam_config` → `write_zteam_config` | `.zteam/config.json` (`projectType`, `models`, `cursorModels`) |
 | Só docs/specs | `workflow: "docs"` | `.docs/**` |
 | Uma feature (1 slug) | `workflow: "feature"` + `slug` | that slug only |
 | Só testes de um requisito | `workflow: "tests"` + `slug` | `*.{test,spec}.*` |
 | Análise (time ou 1 papel) | `workflow: "analyze"` + `scope` + optional `role` | `.docs/reviews/**` |
 | Pipeline completo | `workflow: "full"` / omit | app + docs |
 
-**Role skills** (`.zteam/skills/roles/`): pick by `(role, phase, projectType)` — see [`.docs/todo-skills.md`](../../.docs/todo-skills.md) and [roles/README](../../.zteam/skills/roles/README.md). Examples: `qa-tdd-red-screenflow` + `se-implement-tdd-green` + `qa-tdd-verify-screenflow` for webgame; `qa-tdd-red-api-contract` when `needsUiFlow=false`. **Hosts:** `.zteam/skills/hosts/{copilot,opencode}.md`.
+**Role skills** (`.zteam/skills/roles/`): pick by `(role, phase, projectType)` — e.g. `sa-todo-plan-webgame`, `ta-technologies-webgame`, `qa-tdd-red-screenflow`, `se-implement-tdd-green`, `qa-tdd-verify-screenflow`.
 
-## Dual runtime (config is absolute truth)
+## Dual runtime & `cursorModels` (config is absolute truth)
 
-`.zteam/config.json` **primaries** pick the runtime. **Do not mix** families in one config.
+`.zteam/config.json` **primaries** (`models.*`) pick the runtime. **Do not mix** families in one config.
 
-| Config primary values | `llmRuntime` | What you do |
+| Config `models.*` primary values | `llmRuntime` | What you do |
 |----------------------|--------------|-------------|
-| All `inherit` / `auto` / `cursor` / `cursor-auto` | **cursor** | MCP returns `delegationPlaybook` — run each stage with Cursor **Task** (`subagent_type` + `model` from stage). Do **not** send those ids to 9router. |
+| All `inherit` / `auto` / `cursor` / `cursor-auto` | **cursor** | MCP returns `delegationPlaybook` — run each stage with Cursor **Task** (`subagent_type: stage.subagentType`, `model: stage.model`). Optional `cursorModels` per role (e.g. `"softwareEngineer": "composer-2.5"`) populates `stage.model` without triggering 9router validation! |
 | All other ids (`9RSA-…`, `cu/default`, …) | **ninerouter** | Call `run_development_pipeline` and let MCP drive ChatOpenAI → 9router. Do **not** rewrite with Task. |
 | Mix | `mixed_runtime` | Fix config so all primaries share one family; re-run. |
 
-`get_zteam_config` returns `llmRuntime` when homogeneous.
+### After `run_development_pipeline` (cursor) — 2-Wave Playbook, Mechanical Gates & Live Canvas Dashboard
 
-### After `run_development_pipeline` (cursor) — Live Canvas Dashboard + Short Chat Log
+When `run_development_pipeline` runs on `llmRuntime="cursor"`, it writes `.docs/host.json` (Node/SQLite/native-compile probe), `.zteam/dashboard/index.html`, and returns a **2-wave `delegationPlaybook`**:
 
-When `ensure_zteam_setup` or `run_development_pipeline` runs, it materializes **`.zteam/dashboard/index.html`** (a 9Router-style interactive Canvas with animated Bézier pulses between the Orchestrator hub and each subagent, KPI cards, and live log feed polling `.docs/zteam-live.js` with zero server needed).
+- **Wave 1** (when `.docs/todo.md` has no open slugs yet): `sa-requirements` → `ux-juice` → `fidelity-critic` → `ta-stack` → `architecture-critic` → `ux-design-system` → `sa-todo-and-specs`.
+- **Wave 2** (expanded per open `[ ]` slug in `.docs/todo.md` when you call `run_development_pipeline` again with `workflow: "resume"` after `sa-todo-and-specs`):
+  - Three-handed spec per slug: `sa-spec:{slug}` → `ux-spec:{slug}` → `ta-spec:{slug}`
+  - TDD per slug: `qa-tdd-red:{slug}` → `se-implement:{slug}` → `delivery-critic:{slug}`
+  - Final suite verification: `qa-tdd-verify`
 
 ```text
 If response.llmRuntime === "cursor" (or delegated === true):
 0. Tell the user once: "Live Canvas Dashboard: `.zteam/dashboard/index.html`"
 1. For each stage in delegationPlaybook.stages (in order):
-   a) Call get_pipeline_state({
+   a) HOST ONLY: Call get_pipeline_state({
         workspaceRoot, projectRoot,
         recordStage: stage.id, recordRole: stage.role,
         recordStatus: "start", skillKey: stage.skillKey,
@@ -78,39 +82,46 @@ If response.llmRuntime === "cursor" (or delegated === true):
       })
       Print ONLY the 1-line `chatBanner` in chat (keep chat ultra-clean).
    b) Run Task({
-        subagent_type: stage.subagentType,  // system-architect | technology-architect | software-engineer | qa-engineer
-        model: stage.model,                 // usually "inherit"
+        subagent_type: stage.subagentType,  // system-architect | technology-architect | generalPurpose | software-engineer | qa-engineer
+        model: stage.model,                 // from cursorModels[role] or "inherit"
         description: stage.title,
-        prompt: stage.instructions + " Write expected outputs: " + stage.expectedOutputs.join(", ")
+        prompt: stage.instructions + "\n\nFull User Idea / Constraints:\n" + delegationPlaybook.userIdea + "\n\nWrite expected outputs: " + stage.expectedOutputs.join(", ")
       })
-   c) Call get_pipeline_state({
+   c) HOST ONLY: Call get_pipeline_state({
         workspaceRoot, projectRoot,
         recordStage: stage.id, recordRole: stage.role,
         recordStatus: "done", skillKey: stage.skillKey,
+        checkGate: true,
         recordMessage: "Completed " + stage.title
       })
       Print ONLY the 1-line `chatBanner` in chat.
-2. Verify artefacts under appRoot (.docs/*, code, tests)
-3. Report stages completed; do not call 9router
+      If `gate.ok === false` (e.g. contradictory QA-red tests or forbidden native addon like better-sqlite3), re-run the subagent to fix `gate.reasons` before advancing!
+   d) If `stage.id === "sa-todo-and-specs"` just finished and `.docs/todo.md` now has open `- [ ] slug: title` items:
+      Call `run_development_pipeline({ workspaceRoot, projectRoot, userIdea, workflow: "resume" })` to expand Wave 2 per-slug stages (`sa-spec:{slug}`, `ux-spec:{slug}`, `ta-spec:{slug}`, `qa-tdd-red:{slug}`, `se-implement:{slug}`, `delivery-critic:{slug}`, `qa-tdd-verify`) and execute them in order!
+2. When all stages finish, call:
+   get_pipeline_state({
+     workspaceRoot, projectRoot,
+     recordStage: "pipeline", recordStatus: "done",
+     recordMessage: "Pipeline completed"
+   })
+   so `.zteam/dashboard/index.html` transitions to "Pipeline Completed ✓".
 ```
 
 ### `@zteam/models`
 
-Help the user choose models for **this** project (Cursor aliases **or** 9router ids — one family). Do **not** start a pipeline.
+Help the user choose models for **this** project (Cursor aliases + optional `cursorModels` **or** 9router ids — one family). Do **not** start a pipeline.
 
 ```text
 1. workspaceRoot = absolute Cursor open folder
 2. projectRoot = user app folder if given (else ".")
 3. get_zteam_config({ workspaceRoot, projectRoot })
-4. Show current models + llmRuntime + cursorAliases + modelSuggestions + suggestedDefaults
-5. Ask modelQuestions: for EACH role (SA/TA/**uiUxDesigner**/SE/QA) pick primary AND fallback
-   - Always set **uiUxDesigner** (same family as the others — never omit)
-   - fallback only meaningful for ninerouter; empty ok for cursor
+4. Show current models + cursorModels + projectType + llmRuntime + cursorAliases + modelSuggestions
+5. Ask modelQuestions: for EACH role (SA/TA/**uiUxDesigner**/SE/QA) pick primary AND fallback (or cursorModels slug like "composer-2.5" when using Cursor runtime)
 6. Prefer scope:
    - projectRoot != "." → "app" (write {appRoot}/.zteam/config.json)
    - else → "workspace" (write {workspaceRoot}/.zteam/config.json)
-7. write_zteam_config({ workspaceRoot, projectRoot, scope, models, maxTokens: keep existing })
-8. Confirm path written + final models + llmRuntime; point to .zteam/config.json
+7. write_zteam_config({ workspaceRoot, projectRoot, scope, projectType, models, cursorModels, maxTokens: keep existing })
+8. Confirm path written + final models + cursorModels + llmRuntime; point to .zteam/config.json
 9. Stop (unless user asked to run a pipeline next)
 ```
 
@@ -120,85 +131,8 @@ Help the user choose models for **this** project (Cursor aliases **or** 9router 
 1. workspaceRoot = absolute Cursor open folder (Workspace Path)
 2. projectRoot = user app folder if given (else ".")
 3. get_zteam_config({ workspaceRoot, projectRoot })
-4. Ask setup questions — show cursorAliases + modelSuggestions; ask primary + fallback (homogeneous family)
-5. write_zteam_config({ workspaceRoot, projectRoot, scope, models (incl. *Fallback), maxTokens?, gitignoreIgnore })
+4. Ask setup questions — projectType (webgame/webapp/crud/backend/...), models, cursorModels, maxTokens, gitignoreIgnore
+5. write_zteam_config({ workspaceRoot, projectRoot, scope, projectType, models, cursorModels, maxTokens?, gitignoreIgnore })
 6. Confirm paths written; point user to .zteam/config.json and .zteam/README.MD
 7. Stop (unless user asked to run a pipeline next)
 ```
-
-### `@zteam/documentation` / `@zteam/tests` / plain `@zteam`
-
-```text
-1. get_zteam_config({ workspaceRoot, projectRoot })
-2. If needsConfig → STOP; @zteam/models or @zteam/config first
-3. If runtimeError / mixed → fix config
-4. Pick workflow:
-   - @zteam/documentation → workflow: "docs"
-   - @zteam/tests → workflow: "tests" + slug (required when one requirement)
-   - plain → table below (feature+slug / analyze+scope / …)
-5. run_development_pipeline({ workspaceRoot, projectRoot, userIdea, workflow, slug?, role?, scope? })
-6. If llmRuntime=cursor → execute delegationPlaybook via Task in order
-   (QA-red → SE green → delivery critic → QA-verify; mark [x] only on verify)
-7. If ninerouter → trust MCP result; report failureKind / resumeHint / filesWritten
-```
-
-## Shared instructions (all commands)
-
-1. Call MCP tools on **`user-zteam`** (may also appear as `zteam`).
-2. **Always** pass **`workspaceRoot`** = absolute path of the **Cursor-open folder** (MCP required; fails with `needs_workspace_root` if omitted — never uses sticky `WORKSPACE_ROOT` from mcp.json).
-3. Always set **`projectRoot`** when the app is not the workspace root.
-4. Put hard constraints in **`userIdea`**. Optional `projectType` in config when known (webgame / webapp / crud / api).
-5. **Before any pipeline**: always `get_zteam_config` first until `needsConfig === false`.
-
-### Config gate
-
-```text
-1. workspaceRoot = absolute Cursor open folder
-2. projectRoot = app folder if given (else ".")
-3. get_zteam_config({ workspaceRoot, projectRoot })
-4. If needsConfig === true → write_zteam_config then re-check
-5. Only then: run_development_pipeline(…)
-6. Branch on llmRuntime (cursor Task playbook vs ninerouter MCP)
-```
-
-### Arguments
-
-| Arg | Required | Notes |
-|-----|----------|--------|
-| `workspaceRoot` | **yes** (MCP + skill) | Absolute Cursor open folder; omit → `needs_workspace_root` |
-| `userIdea` | yes (pipeline) | Idea **plus** non-negotiable constraints |
-| `projectRoot` | strongly yes | Relative under `workspaceRoot` |
-| `workflow` | no | `full` \| `docs` \| `feature` \| `punch` \| `fix` \| `resume` \| `tests` \| `analyze` |
-| `slug` | feature/tests | Focus one todo/spec slug |
-| `role` | analyze | Single team role |
-| `scope` | analyze | Review file key / path label |
-
-### Which workflow?
-
-| Situation | Workflow |
-|-----------|----------|
-| New app, sensitive / large idea | **`docs` first** → then **`feature`** or **`full`** |
-| New app, small / trusted | `full` (or omit) |
-| Docs already good, new capability | `feature` (+ optional `slug`) |
-| Tiny UI/copy tweak | `punch` |
-| Bug / failing suite | `fix` |
-| Add/strengthen tests for one requirement | **`tests` + `slug`** |
-| Read-only team/role review | **`analyze` + `scope`** (+ optional `role`) |
-| Mid-failure, todos still `[ ]` | **`resume`** |
-
-### Rescue
-
-| Symptom | Do this |
-|---------|---------|
-| `failureKind=needsConfig` | `@zteam/models` / `@zteam/config` |
-| `failureKind=mixed_runtime` | Make all primaries cursor aliases **or** all 9router ids |
-| `failureKind=invalid_model` | Fix ids to exist on 9router `/models` |
-| `failureKind=llm_empty` / `spec_incomplete` / `tsc` / `fidelity` | Fix cause; `resume` |
-| MCP namespace error | Restart zteam MCP; retry once |
-
-### After the tool returns
-
-1. Report: `workflow`, `llmRuntime`, `workspaceRoot`, `appRoot`, `failureKind`, `resumeHint`.
-2. If cursor: list Task stages run + artefacts.
-3. If ninerouter: quote MCP `filesWritten` / notifications.
-4. **Owner report (after SE/QA):** if `userReport` / `.docs/user-report.md` exists — **present the full summary to the user** (what the project does). If `.docs/tech-debt-plan.md` / `techDebtActionPlan` exists — present it as a **plan-mode decision** (do not implement until the user chooses).

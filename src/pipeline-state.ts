@@ -1,10 +1,19 @@
 /**
- * Disk-based pipeline state / FSM checkpoint (Fase E).
+ * Disk-based pipeline state / FSM checkpoint (Fase E + Cursor playbook wave/resume tracking).
  */
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export const PIPELINE_STATE_PATH = ".docs/pipeline-state.json";
+
+export type CursorPlaybookStageRecord = {
+  id: string;
+  role: string;
+  slug?: string;
+  status: "pending" | "active" | "done" | "error";
+  expectedOutputs: string[];
+  updatedAt: string;
+};
 
 export type PipelineState = {
   version: 1;
@@ -15,6 +24,8 @@ export type PipelineState = {
   completedSpecs: string[];
   pendingQaSpecs: string[];
   filesWritten: string[];
+  /** Cursor delegation playbook stage tracking (supports workflow=resume in cursor runtime). */
+  stages?: Record<string, CursorPlaybookStageRecord>;
   traceId?: string;
   errorClass?: string | null;
   gates: {
@@ -53,6 +64,7 @@ export function defaultPipelineState(
     completedSpecs: partial.completedSpecs ?? [],
     pendingQaSpecs: partial.pendingQaSpecs ?? [],
     filesWritten: partial.filesWritten ?? [],
+    stages: partial.stages ?? {},
     traceId: partial.traceId,
     errorClass: partial.errorClass ?? null,
     gates: partial.gates ?? {
@@ -98,7 +110,13 @@ export async function readPipelineState(
 
 export async function updatePipelineStage(
   appRoot: string,
-  patch: Partial<PipelineState> & { stage: string; workflow?: string }
+  patch: Partial<PipelineState> & {
+    stage: string;
+    workflow?: string;
+    recordStatus?: "start" | "done" | "error" | "warn" | "info";
+    recordRole?: string;
+    expectedOutputs?: string[];
+  }
 ): Promise<PipelineState> {
   const prev =
     (await readPipelineState(appRoot)) ||
@@ -107,13 +125,41 @@ export async function updatePipelineStage(
       workflow: patch.workflow || "full",
       stage: patch.stage,
     });
+  const now = new Date().toISOString();
+  const stages: Record<string, CursorPlaybookStageRecord> = {
+    ...(prev.stages || {}),
+    ...(patch.stages || {}),
+  };
+
+  if (patch.stage && patch.recordStatus) {
+    const existing = stages[patch.stage];
+    const slugMatch = patch.stage.match(/:([a-z0-9-_]+)$/i);
+    const mappedStatus: CursorPlaybookStageRecord["status"] =
+      patch.recordStatus === "done"
+        ? "done"
+        : patch.recordStatus === "error"
+          ? "error"
+          : patch.recordStatus === "start"
+            ? "active"
+            : existing?.status || "pending";
+    stages[patch.stage] = {
+      id: patch.stage,
+      role: patch.recordRole || existing?.role || "",
+      slug: slugMatch ? slugMatch[1] : existing?.slug,
+      status: mappedStatus,
+      expectedOutputs: patch.expectedOutputs || existing?.expectedOutputs || [],
+      updatedAt: now,
+    };
+  }
+
   const next: PipelineState = {
     ...prev,
     ...patch,
     appRoot,
+    stages,
     gates: { ...prev.gates, ...(patch.gates || {}) },
     budgets: { ...prev.budgets, ...(patch.budgets || {}) },
-    updatedAt: new Date().toISOString(),
+    updatedAt: now,
   };
   await writePipelineState(appRoot, next);
   return next;

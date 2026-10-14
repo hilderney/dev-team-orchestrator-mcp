@@ -161,9 +161,13 @@ import {
   writeTeamConfig,
   resolveTeamRuntime,
   buildCursorDelegationPlaybook,
+  writeZteamConfigToolShape,
+  getPipelineStateToolShape,
   type ResolvedTeamConfig,
   type TeamRole,
 } from "./zteam-config.js";
+import { ensureHostProbeFile } from "./host-probe.js";
+import { checkStageGate, type StageGateResult } from "./stage-gate.js";
 import { pickSpecBatch, resolveSeMaxBatch } from "./spec-batch.js";
 import {
   formatSkillPromptBlock,
@@ -2188,6 +2192,16 @@ async function writePipelineResult(
       PIPELINE_RESULT_PATH,
       JSON.stringify(merged, null, 2) + "\n"
     );
+    await emitLiveEvent({
+      appRoot,
+      stage: "pipeline",
+      status: payload.ok === false ? "error" : "done",
+      workflow: String(payload.workflow || "full"),
+      message:
+        payload.ok === false
+          ? `Pipeline failed (${payload.failureKind || "error"})`
+          : `Pipeline completed (${payload.workflow || "full"})`,
+    });
   } catch {
     /* best-effort */
   }
@@ -2658,10 +2672,12 @@ async function technologyArchitectNode(
 ): Promise<Partial<OrchestratorStateType>> {
   return timedStage("technologyArchitect", async () => {
     const appRoot = appRootOf(state);
-    const [readmeFromDisk, requirementsFromDisk] = await Promise.all([
-      readDoc(appRoot, README_PATH),
-      readDoc(appRoot, REQUIREMENTS_PATH),
-    ]);
+    const [{ probe: hostProbe }, readmeFromDisk, requirementsFromDisk] =
+      await Promise.all([
+        ensureHostProbeFile(appRoot),
+        readDoc(appRoot, README_PATH),
+        readDoc(appRoot, REQUIREMENTS_PATH),
+      ]);
 
     const ta = roleLlm("technologyArchitect");
     void ta;
@@ -2674,6 +2690,9 @@ async function technologyArchitectNode(
           "",
           "## .docs/requirements.md",
           requirementsFromDisk,
+          "",
+          "## .docs/host.json (Environment Probe — obey native addon / sqlite constraints)",
+          JSON.stringify(hostProbe, null, 2),
           (state.architectureGaps ?? []).length > 0
             ? [
                 "",
@@ -5691,6 +5710,10 @@ server.tool(
     }
 
     if (runtimeRes.runtime === "cursor") {
+      const [{ probe: hostProbe }, existingState] = await Promise.all([
+        ensureHostProbeFile(appRoot),
+        readPipelineState(appRoot),
+      ]);
       const playbook = buildCursorDelegationPlaybook({
         workflow: explicit || "full",
         userIdea,
@@ -5698,13 +5721,38 @@ server.tool(
         projectRoot: root,
         appRoot,
         models: teamConfig.models,
+        cursorModels: teamConfig.cursorModels,
         maxTokens: teamConfig.maxTokens,
         projectType: teamConfig.projectType,
+        focusSlug: (slug || "").trim() || undefined,
+        completedStageRecords: existingState?.stages,
       });
+
+      // Seed pending stage records into .docs/pipeline-state.json for resume tracking
+      const stageRecords = { ...(existingState?.stages || {}) };
+      const nowIso = new Date().toISOString();
+      for (const st of playbook.stages) {
+        if (!stageRecords[st.id] || stageRecords[st.id].status !== "done") {
+          stageRecords[st.id] = {
+            id: st.id,
+            role: st.role,
+            slug: st.slug,
+            status: stageRecords[st.id]?.status === "error" ? "error" : "pending",
+            expectedOutputs: st.expectedOutputs,
+            updatedAt: nowIso,
+          };
+        }
+      }
+      await updatePipelineStage(appRoot, {
+        stage: playbook.stages[0]?.id || "idle",
+        workflow: explicit || mode,
+        stages: stageRecords,
+      });
+
       session.emit(
         "pipeline",
         "notify",
-        `llmRuntime=cursor — returning delegationPlaybook (${playbook.stages.length} stages); skill must run Cursor Task`
+        `llmRuntime=cursor — returning delegationPlaybook (wave=${playbook.wave}, ${playbook.stages.length} stages); skill must run Cursor Task`
       );
       session.close();
       return {
@@ -5717,11 +5765,15 @@ server.tool(
                 llmRuntime: "cursor",
                 delegated: true,
                 workflow: explicit || mode,
+                wave: playbook.wave,
                 appRoot,
                 workspaceRoot: ws.root,
                 projectRoot: root,
+                projectType: teamConfig.projectType || "core",
                 models: teamConfig.models,
+                cursorModels: teamConfig.cursorModels,
                 maxTokens: teamConfig.maxTokens,
+                hostProbe,
                 delegationPlaybook: playbook,
                 resumeHint: playbook.resumeHint,
                 notifications: session.lines,
@@ -5936,7 +5988,9 @@ server.tool(
       ok: true,
       exists: teamConfig.exists,
       sources: teamConfig.sources,
+      projectType: teamConfig.projectType || "",
       models: teamConfig.models,
+      cursorModels: teamConfig.cursorModels,
       maxTokens: teamConfig.maxTokens,
       llmRuntime: runtimeRes.ok ? runtimeRes.runtime : null,
       runtimeError: runtimeRes.ok
@@ -5952,7 +6006,9 @@ server.tool(
       modelQuestions: [...MODEL_QUESTIONS],
       modelSuggestions: ROLE_MODEL_SUGGESTIONS,
       suggestedDefaults: {
+        projectType: teamConfig.projectType || "",
         models: teamConfig.models,
+        cursorModels: teamConfig.cursorModels,
         maxTokens: teamConfig.maxTokens,
       },
       workspace: diagnoseWorkspace(ws.root, ws.source),
@@ -5975,50 +6031,15 @@ server.tool(
 
 server.tool(
   "write_zteam_config",
-  "Write .zteam/config.json to workspace, app, or both; optionally update .gitignore.",
-  {
-    workspaceRoot: workspaceRootArg,
-    projectRoot: z.string().optional().default("."),
-    scope: z.enum(["workspace", "app", "both"]),
-    models: z.object({
-      systemArchitect: z.string().min(1),
-      technologyArchitect: z.string().min(1),
-      uiUxDesigner: z
-        .string()
-        .min(1)
-        .optional()
-        .describe(
-          "UI/UX primary; if omitted, inherits peer family (cursor alias or 9router default)"
-        ),
-      softwareEngineer: z.string().min(1),
-      qaEngineer: z.string().min(1),
-      fallback: z.string().optional().default(""),
-      systemArchitectFallback: z.string().optional().default(""),
-      technologyArchitectFallback: z.string().optional().default(""),
-      uiUxDesignerFallback: z.string().optional().default(""),
-      softwareEngineerFallback: z.string().optional().default(""),
-      qaEngineerFallback: z.string().optional().default(""),
-    }),
-    maxTokens: z
-      .object({
-        systemArchitect: z.number().int().positive().optional(),
-        technologyArchitect: z.number().int().positive().optional(),
-        uiUxDesigner: z.number().int().positive().optional(),
-        softwareEngineer: z.number().int().positive().optional(),
-        qaEngineer: z.number().int().positive().optional(),
-      })
-      .optional(),
-    gitignoreIgnore: z
-      .boolean()
-      .optional()
-      .default(true)
-      .describe("If true and no .gitignore, create one with .zteam/; if .gitignore exists, append .zteam/"),
-  },
+  "Write .zteam/config.json to workspace, app, or both (including projectType, models, cursorModels, maxTokens); optionally update .gitignore.",
+  writeZteamConfigToolShape,
   async ({
     workspaceRoot,
     projectRoot,
     scope,
+    projectType,
     models,
+    cursorModels,
     maxTokens,
     gitignoreIgnore,
   }) => {
@@ -6036,11 +6057,15 @@ server.tool(
         targets.push(appRoot);
       }
     }
-    // Deduplicate
     const unique = [...new Set(targets.map((t) => resolve(t)))];
 
     for (const dir of unique) {
-      const { path } = await writeTeamConfig(dir, { models, maxTokens });
+      const { path } = await writeTeamConfig(dir, {
+        projectType,
+        models,
+        cursorModels,
+        maxTokens,
+      });
       written.push(path);
       if (gitignoreIgnore) {
         const gi = await ensureGitignoreIgnoresZteam(dir, {
@@ -6064,7 +6089,9 @@ server.tool(
               ok: true,
               written,
               gitignore,
+              projectType: teamConfig.projectType,
               models: teamConfig.models,
+              cursorModels: teamConfig.cursorModels,
               maxTokens: teamConfig.maxTokens,
               exists: teamConfig.exists,
               workspace: diagnoseWorkspace(ws.root, ws.source),
@@ -6149,33 +6176,8 @@ server.tool(
 
 server.tool(
   "get_pipeline_state",
-  "Read (or push a live subagent event to) `.docs/pipeline-state.json` + `.zteam/dashboard/index.html` (9Router Canvas live view). When running Cursor Task subagents, pass `recordStage` + `recordMessage` (`recordStatus`: start|done|error) to animate the HTML dashboard while keeping only `chatBanner` (1 short line) in chat.",
-  {
-    workspaceRoot: workspaceRootArg,
-    projectRoot: z
-      .string()
-      .optional()
-      .default(".")
-      .describe("Relative project folder under workspaceRoot"),
-    recordStage: z
-      .string()
-      .optional()
-      .describe("Optional stage id to push into the live HTML dashboard (e.g. sa-requirements, qa-tdd-red, se-implement)"),
-    recordRole: z
-      .string()
-      .optional()
-      .describe("Optional role id (systemArchitect | uiUxDesigner | technologyArchitect | qaEngineer | softwareEngineer)"),
-    recordStatus: z
-      .enum(["start", "done", "error", "warn", "info"])
-      .optional()
-      .describe("Animation direction: start (Orchestrator -> Agent) or done/error (Agent -> Orchestrator)"),
-    recordMessage: z
-      .string()
-      .optional()
-      .describe("Short summary of what the subagent is doing or delivered"),
-    skillKey: z.string().optional().describe("Active role skill key if any"),
-    filesCount: z.number().optional().describe("Number of files written in this step"),
-  },
+  "Read (or push a live subagent event to) `.docs/pipeline-state.json` + `.zteam/dashboard/index.html` (9Router Canvas live view) + run mechanical stage gates. When running Cursor Task subagents, pass `recordStage` + `recordMessage` (`recordStatus`: start|done|error) to animate the HTML dashboard while keeping only `chatBanner` (1 short line) in chat.",
+  getPipelineStateToolShape,
   async ({
     workspaceRoot,
     projectRoot,
@@ -6185,6 +6187,9 @@ server.tool(
     recordMessage,
     skillKey,
     filesCount,
+    checkGate,
+    testExitCode,
+    testOutput,
   }) => {
     const resolved = mcpResolveWorkspace(workspaceRoot);
     if (!resolved.ok) return resolved.result;
@@ -6193,15 +6198,38 @@ server.tool(
     assertSafeAppRoot(appRoot, projectRoot || ".");
     const dashFiles = await ensureLiveDashboardFiles(appRoot);
 
+    let gate: StageGateResult | null = null;
+    if (recordStage && (checkGate || recordStatus === "done")) {
+      gate = await checkStageGate({
+        appRoot,
+        stage: recordStage,
+        testExitCode,
+        testOutput,
+      });
+    }
+
+    const effectiveStatus =
+      gate && !gate.ok && recordStatus === "done"
+        ? "error"
+        : recordStatus || "info";
+    const effectiveMessage =
+      gate && !gate.ok
+        ? `GATE FAIL (${recordStage}): ${gate.reasons.join("; ")}`
+        : recordMessage || `${recordStage || "idle"} (${effectiveStatus})`;
+
     if (recordStage) {
-      await updatePipelineStage(appRoot, { stage: recordStage });
+      await updatePipelineStage(appRoot, {
+        stage: recordStage,
+        recordStatus: effectiveStatus,
+        recordRole,
+      });
       await emitLiveEvent({
         appRoot,
         stage: recordStage,
         role: recordRole,
         skillKey,
-        status: recordStatus || "info",
-        message: recordMessage || `${recordStage} (${recordStatus || "info"})`,
+        status: effectiveStatus,
+        message: effectiveMessage,
         filesCount,
       });
     }
@@ -6217,7 +6245,7 @@ server.tool(
       role: recordRole,
       skillKey,
       message:
-        recordMessage ||
+        effectiveMessage ||
         live?.events?.[0]?.message ||
         "Dashboard ready",
       specsDone: live?.kpis?.specsDone,
@@ -6230,8 +6258,9 @@ server.tool(
           type: "text" as const,
           text: JSON.stringify(
             {
-              ok: Boolean(state || live),
+              ok: Boolean(state || live) && (!gate || gate.ok),
               chatBanner,
+              gate,
               dashboardHtml: dashFiles.htmlPath,
               liveFeedJs: dashFiles.liveJsPath,
               state: state || null,
@@ -6239,6 +6268,7 @@ server.tool(
                 ? {
                     activeStage: live.activeStage,
                     activeNode: live.activeNode,
+                    pipelineStatus: live.pipelineStatus,
                     kpis: live.kpis,
                     recentEvents: (live.events || []).slice(0, 6),
                   }

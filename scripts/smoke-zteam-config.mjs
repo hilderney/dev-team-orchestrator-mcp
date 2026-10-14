@@ -515,6 +515,275 @@ try {
       banner.includes("[zTeam · full [1/4]]") && banner.includes("qaTddRed"),
       "compact 1-line chat banner"
     );
+
+    // --- Dashboard orphan start reconciliation + disk scan + pipeline completion ---
+    await writeFile(
+      join(app, ".docs", "todo.md"),
+      "- [x] maze-gen: Maze Generator\n- [ ] ghost-ai: Ghost AI\n",
+      "utf8"
+    );
+    await writeFile(
+      join(app, ".docs", "specs", "maze-gen.spec.md"),
+      "# Maze Gen\n## Files to touch\n- src/maze.ts\n",
+      "utf8"
+    );
+    // Starting next stage without closing qaTddRed must auto-close qaTddRed and scan disk specs
+    const afterNext = await emitLiveEvent({
+      appRoot: app,
+      stage: "se-implement:maze-gen",
+      role: "softwareEngineer",
+      status: "start",
+      message: "Implementing maze-gen",
+    });
+    assert(
+      afterNext?.nodes.qaTddRed.status === "done",
+      "orphan qaTddRed start auto-closed to done"
+    );
+    assert(
+      afterNext?.events.some(
+        (e) => e.stage === "qaTddRed" && e.status === "done"
+      ),
+      "synthetic done event emitted for orphan start"
+    );
+    assert(
+      afterNext?.kpis.specsTotal === 2 && afterNext?.kpis.specsDone === 1,
+      `disk scan updated specs KPI (got ${afterNext?.kpis.specsDone}/${afterNext?.kpis.specsTotal})`
+    );
+    assert(
+      (afterNext?.kpis.filesWritten || 0) >= 2,
+      "disk scan counted files touched"
+    );
+
+    // Terminal pipeline done event sets pipelineStatus = completed
+    const afterFinish = await emitLiveEvent({
+      appRoot: app,
+      stage: "pipeline",
+      status: "done",
+      message: "Pipeline completed",
+    });
+    assert(
+      afterFinish?.pipelineStatus === "completed" &&
+        afterFinish?.activeStage === "completed",
+      "pipeline completion state set"
+    );
+  }
+
+  // --- Update Plan Item 1: cursorModels per role (e.g. composer-2.5) ---
+  {
+    const ws = join(base, "cursor-models-ws");
+    await mkdir(ws, { recursive: true });
+    await writeTeamConfig(ws, {
+      projectType: "webgame",
+      models: {
+        systemArchitect: "inherit",
+        technologyArchitect: "inherit",
+        uiUxDesigner: "inherit",
+        softwareEngineer: "inherit",
+        qaEngineer: "inherit",
+      },
+      cursorModels: {
+        softwareEngineer: "composer-2.5",
+        qaEngineer: "claude-sonnet-5-5-high",
+      },
+    });
+    const cfg = await loadTeamConfig(ws, ws);
+    assert(cfg.projectType === "webgame", "projectType persisted");
+    assert(
+      cfg.cursorModels.softwareEngineer === "composer-2.5",
+      "cursorModels.softwareEngineer persisted"
+    );
+    const rt = resolveTeamRuntime(cfg);
+    assert(
+      rt.ok && rt.runtime === "cursor",
+      "all inherit + cursorModels resolves to cursor runtime without 9router"
+    );
+    const pb = buildCursorDelegationPlaybook({
+      workflow: "full",
+      userIdea: "Grid Pursuit webgame",
+      workspaceRoot: ws,
+      projectRoot: ".",
+      appRoot: ws,
+      models: cfg.models,
+      cursorModels: cfg.cursorModels,
+      maxTokens: cfg.maxTokens,
+      projectType: cfg.projectType,
+    });
+    const seStage = pb.stages.find((s) => s.role === "softwareEngineer");
+    const saStage = pb.stages.find((s) => s.role === "systemArchitect");
+    const qaStage = pb.stages.find((s) => s.role === "qaEngineer");
+    assert(
+      seStage?.model === "composer-2.5",
+      `SE stage uses cursorModels composer-2.5, got ${seStage?.model}`
+    );
+    assert(
+      qaStage?.model === "claude-sonnet-5-5-high",
+      `QA stage uses cursorModels claude-sonnet-5-5-high, got ${qaStage?.model}`
+    );
+    assert(
+      saStage?.model === "inherit",
+      `SA stage falls back to inherit, got ${saStage?.model}`
+    );
+
+    // Item 6: subagent prompt does not ask subagent to call get_pipeline_state
+    assert(
+      pb.stages.every((s) => !s.instructions.includes("get_pipeline_state")),
+      "subagent instructions must not ask subagent to call get_pipeline_state"
+    );
+    assert(
+      pb.resumeHint.includes("get_pipeline_state"),
+      "host resumeHint retains get_pipeline_state instructions"
+    );
+  }
+
+  // --- Update Plan Item 2 & 7: 2-Wave playbook per slug + Cursor resume ---
+  {
+    const app = join(base, "wave2-app");
+    await mkdir(join(app, ".docs", "specs"), { recursive: true });
+    await writeFile(
+      join(app, ".docs", "todo.md"),
+      "# Todo\n- [ ] maze-generator: Procedural Maze\n- [ ] ghost-ai: Ghost Pursuit\n- [x] boot-shell: Boot Shell\n",
+      "utf8"
+    );
+    // maze-generator already has a spec; ghost-ai does not
+    await writeFile(
+      join(app, ".docs", "specs", "maze-generator.spec.md"),
+      "# Maze\n## Files to touch\n- src/maze.ts\n",
+      "utf8"
+    );
+
+    const models = {
+      ...defaultsOnlyTeamConfig().models,
+      systemArchitect: "inherit",
+      technologyArchitect: "inherit",
+      uiUxDesigner: "inherit",
+      softwareEngineer: "inherit",
+      qaEngineer: "inherit",
+    };
+    const pbWave2 = buildCursorDelegationPlaybook({
+      workflow: "full",
+      userIdea: "Grid Pursuit",
+      workspaceRoot: app,
+      projectRoot: ".",
+      appRoot: app,
+      models,
+      cursorModels: { softwareEngineer: "composer-2.5" },
+      maxTokens: defaultsOnlyTeamConfig().maxTokens,
+      projectType: "webgame",
+    });
+    assert(pbWave2.wave === 2, "wave 2 when open slugs exist in todo.md");
+    const stageIds = pbWave2.stages.map((s) => s.id);
+    // maze-generator spec exists -> no sa-spec:maze-generator, but has qa-tdd-red:maze-generator, se-implement:maze-generator, delivery-critic:maze-generator
+    assert(
+      !stageIds.includes("sa-spec:maze-generator"),
+      "existing spec skipped"
+    );
+    assert(
+      stageIds.includes("qa-tdd-red:maze-generator") &&
+        stageIds.includes("se-implement:maze-generator") &&
+        stageIds.includes("delivery-critic:maze-generator"),
+      "per-slug TDD trio emitted for maze-generator"
+    );
+    // ghost-ai has no spec -> 3-handed spec stages emitted
+    assert(
+      stageIds.includes("sa-spec:ghost-ai") &&
+        stageIds.includes("ux-spec:ghost-ai") &&
+        stageIds.includes("ta-spec:ghost-ai"),
+      "3-handed spec stages emitted for ghost-ai"
+    );
+    assert(
+      stageIds[stageIds.length - 1] === "qa-tdd-verify",
+      "qa-tdd-verify is last"
+    );
+
+    // Item 7: Resume filters out stages marked done in pipeline-state.json
+    const { updatePipelineStage } = await import("../src/pipeline-state.ts");
+    await updatePipelineStage(app, {
+      stage: "qa-tdd-red:maze-generator",
+      recordStatus: "done",
+      recordRole: "qaEngineer",
+    });
+    await updatePipelineStage(app, {
+      stage: "se-implement:maze-generator",
+      recordStatus: "error",
+      recordRole: "softwareEngineer",
+    });
+    const pbResume = buildCursorDelegationPlaybook({
+      workflow: "resume",
+      userIdea: "Grid Pursuit",
+      workspaceRoot: app,
+      projectRoot: ".",
+      appRoot: app,
+      models,
+      cursorModels: { softwareEngineer: "composer-2.5" },
+      maxTokens: defaultsOnlyTeamConfig().maxTokens,
+      projectType: "webgame",
+    });
+    const resumeIds = pbResume.stages.map((s) => s.id);
+    assert(
+      !resumeIds.includes("qa-tdd-red:maze-generator"),
+      "completed qa-tdd-red:maze-generator not re-emitted on resume"
+    );
+    assert(
+      resumeIds.includes("se-implement:maze-generator"),
+      "failed se-implement:maze-generator re-emitted on resume"
+    );
+  }
+
+  // --- Update Plan Item 3, 4, 5: Schema contract, host.json probe, and stage-gate ---
+  {
+    const { writeZteamConfigToolShape, getPipelineStateToolShape } =
+      await import("../src/zteam-config.ts");
+    assert(
+      "projectType" in writeZteamConfigToolShape &&
+        "cursorModels" in writeZteamConfigToolShape,
+      "write_zteam_config schema exposes projectType and cursorModels"
+    );
+    assert(
+      "recordStage" in getPipelineStateToolShape &&
+        "recordRole" in getPipelineStateToolShape &&
+        "recordStatus" in getPipelineStateToolShape &&
+        "recordMessage" in getPipelineStateToolShape &&
+        "skillKey" in getPipelineStateToolShape &&
+        "filesCount" in getPipelineStateToolShape &&
+        "checkGate" in getPipelineStateToolShape,
+      "get_pipeline_state schema exposes all telemetry & gate fields"
+    );
+
+    const { ensureHostProbeFile } = await import("../src/host-probe.ts");
+    const { checkStageGate } = await import("../src/stage-gate.ts");
+    const gateApp = join(base, "gate-app");
+    await mkdir(join(gateApp, ".docs", "specs"), { recursive: true });
+    await mkdir(join(gateApp, "tests"), { recursive: true });
+    const { probe } = await ensureHostProbeFile(gateApp);
+    assert(
+      typeof probe.nodeVersion === "string" &&
+        typeof probe.hasNodeSqlite === "boolean",
+      "host.json probe written"
+    );
+
+    await writeFile(
+      join(gateApp, ".docs", "specs", "maze.spec.md"),
+      "# Maze\nCorridors must have at most 3 free cells in a line.\n",
+      "utf8"
+    );
+    await writeFile(
+      join(gateApp, "tests", "maze.test.ts"),
+      `import Database from "better-sqlite3";\n// Test requires 13 free cells in a line\nexpect(freeCellsInLine).toBeGreaterThanOrEqual(13);\n`,
+      "utf8"
+    );
+    const gateRes = await checkStageGate({
+      appRoot: gateApp,
+      stage: "qa-tdd-red:maze",
+    });
+    assert(!gateRes.ok, "qa-tdd-red gate fails on native addon + contradiction");
+    assert(
+      gateRes.reasons.some((r) => /better-sqlite3/i.test(r)),
+      "gate flags better-sqlite3"
+    );
+    assert(
+      gateRes.reasons.some((r) => /Contradictory/i.test(r)),
+      "gate flags 13 vs max 3 contradiction"
+    );
   }
 
   console.log("smoke:zteam-config OK");

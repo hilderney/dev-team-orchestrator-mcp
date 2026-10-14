@@ -78,6 +78,16 @@
     color: var(--text);
     border-color: var(--accent);
   }
+  .pill.completed {
+    color: var(--green);
+    border-color: var(--green);
+    background: rgba(34, 197, 94, 0.1);
+  }
+  .pill.error {
+    color: var(--red);
+    border-color: var(--red);
+    background: rgba(239, 68, 68, 0.1);
+  }
   .status-dot {
     width: 8px;
     height: 8px;
@@ -262,7 +272,7 @@
     </div>
     <div class="controls">
       <button class="pill" id="btnSimulate" title="Fire a demo pulse across all agents">⚡ Simulate Pulse</button>
-      <span class="pill active"><span class="status-dot" id="liveDot"></span><span id="liveStatus">Polling .docs/zteam-live.js</span></span>
+      <span class="pill active" id="statusPill"><span class="status-dot" id="liveDot"></span><span id="liveStatus">Polling .docs/zteam-live.js</span></span>
     </div>
   </header>
 
@@ -283,9 +293,9 @@
       <div class="kpi-sub" id="kpiFiles">0 files touched</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Output Chars</div>
+      <div class="kpi-label">Output / Disk Chars</div>
       <div class="kpi-val val-green" id="kpiCharsOut">0</div>
-      <div class="kpi-sub">Agent generations</div>
+      <div class="kpi-sub">Generated artefacts</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Retries / Fixes</div>
@@ -354,6 +364,7 @@
     projectType: "core",
     activeStage: "idle",
     activeNode: "orchestrator",
+    pipelineStatus: "idle",
     seq: 0,
     kpis: { totalEvents: 0, specsDone: 0, specsTotal: 0, charsIn: 0, charsOut: 0, filesWritten: 0, retriesAndFixes: 0 },
     nodes: {
@@ -422,6 +433,11 @@
         setTimeout(() => {
           spawnPulse(id, "orchestrator", "#22c55e");
           state.nodes[id].status = "done";
+          if (idx === order.length - 1) {
+            state.activeNode = "orchestrator";
+            state.activeStage = "completed";
+            state.pipelineStatus = "completed";
+          }
         }, 650);
       }, idx * 450);
     });
@@ -468,8 +484,14 @@
 
     const hub = getCoords("orchestrator", w, h);
 
-    // Keep continuous subtle pulse on activeNode
-    if (state.activeNode && state.activeNode !== "orchestrator" && Math.random() < 0.06) {
+    // Keep continuous subtle pulse ONLY while an agent is actively running
+    if (
+      state.pipelineStatus !== "completed" &&
+      state.activeNode &&
+      state.activeNode !== "orchestrator" &&
+      state.nodes?.[state.activeNode]?.status === "active" &&
+      Math.random() < 0.06
+    ) {
       spawnPulse("orchestrator", state.activeNode, NODE_LAYOUT[state.activeNode]?.color);
     }
 
@@ -478,7 +500,9 @@
       if (id === "orchestrator") return;
       const target = getCoords(id, w, h);
       const nodeState = state.nodes?.[id] || {};
-      const isActive = state.activeNode === id || nodeState.status === "active";
+      const isActive =
+        state.pipelineStatus !== "completed" &&
+        (state.activeNode === id || nodeState.status === "active");
       const isDone = nodeState.status === "done";
       const ctrl = {
         x: (hub.x + target.x) / 2,
@@ -526,7 +550,8 @@
       const lay = NODE_LAYOUT[id];
       const n = state.nodes?.[id] || { label: id, sublabel: "", status: "idle", calls: 0 };
       const isHub = id === "orchestrator";
-      const isActive = state.activeNode === id || n.status === "active";
+      const isCompleted = state.pipelineStatus === "completed";
+      const isActive = !isCompleted && (state.activeNode === id || n.status === "active");
       const cardW = (isHub ? 190 : 176) * zoom;
       const cardH = (isHub ? 58 : 54) * zoom;
       const x = pos.x - cardW / 2;
@@ -536,8 +561,8 @@
       ctx.beginPath();
       ctx.roundRect(x, y, cardW, cardH, 10 * zoom);
       ctx.fillStyle = isHub ? "#191516" : "#131621";
-      if (isActive) {
-        ctx.shadowColor = lay.color;
+      if (isActive || (isHub && isCompleted)) {
+        ctx.shadowColor = isHub && isCompleted ? "#22c55e" : lay.color;
         ctx.shadowBlur = 18;
       }
       ctx.fill();
@@ -545,7 +570,7 @@
 
       ctx.lineWidth = isActive ? 2 : 1.2;
       ctx.strokeStyle = isHub
-        ? "#f97316"
+        ? (isCompleted ? "#22c55e" : "#f97316")
         : n.status === "error"
           ? "#ef4444"
           : isActive
@@ -622,9 +647,26 @@
     document.getElementById("projMeta").textContent =
       "workflow: " + (state.workflow || "full") + " · projectType: " + (state.projectType || "core") + " · updated " + relTime(state.updatedAt);
 
+    const statusPill = document.getElementById("statusPill");
+    const liveStatus = document.getElementById("liveStatus");
+    const liveDot = document.getElementById("liveDot");
+    if (state.pipelineStatus === "completed") {
+      statusPill.className = "pill completed";
+      liveStatus.textContent = "Pipeline Completed ✓";
+      liveDot.style.background = "#22c55e";
+    } else if (state.pipelineStatus === "error") {
+      statusPill.className = "pill error";
+      liveStatus.textContent = "Pipeline Error ✗";
+      liveDot.style.background = "#ef4444";
+    } else {
+      statusPill.className = "pill active";
+      liveStatus.textContent = "Polling .docs/zteam-live.js";
+      liveDot.style.background = "#22c55e";
+    }
+
     const k = state.kpis || {};
     document.getElementById("kpiEvents").textContent = fmtNum(k.totalEvents);
-    document.getElementById("kpiActiveStage").textContent = "Active: " + (state.activeStage || "idle");
+    document.getElementById("kpiActiveStage").textContent = "Stage: " + (state.activeStage || "idle");
     document.getElementById("kpiCharsIn").textContent = fmtNum(k.charsIn);
     document.getElementById("kpiSpecs").textContent = (k.specsDone || 0) + " / " + (k.specsTotal || 0);
     document.getElementById("kpiFiles").textContent = fmtNum(k.filesWritten) + " files touched";

@@ -148,5 +148,15 @@ assert.ok(
   "package skills root"
 );
 
+{
+  const webgameTodo = resolveSkillSync({
+    role: "systemArchitect",
+    phase: "todo-plan",
+    projectType: "webgame",
+  });
+  assert.ok(webgameTodo, "sa-todo-plan-webgame resolves");
+  assert.equal(webgameTodo.key, "sa-todo-plan-webgame");
+}
+
 console.log("smoke-skill-resolve: ok");
 process.exit(0);

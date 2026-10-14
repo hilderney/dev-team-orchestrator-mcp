@@ -50,7 +50,10 @@ export const ROLE_ABBREV: Record<TeamRole, string> = {
 export function stageToSkillPhase(stage: string): SkillPhase | null {
   const s = (stage || "").trim();
   if (!s) return null;
-  if (s.startsWith("analyze:") || s === "analyze") return "analyze";
+  if (s.startsWith("analyze:") || s === "analyze" || s === "fidelity-critic" || s === "architecture-critic") {
+    return "analyze";
+  }
+  const baseStage = s.split(":")[0];
   const map: Record<string, SkillPhase> = {
     // LangGraph / invokeRoleLlm stage ids
     orchestratorBootstrapReadme: "bootstrap",
@@ -70,18 +73,22 @@ export function stageToSkillPhase(stage: string): SkillPhase | null {
     systemArchitectTechDebtReview: "tech-debt",
     analyzePrepare: "analyze",
     deliveryCriticDelivery: "delivery-critic",
-    // Cursor delegation playbook stage ids
+    // Cursor delegation playbook stage ids (wave 1 + wave 2 per-slug)
     "sa-requirements": "requirements",
     "ux-juice": "juice",
     "ta-stack": "technologies",
     "ux-design-system": "look-and-feel",
+    "sa-todo-plan": "todo-plan",
     "sa-todo-and-specs": "todo-plan",
+    "sa-spec": "spec-write",
+    "ux-spec": "spec-flow",
+    "ta-spec": "spec-tech",
     "qa-tdd-red": "tdd-red",
     "se-implement": "tdd-green",
     "delivery-critic": "delivery-critic",
     "qa-tdd-verify": "tdd-verify",
   };
-  return map[s] ?? null;
+  return map[s] ?? map[baseStage] ?? null;
 }
 
 /**

@@ -1,6 +1,7 @@
 /**
  * Team model config: `.zteam/config.json` (workspace default + app override).
  */
+import { existsSync, readFileSync } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +15,7 @@ import {
   DASHBOARD_HTML_REL_PATH,
   ensureLiveDashboardFiles,
 } from "./live-dashboard.js";
+import type { CursorPlaybookStageRecord } from "./pipeline-state.js";
 
 /** Orchestrator package root (this MCP server). */
 export const ZTEAM_PACKAGE_ROOT = join(
@@ -94,8 +96,11 @@ export const TEAM_ROLES: TeamRole[] = [
   "qaEngineer",
 ];
 
+export type CursorRoleModels = Partial<Record<TeamRole, string>>;
+
 export function isCursorModelAlias(model: string): boolean {
-  return CURSOR_MODEL_ALIASES.has(model.trim().toLowerCase());
+  const m = model.trim().toLowerCase();
+  return CURSOR_MODEL_ALIASES.has(m) || m.startsWith("cursor:");
 }
 
 export type TeamRuntimeOk = {
@@ -131,7 +136,6 @@ export function inferMissingPrimaryFromPeers(
   const allCursor = peers.every((m) => isCursorModelAlias(m));
   const allNine = peers.every((m) => !isCursorModelAlias(m));
   if (allCursor) {
-    // Prefer the most common alias; fall back to first peer
     const counts = new Map<string, number>();
     for (const m of peers) counts.set(m, (counts.get(m) || 0) + 1);
     let best = peers[0];
@@ -229,6 +233,8 @@ export type DelegationStage = {
   title: string;
   instructions: string;
   expectedOutputs: string[];
+  /** Optional slug when stage is scoped to a single todo item. */
+  slug?: string;
   /** Resolved skill key when a role skill was injected into instructions. */
   skillKey?: string;
 };
@@ -236,17 +242,88 @@ export type DelegationStage = {
 export type CursorDelegationPlaybook = {
   llmRuntime: "cursor";
   workflow: string;
+  wave: 1 | 2;
   userIdea: string;
   workspaceRoot: string;
   projectRoot: string;
   appRoot: string;
   models: ResolvedTeamConfig["models"];
+  cursorModels?: CursorRoleModels;
   maxTokens: ResolvedTeamConfig["maxTokens"];
   stages: DelegationStage[];
   resumeHint: string;
 };
 
-/** Stages for skill-driven Cursor Task path (no ChatOpenAI). */
+/**
+ * Parse open (`- [ ] slug: title`) and done (`- [x] slug: title`) slugs from `.docs/todo.md`.
+ */
+export function parseTodoSlugsSync(appRoot: string): {
+  open: Array<{ slug: string; title: string }>;
+  done: Array<{ slug: string; title: string }>;
+} {
+  const todoPath = join(resolve(appRoot), ".docs", "todo.md");
+  const open: Array<{ slug: string; title: string }> = [];
+  const done: Array<{ slug: string; title: string }> = [];
+  if (!existsSync(todoPath)) return { open, done };
+  try {
+    const text = readFileSync(todoPath, "utf8");
+    for (const line of text.split(/\r?\n/)) {
+      const m = line.match(
+        /^\s*-\s*\[([ xX])\]\s+([a-z0-9-_]+)(?:\s*:\s*(.+))?$/i
+      );
+      if (!m) continue;
+      const isDone = m[1].toLowerCase() === "x";
+      const slug = m[2].trim();
+      const title = (m[3] || slug).trim();
+      if (isDone) done.push({ slug, title });
+      else open.push({ slug, title });
+    }
+  } catch {
+    /* ignore */
+  }
+  return { open, done };
+}
+
+function loadCompletedStageIdsSync(
+  appRoot: string,
+  explicitStages?: Record<string, CursorPlaybookStageRecord>
+): Set<string> {
+  const doneIds = new Set<string>();
+  const map =
+    explicitStages ??
+    (() => {
+      const statePath = join(resolve(appRoot), ".docs", "pipeline-state.json");
+      if (!existsSync(statePath)) return undefined;
+      try {
+        const parsed = JSON.parse(readFileSync(statePath, "utf8")) as {
+          stages?: Record<string, CursorPlaybookStageRecord>;
+        };
+        return parsed.stages;
+      } catch {
+        return undefined;
+      }
+    })();
+  if (!map) return doneIds;
+  for (const [id, rec] of Object.entries(map)) {
+    if (rec?.status === "done") doneIds.add(id);
+  }
+  return doneIds;
+}
+
+/**
+ * Stages for skill-driven Cursor Task path (no ChatOpenAI).
+ *
+ * Implements Update Plan Items 1, 2, 6, 7:
+ * - Item 1: `stage.model` comes from `cursorModels[role]` when non-empty, else `models[role]` (default `"inherit"`).
+ * - Item 2: Two-wave expansion:
+ *   - Wave 1 (when `.docs/todo.md` has no slugs yet, or `workflow === "docs"`):
+ *     `sa-requirements` → `ux-juice` → `fidelity-critic` → `ta-stack` → `architecture-critic` → `ux-design-system` → `sa-todo-plan` (+ `sa-todo-and-specs` alias for legacy/docs).
+ *   - Wave 2 (when `.docs/todo.md` exists on disk with open `[ ]` slugs):
+ *     For each open slug: three-handed spec stages (`sa-spec:{slug}`, `ux-spec:{slug}`, `ta-spec:{slug}`) if `.docs/specs/{slug}.spec.md` is missing, plus implementation trio (`qa-tdd-red:{slug}`, `se-implement:{slug}`, `delivery-critic:{slug}`), followed by `qa-tdd-verify`.
+ *   - When `.docs/todo.md` does not exist yet on a `full` call, Wave 1 is emitted alongside the aggregate fallback stages (`qa-tdd-red`, `se-implement`, `delivery-critic`, `qa-tdd-verify`) so callers inspect the full pipeline topology, and calling `run_development_pipeline` again (or `workflow="resume"`) after `.docs/todo.md` is written expands Wave 2 per-slug.
+ * - Item 6: Subagent prompt is lean — `userIdea` stays once at `playbook.userIdea` (stage only gets a short 280-char summary + input artefacts), and `get_pipeline_state` telemetry instructions live ONLY in `playbook.resumeHint` (for the host), never inside the subagent's prompt.
+ * - Item 7: When `workflow === "resume"`, completed stages in `.docs/pipeline-state.json` (`status === "done"`) are filtered out so only `pending` or `error` stages are returned.
+ */
 export function buildCursorDelegationPlaybook(opts: {
   workflow: string;
   userIdea: string;
@@ -254,22 +331,38 @@ export function buildCursorDelegationPlaybook(opts: {
   projectRoot: string;
   appRoot: string;
   models: ResolvedTeamConfig["models"];
+  cursorModels?: CursorRoleModels;
   maxTokens: ResolvedTeamConfig["maxTokens"];
   projectType?: string;
+  focusSlug?: string;
+  completedStageRecords?: Record<string, CursorPlaybookStageRecord>;
 }): CursorDelegationPlaybook {
   const wf = opts.workflow || "full";
   const idea = opts.userIdea.trim();
-  const rootHint = `workspaceRoot=${opts.workspaceRoot} projectRoot=${opts.projectRoot} appRoot=${opts.appRoot}`;
+  const shortIdea = idea.length > 260 ? `${idea.slice(0, 260)}…` : idea;
+  const rootHint = `appRoot=${opts.appRoot}`;
   const projectType = (opts.projectType || "").trim();
+  const isResume = wf === "resume";
+  const doneStageIds = isResume
+    ? loadCompletedStageIdsSync(opts.appRoot, opts.completedStageRecords)
+    : new Set<string>();
+
+  const resolveTaskModel = (role: TeamRole): string => {
+    const cm = opts.cursorModels?.[role]?.trim();
+    if (cm) return cm;
+    const primary = opts.models[role]?.trim();
+    return primary || "inherit";
+  };
 
   const stage = (
     id: string,
     role: TeamRole,
     title: string,
     instructions: string,
-    expectedOutputs: string[]
+    expectedOutputs: string[],
+    slug?: string
   ): DelegationStage => {
-    let instr = `${instructions}\n\nConstraints: ${rootHint}. Idea: ${idea}\n\nLive Canvas Observability (9Router style): Before and after running this stage via Cursor Task, call MCP \`get_pipeline_state\` with \`recordStage="${id}"\`, \`recordRole="${role}"\`, \`recordStatus="start"|"done"\`, and a 1-sentence \`recordMessage\` so \`.zteam/dashboard/index.html\` animates the agent call in real time. In the main Cursor chat, print ONLY the 1-line \`chatBanner\` returned by \`get_pipeline_state\` (keep long logs out of chat).`;
+    let instr = `${instructions}\n\nContext: ${rootHint}${slug ? ` · slug=${slug}` : ""}. Goal summary: ${shortIdea} (read full constraints in .docs/requirements.md and .docs/host.json when present).`;
     let skillKey: string | undefined;
     const phase = stageToSkillPhase(id);
     if (phase) {
@@ -289,10 +382,11 @@ export function buildCursorDelegationPlaybook(opts: {
       id,
       role,
       subagentType: ROLE_TO_SUBAGENT[role],
-      model: opts.models[role],
+      model: resolveTaskModel(role),
       title,
       instructions: instr,
       expectedOutputs,
+      ...(slug ? { slug } : {}),
       skillKey,
     };
   };
@@ -328,11 +422,13 @@ export function buildCursorDelegationPlaybook(opts: {
     return {
       llmRuntime: "cursor",
       workflow: wf,
+      wave: 1,
       userIdea: idea,
       workspaceRoot: opts.workspaceRoot,
       projectRoot: opts.projectRoot,
       appRoot: opts.appRoot,
       models: opts.models,
+      cursorModels: opts.cursorModels,
       maxTokens: opts.maxTokens,
       stages,
       resumeHint:
@@ -340,13 +436,21 @@ export function buildCursorDelegationPlaybook(opts: {
     };
   }
 
-  if (needsArch || wf === "docs") {
+  const todoSlugs = parseTodoSlugsSync(opts.appRoot);
+  const focus = (opts.focusSlug || "").trim();
+  const openSlugs = focus
+    ? todoSlugs.open.filter((item) => item.slug === focus)
+    : todoSlugs.open;
+  const hasOpenTodoOnDisk = openSlugs.length > 0;
+  const wave: 1 | 2 = hasOpenTodoOnDisk ? 2 : 1;
+
+  if ((needsArch && !hasOpenTodoOnDisk) || wf === "docs") {
     stages.push(
       stage(
         "sa-requirements",
         "systemArchitect",
         "System Architect — requirements",
-        "Produce or update .docs/requirements.md (## sections with goals, functional/non-functional, normal+alt flows; technology-agnostic). Do not write implementation code or specs yet.",
+        "Produce or update .docs/requirements.md (## sections with goals, functional/non-functional, normal+alt flows; preserve all numbered rules from userIdea). Do not write implementation code.",
         [".docs/requirements.md"]
       )
     );
@@ -355,8 +459,17 @@ export function buildCursorDelegationPlaybook(opts: {
         "ux-juice",
         "uiUxDesigner",
         "UI/UX — juice addendum",
-        "Score requirements UX 1–10, write ## UX / Juice addendum (action/reaction feedback). Raise score to ≥7 vs before. Do not invent contradicting features or pick stacks.",
+        "Score requirements UX 1–10, write ## UX / Juice addendum (action/reaction feedback) in .docs/requirements.md. Raise score to ≥7. Do not invent contradicting features.",
         [".docs/requirements.md"]
+      )
+    );
+    stages.push(
+      stage(
+        "fidelity-critic",
+        "systemArchitect",
+        "Fidelity Critic — requirements vs userIdea",
+        "Read .docs/requirements.md and compare against every constraint in playbook.userIdea. Write verdict (PASS or FAIL + missing items) to .docs/reviews/fidelity-review.md.",
+        [".docs/reviews/fidelity-review.md"]
       )
     );
     stages.push(
@@ -364,8 +477,17 @@ export function buildCursorDelegationPlaybook(opts: {
         "ta-stack",
         "technologyArchitect",
         "Technology Architect — stack / structure",
-        "Produce or update .docs/technologies.md covering stack, folder layout, hosting, persistence, scalability, cost-benefit services, and standards from approved requirements. Do not write full feature implementations.",
+        "Read .docs/requirements.md and .docs/host.json. Produce .docs/technologies.md covering the 9-Layer System Design + AI Stack. Respect .docs/host.json (prefer node:sqlite over better-sqlite3 when nativeCompileLikelyOk=false).",
         [".docs/technologies.md"]
+      )
+    );
+    stages.push(
+      stage(
+        "architecture-critic",
+        "technologyArchitect",
+        "Architecture Critic — requirements ↔ stack coverage",
+        "Read .docs/requirements.md, .docs/technologies.md, and .docs/host.json. Verify persistence, auth/leaderboard, and host compatibility. Write verdict to .docs/reviews/architecture-review.md.",
+        [".docs/reviews/architecture-review.md"]
       )
     );
     stages.push(
@@ -373,7 +495,7 @@ export function buildCursorDelegationPlaybook(opts: {
         "ux-design-system",
         "uiUxDesigner",
         "UI/UX — look and feel",
-        "From requirements.md + technologies.md write .docs/ui-ux.md: look-and-feel, hierarchy, color palette, visual/sound/sensory behavior, evidence-based emotion strategies. No invented statistics.",
+        "From .docs/requirements.md + .docs/technologies.md write .docs/ui-ux.md: look-and-feel, hierarchy, color palette, visual/sound/sensory behavior.",
         [".docs/ui-ux.md"]
       )
     );
@@ -381,20 +503,97 @@ export function buildCursorDelegationPlaybook(opts: {
       stage(
         "sa-todo-and-specs",
         "systemArchitect",
-        "System Architect — todo + three-handed specs",
-        "Plan .docs/todo.md (testable chunks from pré-reqs). For each slug: SA writes detailed spec, UI/UX enriches usability/narrative, TA adds technical how-to on the same .docs/specs/{slug}.spec.md.",
-        [".docs/todo.md", ".docs/specs/*.spec.md"]
+        "System Architect — todo plan",
+        "Plan .docs/todo.md with testable `- [ ] slug: title` chunks in dependency order. Once .docs/todo.md is saved, Wave 2 expands three-handed specs (SA → UX → TA) and TDD per slug.",
+        [".docs/todo.md"]
       )
     );
   }
 
-  if (needsImpl && !docsOnly && !testsOnly) {
+  // Wave 2: per-slug three-handed specs + per-slug TDD (qa-tdd-red:{slug} -> se-implement:{slug} -> delivery-critic:{slug})
+  if (hasOpenTodoOnDisk && (needsArch || needsImpl) && !testsOnly) {
+    for (const item of openSlugs) {
+      const s = item.slug;
+      const specRel = `.docs/specs/${s}.spec.md`;
+      const specAbs = join(resolve(opts.appRoot), specRel);
+      const specExists = existsSync(specAbs);
+
+      if (!specExists || docsOnly) {
+        stages.push(
+          stage(
+            `sa-spec:${s}`,
+            "systemArchitect",
+            `SA Spec — ${s} (${item.title})`,
+            `Write ${specRel} for todo '${s}: ${item.title}' with >=3 use cases, acceptance criteria, and explicit ## Files to touch.`,
+            [specRel],
+            s
+          )
+        );
+        if (needsUiFlow(projectType)) {
+          stages.push(
+            stage(
+              `ux-spec:${s}`,
+              "uiUxDesigner",
+              `UX Flow & States — ${s}`,
+              `Enrich ${specRel} with ## Flow & states (screen transitions, overlay exclusivity, busy states).`,
+              [specRel],
+              s
+            )
+          );
+        }
+        stages.push(
+          stage(
+            `ta-spec:${s}`,
+            "technologyArchitect",
+            `TA Technical How-To — ${s}`,
+            `Enrich ${specRel} with ## Technical design / how-to aligned with .docs/technologies.md and .docs/host.json.`,
+            [specRel],
+            s
+          )
+        );
+      }
+
+      if (needsImpl && !docsOnly) {
+        stages.push(
+          stage(
+            `qa-tdd-red:${s}`,
+            "qaEngineer",
+            `QA TDD Red — ${s}`,
+            `Read ${specRel} and .docs/host.json. Write failing tests for slug '${s}' ONLY. Positive test cases MUST NOT violate another rule of the spec. Never import better-sqlite3 if host.json prefers node:sqlite. Do NOT implement product code or mark [x].`,
+            [`tests/**/${s}*.test.*`],
+            s
+          )
+        );
+        stages.push(
+          stage(
+            `se-implement:${s}`,
+            "softwareEngineer",
+            `SE Implement (TDD Green) — ${s}`,
+            `Read ${specRel} and make the red tests for slug '${s}' pass. Touch only files scoped for '${s}'. Do not weaken tests or mark [x].`,
+            ["src/**"],
+            s
+          )
+        );
+        stages.push(
+          stage(
+            `delivery-critic:${s}`,
+            "softwareEngineer",
+            `Delivery Critic — ${s}`,
+            `Verify all ## Files to touch in ${specRel} exist on disk and tests for '${s}' pass.`,
+            [".docs/todo.md", "src/**"],
+            s
+          )
+        );
+      }
+    }
+  } else if (needsImpl && !docsOnly && !testsOnly) {
+    // Fallback aggregate stages when .docs/todo.md is not on disk yet
     stages.push(
       stage(
         "qa-tdd-red",
         "qaEngineer",
         "QA — TDD red (tests first)",
-        "BEFORE implementation: write failing automated tests from each pending spec (use cases, ACs, screen-flow / Flow & states if present). Prefer vitest. Do NOT implement product code. Do NOT mark todos [x]. Tests must fail or be clearly red until SE implements.",
+        "BEFORE implementation: write failing automated tests from each pending spec (use cases, ACs, Flow & states). Ensure positive fixtures never violate another spec rule and respect .docs/host.json (prefer node:sqlite). Do NOT implement product code or mark [x].",
         ["**/*.{test,spec}.*", "tests/**"]
       )
     );
@@ -403,7 +602,7 @@ export function buildCursorDelegationPlaybook(opts: {
         "se-implement",
         "softwareEngineer",
         "Software Engineer — implement (TDD green)",
-        "Implement pending [ ] todos that have specs AND existing red tests. Make tests pass. Follow technologies.md and specs. Do not delete or weaken tests. Do not mark todos [x] — QA verify does that after green.",
+        "Implement pending [ ] todos that have specs AND existing red tests. Make tests pass. Follow .docs/technologies.md and specs. Do not delete or weaken tests. Do not mark todos [x].",
         ["src/**", "package.json"]
       )
     );
@@ -412,20 +611,22 @@ export function buildCursorDelegationPlaybook(opts: {
         "delivery-critic",
         "softwareEngineer",
         "Delivery critic — spot-check",
-        "After SE green and BEFORE QA verify: spot-check completed specs vs Files to touch on disk and use-case coverage. Reopen incomplete slugs (do not mark [x]). Do not rewrite or weaken red tests.",
+        "After SE green and BEFORE QA verify: spot-check completed specs vs Files to touch on disk and use-case coverage. Reopen incomplete slugs (do not mark [x]).",
         [".docs/todo.md", "src/**"]
       )
     );
   }
 
   if (testsOnly) {
+    const targetId = focus ? `qa-tdd-red:${focus}` : "qa-tdd-red";
     stages.push(
       stage(
-        "qa-tdd-red",
+        targetId,
         "qaEngineer",
-        "QA — TDD red (tests only)",
-        "Write failing tests for the focused slug/requirement only. No product implementation.",
-        ["**/*.{test,spec}.*", "tests/**"]
+        focus ? `QA — TDD red (${focus})` : "QA — TDD red (tests only)",
+        "Write failing tests for the focused slug/requirement only. Ensure positive test cases satisfy all spec invariants. No product implementation.",
+        ["**/*.{test,spec}.*", "tests/**"],
+        focus || undefined
       )
     );
   }
@@ -436,24 +637,30 @@ export function buildCursorDelegationPlaybook(opts: {
         "qa-tdd-verify",
         "qaEngineer",
         "QA — TDD verify",
-        "Run the suite; add only gap/regression tests. Confirm ACs of [x]-candidate specs are covered (incl. screen-flow/overlays when the spec requires it). Do not re-implement the product. Mark done only when tests pass.",
-        ["**/*.{test,spec}.*", "tests/**"]
+        "Run the full test suite; confirm all specs and screen-flow ACs pass (exit code 0). Only mark todos [x] when the suite passes.",
+        ["**/*.{test,spec}.*", "tests/**", ".docs/todo.md"]
       )
     );
   }
 
+  const filteredStages = isResume
+    ? stages.filter((s) => !doneStageIds.has(s.id))
+    : stages;
+
   return {
     llmRuntime: "cursor",
     workflow: wf,
+    wave,
     userIdea: idea,
     workspaceRoot: opts.workspaceRoot,
     projectRoot: opts.projectRoot,
     appRoot: opts.appRoot,
     models: opts.models,
+    cursorModels: opts.cursorModels,
     maxTokens: opts.maxTokens,
-    stages,
+    stages: filteredStages,
     resumeHint:
-      "llmRuntime=cursor: run each delegationPlaybook.stages entry via Cursor Task (subagentType + model from stage). Do NOT call 9router. Open `.zteam/dashboard/index.html` in a browser for the 9Router-style live canvas animation; before/after each Task call `get_pipeline_state` with `recordStage`/`recordStatus`/`recordMessage` and print ONLY the 1-line `chatBanner` in chat.",
+      "HOST INSTRUCTIONS (llmRuntime=cursor): Run each delegationPlaybook.stages entry via Cursor Task using `subagent_type: stage.subagentType` and `model: stage.model`. Do NOT call 9router. Before each Task call `get_pipeline_state({ workspaceRoot, projectRoot, recordStage: stage.id, recordRole: stage.role, recordStatus: 'start', skillKey: stage.skillKey })`; after each Task call `get_pipeline_state({ ..., recordStatus: 'done', checkGate: true })` (if `gate.ok === false`, fix before advancing). When `.docs/todo.md` is created after `sa-todo-and-specs`, call `run_development_pipeline` with `workflow: 'resume'` to expand Wave 2 per-slug stages. At the end of the pipeline, call `get_pipeline_state({ ..., recordStage: 'pipeline', recordStatus: 'done', recordMessage: 'Pipeline completed' })` so `.zteam/dashboard/index.html` shows Completed.",
   };
 }
 
@@ -583,6 +790,16 @@ const modelsSchema = z
   })
   .passthrough();
 
+export const cursorModelsSchema = z
+  .object({
+    systemArchitect: z.string().optional(),
+    technologyArchitect: z.string().optional(),
+    uiUxDesigner: z.string().optional(),
+    softwareEngineer: z.string().optional(),
+    qaEngineer: z.string().optional(),
+  })
+  .passthrough();
+
 const maxTokensSchema = z
   .object({
     systemArchitect: z.number().int().positive().optional(),
@@ -596,9 +813,11 @@ const maxTokensSchema = z
 export const zteamConfigFileSchema = z
   .object({
     version: z.number().int().positive().default(1),
-    /** webgame | godotgame | crud | webapp | mobile | cli-dos | backend | frontend | fullstack | library | desktop | other */
+    /** webgame | godotgame | crud | webapp | mobile | cli-dos | backend | frontend | fullstack | library | desktop | ai-rag | other */
     projectType: z.string().min(1).optional(),
     models: modelsSchema.optional(),
+    /** Optional Cursor Task model slugs per role (e.g. "composer-2.5", "claude-sonnet-5-5-high") when models.* are "inherit". */
+    cursorModels: cursorModelsSchema.optional(),
     maxTokens: maxTokensSchema.optional(),
     createdAt: z.string().optional(),
     updatedAt: z.string().optional(),
@@ -642,6 +861,8 @@ export type ResolvedTeamConfig = {
     softwareEngineerFallback: string;
     qaEngineerFallback: string;
   };
+  /** Optional Cursor Task model slugs per role (used by buildCursorDelegationPlaybook; never sent to 9router). */
+  cursorModels: CursorRoleModels;
   maxTokens: {
     systemArchitect: number;
     technologyArchitect: number;
@@ -670,7 +891,8 @@ export type WorkspaceDiagnosis = {
 
 export const SETUP_QUESTIONS = [
   "Escopo: gravar no workspace, neste app (projectRoot), ou ambos?",
-  "System Architect — primary model (ver modelSuggestions.systemArchitect: 2 free + 2 paid)",
+  "Tipo de projeto (projectType): webgame | webapp | crud | backend | fullstack | ai-rag | cli-dos | library?",
+  "System Architect — primary model (ver modelSuggestions.systemArchitect: 2 free + 2 paid, ou 'inherit' para Cursor)",
   "System Architect — fallback model (segundo agente SA se o primary esgotar; vazio = sem handoff)",
   "Technology Architect — primary (ver modelSuggestions.technologyArchitect)",
   "Technology Architect — fallback",
@@ -680,13 +902,14 @@ export const SETUP_QUESTIONS = [
   "Software Engineer — fallback (recomendado se usares SE free)",
   "QA Engineer — primary (ver modelSuggestions.qaEngineer)",
   "QA Engineer — fallback",
+  "Se runtime Cursor ('inherit'): queres definir cursorModels por papel (ex. softwareEngineer: 'composer-2.5')?",
   "maxTokens por papel? (defaults / custom)",
   "Se não houver .gitignore no alvo: ignorar .zteam/config.json no git? (recomendado: sim)",
 ] as const;
 
 /** Focused questions for `@zteam/models` (LLM ids only). */
 export const MODEL_QUESTIONS = [
-  "Para CADA papel (SA/TA/UX/SE/QA): escolhe primary + fallback. Família homogénea: aliases Cursor (inherit/auto/cursor/cursor-auto) OU ids 9router (modelSuggestions). Não misturar.",
+  "Para CADA papel (SA/TA/UX/SE/QA): escolhe primary + fallback. Família homogénea: aliases Cursor (inherit/auto/cursor/cursor-auto) OU ids 9router (modelSuggestions). Não misturar. Se Cursor, podes opcionalmente indicar cursorModels por papel (ex. composer-2.5).",
   "System Architect — primary",
   "System Architect — fallback (vazio ok; só ninerouter)",
   "Technology Architect — primary",
@@ -697,6 +920,7 @@ export const MODEL_QUESTIONS = [
   "Software Engineer — fallback",
   "QA Engineer — primary",
   "QA Engineer — fallback",
+  "cursorModels opcionais por papel (ex. softwareEngineer='composer-2.5')?",
   "Gravar neste projeto: workspace (raiz aberta), app (projectRoot), ou ambos?",
 ] as const;
 
@@ -743,7 +967,7 @@ O valor de cada primary em \`models\` escolhe o runtime (**família homogénea**
 
 | Valor no config | Runtime | O que acontece |
 |-----------------|---------|----------------|
-| \`inherit\` / \`auto\` / \`cursor\` / \`cursor-auto\` | **cursor** | Skill corre SA/TA/SE/QA via Cursor Task (Auto do chat pai). MCP **não** chama 9router. |
+| \`inherit\` / \`auto\` / \`cursor\` / \`cursor-auto\` | **cursor** | Skill corre SA/TA/UX/SE/QA via Cursor Task. Use \`cursorModels\` opcional para fixar slugs do Cursor (ex. \`composer-2.5\`). MCP **não** chama 9router. |
 | Qualquer outro id (\`9RSA-…\`, \`cu/default\`, …) | **ninerouter** | MCP \`ChatOpenAI\` com o id **literal** → 9router. |
 
 Mix (\`inherit\` + \`9RSE-…\`) → \`failureKind: mixed_runtime\` (fail cedo).
@@ -756,11 +980,11 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 
 | Comando | O que faz | MCP |
 |---------|-----------|-----|
-| **\`@zteam/config\`** | Setup completo: \`.zteam/config.json\` (modelos, maxTokens, escopo workspace/app, gitignore). | \`get_zteam_config\` → perguntas → \`write_zteam_config\` |
-| **\`@zteam/models\`** | Só LLMs por papel — perguntas guiadas → atualiza \`models\` em \`.zteam/config.json\` neste projeto. | \`get_zteam_config\` → \`modelQuestions\` → \`write_zteam_config\` |
+| **\`@zteam/config\`** | Setup completo: \`.zteam/config.json\` (projectType, modelos, cursorModels, maxTokens, escopo workspace/app, gitignore). | \`get_zteam_config\` → perguntas → \`write_zteam_config\` |
+| **\`@zteam/models\`** | Só LLMs por papel — perguntas guiadas → atualiza \`models\` / \`cursorModels\` em \`.zteam/config.json\` neste projeto. | \`get_zteam_config\` → \`modelQuestions\` → \`write_zteam_config\` |
 | **\`@zteam/documentation\`** | Só documentação / arquitetura (requirements, technologies, todo, specs). Sem SE/QA. | \`run_development_pipeline\` com \`workflow: "docs"\` |
 | **\`@zteam/tests\`** | Só testes (TDD red → verify) para um requisito. | \`run_development_pipeline\` com \`workflow: "tests"\` + \`slug\` |
-| **\`@zteam\`** / **\`/zteam\`** | Pipeline completo ou o workflow que pedires (\`full\` \\| \`docs\` \\| \`feature\` \\| \`punch\` \\| \`fix\` \\| \`resume\` \\| \`tests\` \\| \`analyze\`). | \`run_development_pipeline\` (ou Task playbook se runtime=cursor) |
+| **\`@zteam\`** / **\`/zteam\`** | Pipeline completo ou o workflow que pedires (\`full\` \\| \`docs\` \\| \`feature\` \\| \`punch\` \\| \`fix\` \\| \`resume\` \\| \`tests\` \\| \`analyze\`). | \`run_development_pipeline\` (ou Task playbook em 2 ondas se runtime=cursor) |
 | **\`ensure_zteam_setup\`** | Stubs skill + \`.docs\` (+ template config opcional), sem LLM. | MCP \`ensure_zteam_setup\` |
 | **LangGraph Studio** | Topologia do pipeline (nós/edges). \`node .zteam/langgraph/dev.mjs\` | Agent Server no pacote MCP |
 
@@ -768,10 +992,10 @@ Use estes atalhos no chat Cursor (skill \`zteam\` / \`@zteam\`). O agent **sempr
 
 \`\`\`text
 @zteam/models
-→ mostra modelos atuais + defaults → pergunta SA/TA/SE/QA/fallback → grava .zteam/config.json
+→ mostra modelos atuais + defaults → pergunta SA/TA/SE/QA/fallback (+ cursorModels) → grava .zteam/config.json
 
 @zteam/config
-→ pergunta modelos / escopo / maxTokens → grava .zteam/config.json (+ .gitignore para config)
+→ pergunta projectType / modelos / escopo / maxTokens → grava .zteam/config.json (+ .gitignore para config)
 
 @zteam/documentation samples/pacman — canvas TS, infinite lives
 → workflow=docs, projectRoot=samples/pacman
@@ -790,10 +1014,12 @@ node .zteam/langgraph/dev.mjs
 
 | Path | Papel |
 |------|--------|
-| \`.zteam/config.json\` | **Verdade absoluta** — modelos e maxTokens por papel |
+| \`.zteam/config.json\` | **Verdade absoluta** — projectType, modelos, cursorModels e maxTokens por papel |
+| \`.zteam/dashboard/index.html\` | **Live Canvas Dashboard** (9Router style) — abre direto no browser (\`file://\`), faz polling de \`.docs/zteam-live.js\` |
 | \`.zteam/README.MD\` | Este guia (comandos) |
 | \`.zteam/skills/SKILL.md\` | Cópia local da skill Cursor zteam (sincronizada ao criar \`.zteam/\`) |
 | \`.zteam/langgraph/\` | Launcher LangGraph Studio (topologia; ver README nessa pasta) |
+| \`.docs/host.json\` | Sonda automática do ambiente (Node, \`node:sqlite\`, compilação nativa) |
 | \`.docs/*\` | Artefactos da pipeline (requirements, technologies, specs, progress, …) |
 | \`.docs/langgraph.mmd\` | Dump Mermaid offline do grafo (copiado do pacote MCP) |
 
@@ -813,6 +1039,7 @@ Isto mostra a **topologia** do fluxo (workflowRouter → SA → TA → SE → QA
 \`\`\`json
 {
   "version": 1,
+  "projectType": "webgame",
   "models": {
     "systemArchitect": "9RSA-system-architect-free",
     "systemArchitectFallback": "9RSA-system-architect",
@@ -836,11 +1063,12 @@ Isto mostra a **topologia** do fluxo (workflowRouter → SA → TA → SE → QA
 }
 \`\`\`
 
-### Exemplo Cursor Auto (fora do 9router)
+### Exemplo Cursor (com \`cursorModels\` por papel, fora do 9router)
 
 \`\`\`json
 {
   "version": 1,
+  "projectType": "webgame",
   "models": {
     "systemArchitect": "inherit",
     "systemArchitectFallback": "",
@@ -853,13 +1081,17 @@ Isto mostra a **topologia** do fluxo (workflowRouter → SA → TA → SE → QA
     "qaEngineer": "inherit",
     "qaEngineerFallback": "",
     "fallback": ""
+  },
+  "cursorModels": {
+    "softwareEngineer": "composer-2.5",
+    "qaEngineer": "composer-2.5"
   }
 }
 \`\`\`
 
 Handoff (só runtime **ninerouter**): se o primary esgotar retries, o MCP promove o \`*Fallback\` do papel. Papéis ativos podem consultar-se nos gates (SE↔SA após VERIFY FAIL; TA↔SA em gaps de arquitetura).
 
-No \`@zteam/config\` / \`@zteam/models\`, pergunta primary+fallback por papel e mostra \`modelSuggestions\` (2 free + 2 paid) **e** aliases Cursor (\`inherit\`).
+No \`@zteam/config\` / \`@zteam/models\`, pergunta primary+fallback por papel e mostra \`modelSuggestions\` (2 free + 2 paid) **e** aliases Cursor (\`inherit\` + \`cursorModels\`).
 
 ## Workspace (pasta raiz)
 
@@ -951,7 +1183,7 @@ export async function ensureZteamSkillCopy(
 }
 
 /**
- * Create `.zteam/` and materialize README + local skill copy + LangGraph Studio launcher.
+ * Create `.zteam/` and materialize README + local skill copy + LangGraph Studio launcher + Live Canvas Dashboard.
  * Call this before any pipeline / LLM work (and whenever `.zteam/` is created).
  */
 export async function ensureZteamBootstrap(targetDir: string): Promise<{
@@ -1349,6 +1581,7 @@ export function envDefaultsTeamConfig(): Omit<
         process.env.MODEL_QA_ENGINEER_FALLBACK?.trim() ||
         DEFAULT_MODELS.qaEngineerFallback,
     },
+    cursorModels: {},
     maxTokens: {
       systemArchitect: parseMaxTokensEnv(
         process.env.MAX_TOKENS_SYSTEM_ARCHITECT,
@@ -1382,6 +1615,7 @@ export function defaultsOnlyTeamConfig(): Omit<
   return {
     projectType: "",
     models: { ...DEFAULT_MODELS },
+    cursorModels: {},
     maxTokens: { ...DEFAULT_MAX_TOKENS },
   };
 }
@@ -1411,6 +1645,19 @@ async function readConfigFile(abs: string): Promise<ZteamConfigFile | null> {
   const raw = (await readFile(abs, "utf8")).replace(/^\uFEFF/, "");
   const parsed = JSON.parse(raw) as unknown;
   return zteamConfigFileSchema.parse(parsed);
+}
+
+function mergeCursorModels(
+  base: CursorRoleModels,
+  layer?: CursorRoleModels
+): CursorRoleModels {
+  if (!layer) return { ...base };
+  const next: CursorRoleModels = { ...base };
+  for (const role of TEAM_ROLES) {
+    const val = layer[role]?.trim();
+    if (val) next[role] = val;
+  }
+  return next;
 }
 
 function mergeLayer(
@@ -1465,6 +1712,7 @@ function mergeLayer(
           ? String(lm.qaEngineerFallback).trim()
           : base.models.qaEngineerFallback,
     },
+    cursorModels: mergeCursorModels(base.cursorModels, layer.cursorModels),
     maxTokens: {
       systemArchitect:
         layer.maxTokens?.systemArchitect ?? base.maxTokens.systemArchitect,
@@ -1491,7 +1739,6 @@ export async function loadTeamConfig(
       ? null
       : await readConfigFile(paths.appConfig);
 
-  // Same path when projectRoot is "." — only read once
   const samePath =
     resolve(paths.workspaceConfig) === resolve(paths.appConfig);
   const workspaceExists = await pathExists(paths.workspaceConfig);
@@ -1505,9 +1752,6 @@ export async function loadTeamConfig(
       : envDefaultsTeamConfig();
   merged = mergeLayer(merged, workspaceFile);
   if (!samePath) merged = mergeLayer(merged, appFile);
-  else if (workspaceFile) {
-    /* already merged */
-  }
 
   return {
     ...merged,
@@ -1592,6 +1836,7 @@ export type WriteTeamConfigInput = {
     softwareEngineerFallback?: string;
     qaEngineerFallback?: string;
   };
+  cursorModels?: CursorRoleModels;
   maxTokens?: Partial<ResolvedTeamConfig["maxTokens"]>;
   /** Optional; preserved from existing file when omitted. */
   projectType?: string;
@@ -1608,11 +1853,13 @@ export async function writeTeamConfig(
 
   let createdAt = now;
   let prevProjectType = "";
+  let prevCursorModels: CursorRoleModels = {};
   if (await pathExists(abs)) {
     try {
       const prev = await readConfigFile(abs);
       if (prev?.createdAt) createdAt = prev.createdAt;
       if (prev?.projectType) prevProjectType = prev.projectType.trim();
+      if (prev?.cursorModels) prevCursorModels = prev.cursorModels;
     } catch {
       /* rewrite */
     }
@@ -1620,6 +1867,8 @@ export async function writeTeamConfig(
 
   const projectType =
     (input.projectType || "").trim() || prevProjectType || undefined;
+  const cursorModels = mergeCursorModels(prevCursorModels, input.cursorModels);
+  const hasCursorModels = Object.keys(cursorModels).length > 0;
 
   const config: ZteamConfigFile = zteamConfigFileSchema.parse({
     version: 1,
@@ -1658,6 +1907,7 @@ export async function writeTeamConfig(
       ).trim(),
       qaEngineerFallback: (input.models.qaEngineerFallback ?? "").trim(),
     },
+    ...(hasCursorModels ? { cursorModels } : {}),
     maxTokens: {
       systemArchitect:
         input.maxTokens?.systemArchitect ?? DEFAULT_MAX_TOKENS.systemArchitect,
@@ -1754,3 +2004,136 @@ export function needsConfigPayload(opts: {
       : "Answer setup questions, call write_zteam_config, then re-run pipeline",
   };
 }
+
+/**
+ * Single source of truth for MCP tool Zod schemas (`write_zteam_config` & `get_pipeline_state`)
+ * so published MCP descriptors and contract tests never drift (Item 4 of Update Plan).
+ */
+export const PROJECT_TYPE_VALUES = [
+  "webgame",
+  "godotgame",
+  "crud",
+  "webapp",
+  "mobile",
+  "cli-dos",
+  "backend",
+  "frontend",
+  "fullstack",
+  "library",
+  "desktop",
+  "ai-rag",
+  "api",
+  "other",
+] as const;
+
+export const writeZteamConfigToolShape = {
+  workspaceRoot: z
+    .string()
+    .optional()
+    .describe(
+      "Absolute path of the Cursor-open workspace folder (REQUIRED on every MCP call; env WORKSPACE_ROOT is ignored)"
+    ),
+  projectRoot: z.string().optional().default("."),
+  scope: z.enum(["workspace", "app", "both"]),
+  projectType: z
+    .string()
+    .optional()
+    .describe(
+      "Project archetype driving role skills: webgame | webapp | crud | backend | fullstack | ai-rag | godotgame | cli-dos | library | desktop | api | other"
+    ),
+  models: z.object({
+    systemArchitect: z.string().min(1),
+    technologyArchitect: z.string().min(1),
+    uiUxDesigner: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "UI/UX primary; if omitted, inherits peer family (cursor alias or 9router default)"
+      ),
+    softwareEngineer: z.string().min(1),
+    qaEngineer: z.string().min(1),
+    fallback: z.string().optional().default(""),
+    systemArchitectFallback: z.string().optional().default(""),
+    technologyArchitectFallback: z.string().optional().default(""),
+    uiUxDesignerFallback: z.string().optional().default(""),
+    softwareEngineerFallback: z.string().optional().default(""),
+    qaEngineerFallback: z.string().optional().default(""),
+  }),
+  cursorModels: cursorModelsSchema
+    .optional()
+    .describe(
+      "Optional Cursor Task model slugs per role (e.g. { softwareEngineer: 'composer-2.5' }) when models.* are 'inherit'"
+    ),
+  maxTokens: z
+    .object({
+      systemArchitect: z.number().int().positive().optional(),
+      technologyArchitect: z.number().int().positive().optional(),
+      uiUxDesigner: z.number().int().positive().optional(),
+      softwareEngineer: z.number().int().positive().optional(),
+      qaEngineer: z.number().int().positive().optional(),
+    })
+    .optional(),
+  gitignoreIgnore: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      "If true and no .gitignore, create one with .zteam/config.json; if .gitignore exists, append .zteam/config.json"
+    ),
+};
+
+export const getPipelineStateToolShape = {
+  workspaceRoot: z
+    .string()
+    .optional()
+    .describe(
+      "Absolute path of the Cursor-open workspace folder (REQUIRED on every MCP call; env WORKSPACE_ROOT is ignored)"
+    ),
+  projectRoot: z
+    .string()
+    .optional()
+    .default(".")
+    .describe("Relative project folder under workspaceRoot"),
+  recordStage: z
+    .string()
+    .optional()
+    .describe(
+      "Optional stage id to push into `.docs/pipeline-state.json` and `.zteam/dashboard/index.html` (e.g. sa-requirements, qa-tdd-red:maze, se-implement:maze, pipeline)"
+    ),
+  recordRole: z
+    .string()
+    .optional()
+    .describe(
+      "Optional role id (systemArchitect | uiUxDesigner | technologyArchitect | qaEngineer | softwareEngineer)"
+    ),
+  recordStatus: z
+    .enum(["start", "done", "error", "warn", "info"])
+    .optional()
+    .describe(
+      "Animation direction & stage checkpoint status: start (Orchestrator -> Agent) or done/error (Agent -> Orchestrator)"
+    ),
+  recordMessage: z
+    .string()
+    .optional()
+    .describe("Short summary of what the subagent is doing or delivered"),
+  skillKey: z.string().optional().describe("Active role skill key if any"),
+  filesCount: z
+    .number()
+    .optional()
+    .describe("Number of files written in this step"),
+  checkGate: z
+    .boolean()
+    .optional()
+    .describe(
+      "When true (or automatically when recordStatus='done'), runs mechanical stage gate checks (requirements, host.json native addons, QA-red contradictions)"
+    ),
+  testExitCode: z
+    .number()
+    .optional()
+    .describe("Optional exit code from `npm test` for stage gate verification"),
+  testOutput: z
+    .string()
+    .optional()
+    .describe("Optional stdout/stderr snippet from `npm test` for stage gate verification"),
+};

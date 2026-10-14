@@ -697,10 +697,12 @@ Every bootstrapped project automatically gets **`.zteam/dashboard/index.html`** 
 *Example: active System Architect (`sa-todo-and-specs`), KPI cards, radial agent canvas, and recent activity feed.*
 
 - **Animated Radial Canvas:** central `zTeam Orchestrator` hub firing glowing Bézier particles to/from `System Architect`, `UI/UX Designer`, `Tech Architect`, `QA TDD Red`, `Software Engineer`, `QA TDD Verify`, and `Critics & Gates` as each agent is called or consults a teammate.
-- **Top KPI Cards:** *Total Events*, *Payload Chars In*, *Specs Progress*, *Output Chars*, and *Retries / Fixes*.
+- **Top KPI Cards (auto-synced from disk):** *Total Events*, *Payload Chars In*, *Specs Progress* (auto-scanned from `.docs/todo.md` `[x]/[ ]` and `.docs/specs/*.spec.md`), *Output / Disk Chars* (and files touched across `.docs/**`, `src/**`, `tests/**`), and *Retries / Fixes*.
+- **Orphan-Start Reconciliation & Completion Banner:** if a subagent stage transitions without an explicit `done`, `emitLiveEvent` automatically closes the previous `start` event so no stage stays stuck in progress; when the pipeline finishes (`recordStage: "pipeline", recordStatus: "done"` or `qa-tdd-verify` done), the header badge switches to **`Pipeline Completed ✓`**.
 - **Recent Agent Activity Feed:** live stream of stages, active `skillKey`, chars `↑/↓` or files touched, and relative timestamps.
 - **Zero-server JSONP polling:** the orchestrator writes `.docs/zteam-live.js` (`window.__ZTEAM_LIVE__ = ...`) and `.docs/zteam-live.json` on every LangGraph node, LLM call (`invokeRoleLlm`), teammate consult (`consultTeammate`), or `get_pipeline_state` push; the HTML page reloads `.docs/zteam-live.js` every 1 second.
-- **Clean Chat Contract:** when running in Cursor (`delegationPlaybook`), the orchestrator agent pushes subagent start/done events via `get_pipeline_state({ recordStage, recordRole, recordStatus, recordMessage })` so the HTML dashboard animates the full work while the Cursor chat prints **only the 1-line `chatBanner`**.
+- **Clean Chat Contract & Host-Only Telemetry:** when running in Cursor (`delegationPlaybook`), the host agent pushes subagent `start`/`done` events + mechanical stage gates (`checkGate: true`) via `get_pipeline_state` while the Cursor chat prints **only the 1-line `chatBanner`**. Subagent prompts stay lean and never call `get_pipeline_state` themselves.
+- **`cursorModels` per Role + 2-Wave Per-Slug Playbook:** `.zteam/config.json` supports `projectType` (`webgame`, `webapp`, `crud`, `backend`, `ai-rag`, …) and optional `cursorModels` per role (e.g. `{ "softwareEngineer": "composer-2.5" }`) alongside `models.*: "inherit"`, expanding Wave 1 (architecture + critics + `.docs/host.json` probe) and Wave 2 (3-handed spec + `qa-tdd-red:{slug}` → `se-implement:{slug}` → `delivery-critic:{slug}` per todo item, with `workflow=resume` checkpointing in `.docs/pipeline-state.json`).
 
 While the pipeline runs (MCP tool or CLI):
 

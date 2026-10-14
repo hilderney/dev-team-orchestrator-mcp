@@ -5,8 +5,12 @@
  * `.docs/zteam-live.js` (`window.__ZTEAM_LIVE__ = {...}`) and `.docs/zteam-live.json`,
  * while `.zteam/dashboard/index.html` polls `.docs/zteam-live.js` every ~1s via dynamic <script> tag
  * and animates Bézier particle pulses between the Orchestrator hub and each subagent/node.
+ *
+ * Also auto-scans `.docs/todo.md`, `.docs/specs/*.spec.md`, `src/**`, and `tests/**`
+ * on every emit so KPI cards (Specs Progress, Files Touched, Chars In/Out, Pipeline Status)
+ * stay 100% accurate even when subagents write files directly on disk.
  */
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
 export const LIVE_FEED_JSON_PATH = ".docs/zteam-live.json";
@@ -51,6 +55,7 @@ export type LiveDashboardState = {
   projectType: string;
   activeStage: string;
   activeNode: LiveNodeId;
+  pipelineStatus?: "idle" | "running" | "completed" | "error";
   seq: number;
   kpis: {
     totalEvents: number;
@@ -88,12 +93,142 @@ async function pathExists(abs: string): Promise<boolean> {
   }
 }
 
+/**
+ * Scan disk artefacts under `appRoot` so KPI numbers never drift when Cursor Task subagents
+ * write `.docs/todo.md`, `.docs/specs/*.spec.md`, `src/**`, or `tests/**` directly.
+ */
+export async function scanAppDiskMetrics(appRoot: string): Promise<{
+  specsDone: number;
+  specsTotal: number;
+  filesCount: number;
+  artefactChars: number;
+}> {
+  const root = resolve(appRoot);
+  let specsDone = 0;
+  let specsTotal = 0;
+  let filesCount = 0;
+  let artefactChars = 0;
+
+  // 1. Parse .docs/todo.md checkboxes
+  const todoPath = join(root, ".docs", "todo.md");
+  if (await pathExists(todoPath)) {
+    try {
+      const todoRaw = await readFile(todoPath, "utf8");
+      artefactChars += todoRaw.length;
+      const lines = todoRaw.split(/\r?\n/);
+      for (const line of lines) {
+        const m = line.match(/^\s*-\s*\[([ xX])\]\s+([a-z0-9-_]+)\b/i);
+        if (m) {
+          specsTotal++;
+          if (m[1].toLowerCase() === "x") specsDone++;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // 2. Count .docs/specs/*.spec.md
+  const specsDir = join(root, ".docs", "specs");
+  let specFilesCount = 0;
+  if (await pathExists(specsDir)) {
+    try {
+      const entries = await readdir(specsDir);
+      for (const name of entries) {
+        if (name.endsWith(".spec.md")) {
+          specFilesCount++;
+          filesCount++;
+          try {
+            const st = await stat(join(specsDir, name));
+            artefactChars += st.size;
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (specsTotal === 0 && specFilesCount > 0) {
+    specsTotal = specFilesCount;
+  }
+
+  // 3. Count core .docs markdown files
+  for (const docName of [
+    "requirements.md",
+    "technologies.md",
+    "ui-ux.md",
+    "todo.md",
+    "user-report.md",
+  ]) {
+    const p = join(root, ".docs", docName);
+    if (await pathExists(p)) {
+      filesCount++;
+      if (docName !== "todo.md") {
+        try {
+          const st = await stat(p);
+          artefactChars += st.size;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  // 4. Count files in src/ and tests/
+  async function walkDir(dir: string, depth = 0): Promise<void> {
+    if (depth > 4 || !(await pathExists(dir))) return;
+    try {
+      const entries = await readdir(dir, { withFileTypes: true });
+      for (const e of entries) {
+        if (
+          e.name === "node_modules" ||
+          e.name === ".git" ||
+          e.name === "dist" ||
+          e.name === ".zteam" ||
+          e.name === ".docs"
+        ) {
+          continue;
+        }
+        const full = join(dir, e.name);
+        if (e.isDirectory()) {
+          await walkDir(full, depth + 1);
+        } else if (/\.(ts|tsx|js|jsx|mjs|css|html|json)$/i.test(e.name)) {
+          filesCount++;
+          try {
+            const st = await stat(full);
+            artefactChars += st.size;
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  await walkDir(join(root, "src"));
+  await walkDir(join(root, "tests"));
+  await walkDir(join(root, "test"));
+
+  return { specsDone, specsTotal, filesCount, artefactChars };
+}
+
 export function stageToLiveNodeId(stage: string, role?: string): LiveNodeId {
   const s = (stage || "").trim();
   const r = (role || "").trim();
+  if (/^(pipeline|done|complete|finished|finalize)$/i.test(s)) {
+    return "orchestrator";
+  }
   if (/qaTddRed|qa-tdd-red|tdd-red/i.test(s)) return "qaTddRed";
   if (/qaEngineer|qa-tdd-verify|tdd-verify/i.test(s)) return "qaVerify";
-  if (/fidelityCritic|deliveryCritic|archCritic|delivery-critic|scaffold|bootstrapFix/i.test(s)) {
+  if (
+    /fidelityCritic|fidelity-critic|deliveryCritic|archCritic|architecture-critic|delivery-critic|scaffold|bootstrapFix/i.test(
+      s
+    )
+  ) {
     return "critics";
   }
   if (/uiUx|ux-/i.test(s) || r === "uiUxDesigner") return "uiUxDesigner";
@@ -103,7 +238,10 @@ export function stageToLiveNodeId(stage: string, role?: string): LiveNodeId {
   if (/softwareEngineer|se-/i.test(s) || r === "softwareEngineer") {
     return "softwareEngineer";
   }
-  if (/systemArchitect|sa-|bootstrapReadme|cleanReadme/i.test(s) || r === "systemArchitect") {
+  if (
+    /systemArchitect|sa-|bootstrapReadme|cleanReadme/i.test(s) ||
+    r === "systemArchitect"
+  ) {
     return "systemArchitect";
   }
   if (r === "qaEngineer") return "qaVerify";
@@ -222,6 +360,7 @@ export function emptyLiveDashboardState(
     projectType: partial?.projectType || "core",
     activeStage: partial?.activeStage || "idle",
     activeNode: partial?.activeNode || "orchestrator",
+    pipelineStatus: partial?.pipelineStatus || "idle",
     seq: partial?.seq ?? 0,
     kpis: partial?.kpis ?? {
       totalEvents: 0,
@@ -291,7 +430,8 @@ export type EmitLiveEventInput = {
 
 /**
  * Append a live event + update node state & KPIs in `.docs/zteam-live.{json,js}`.
- * Never throws so pipeline execution is never blocked by dashboard I/O.
+ * Auto-reconciles orphan `start` events when switching stages and scans disk for real
+ * specs/files counts so KPIs never stay stuck at `0 / 0`.
  */
 export async function emitLiveEvent(
   input: EmitLiveEventInput
@@ -305,11 +445,60 @@ export async function emitLiveEvent(
         projectType: input.projectType,
       });
 
-    const seq = (prev.seq || 0) + 1;
+    const disk = await scanAppDiskMetrics(input.appRoot);
+    let seq = prev.seq || 0;
     const now = new Date().toISOString();
     const targetNode = stageToLiveNodeId(input.stage, input.role);
     const status = input.status || "info";
+    const isPipelineTerminal =
+      (/^(pipeline|done|complete|finished|finalize)$/i.test(input.stage) &&
+        (status === "done" || status === "error")) ||
+      (input.stage === "qa-tdd-verify" && status === "done");
 
+    const syntheticEvents: LivePulseEvent[] = [];
+    const nodes = { ...defaultNodes(), ...(prev.nodes || {}) };
+
+    // Auto-close any previously active stage that never received an explicit `done`
+    if (
+      (status === "start" || isPipelineTerminal) &&
+      prev.activeStage &&
+      prev.activeStage !== "idle" &&
+      prev.activeStage !== "done" &&
+      prev.activeStage !== input.stage
+    ) {
+      const prevNodeId = prev.activeNode || stageToLiveNodeId(prev.activeStage);
+      if (
+        prevNodeId !== "orchestrator" &&
+        nodes[prevNodeId]?.status === "active"
+      ) {
+        nodes[prevNodeId] = {
+          ...nodes[prevNodeId],
+          status: "done",
+          updatedAt: now,
+        };
+        // Check if the last event for prev.activeStage was a "start" without a matching "done"
+        const prevStageEvents = (prev.events || []).filter(
+          (e) => e.stage === prev.activeStage
+        );
+        if (prevStageEvents[0]?.status === "start") {
+          seq += 1;
+          syntheticEvents.push({
+            id: `ev-${seq}`,
+            seq,
+            at: now,
+            from: prevNodeId,
+            to: "orchestrator",
+            stage: prev.activeStage,
+            role: prevStageEvents[0].role,
+            skillKey: prevStageEvents[0].skillKey,
+            status: "done",
+            message: `Completed ${prev.activeStage}`,
+          });
+        }
+      }
+    }
+
+    seq += 1;
     const from: LiveNodeId =
       input.from ||
       (status === "done" || status === "error" ? targetNode : "orchestrator");
@@ -334,7 +523,6 @@ export async function emitLiveEvent(
       filesCount: input.filesCount,
     };
 
-    const nodes = { ...defaultNodes(), ...(prev.nodes || {}) };
     const nodeEntry = { ...(nodes[targetNode] || defaultNodes()[targetNode]) };
     nodeEntry.lastStage = input.stage;
     nodeEntry.lastMessage = input.message.slice(0, 140);
@@ -355,9 +543,13 @@ export async function emitLiveEvent(
     }
 
     // Mark previously active sibling nodes as done when switching active stage
-    if (status === "start" || status === "info") {
+    if (status === "start" || status === "info" || isPipelineTerminal) {
       for (const k of Object.keys(nodes) as LiveNodeId[]) {
-        if (k !== targetNode && k !== "orchestrator" && nodes[k].status === "active") {
+        if (
+          k !== targetNode &&
+          k !== "orchestrator" &&
+          nodes[k].status === "active"
+        ) {
           nodes[k] = { ...nodes[k], status: "done" };
         }
       }
@@ -365,8 +557,13 @@ export async function emitLiveEvent(
     nodes[targetNode] = nodeEntry;
     nodes.orchestrator = {
       ...nodes.orchestrator,
-      status: status === "error" ? "error" : "active",
-      lastStage: input.stage,
+      status:
+        status === "error"
+          ? "error"
+          : isPipelineTerminal
+            ? "done"
+            : "active",
+      lastStage: isPipelineTerminal && status === "done" ? "done" : input.stage,
       lastMessage: input.message.slice(0, 140),
       updatedAt: now,
     };
@@ -375,24 +572,54 @@ export async function emitLiveEvent(
       /retry|fix|reopen|FAIL|handoff/i.test(input.stage) ||
       /retry|fix|reopen|FAIL|handoff/i.test(input.message);
 
+    const accumCharsOut = (prev.kpis?.charsOut || 0) + (input.charsOut || 0);
+    const effectiveCharsOut = Math.max(accumCharsOut, disk.artefactChars);
+    const accumFiles = (prev.kpis?.filesWritten || 0) + (input.filesCount || 0);
+    const effectiveFiles = Math.max(accumFiles, disk.filesCount);
+
     const kpis = {
-      totalEvents: (prev.kpis?.totalEvents || 0) + 1,
-      specsDone: input.specsDone ?? prev.kpis?.specsDone ?? 0,
-      specsTotal: input.specsTotal ?? prev.kpis?.specsTotal ?? 0,
+      totalEvents:
+        (prev.kpis?.totalEvents || 0) + 1 + syntheticEvents.length,
+      specsDone:
+        input.specsDone ??
+        (disk.specsTotal > 0 ? disk.specsDone : prev.kpis?.specsDone ?? 0),
+      specsTotal:
+        input.specsTotal ??
+        (disk.specsTotal > 0 ? disk.specsTotal : prev.kpis?.specsTotal ?? 0),
       charsIn: (prev.kpis?.charsIn || 0) + (input.charsIn || 0),
-      charsOut: (prev.kpis?.charsOut || 0) + (input.charsOut || 0),
-      filesWritten: (prev.kpis?.filesWritten || 0) + (input.filesCount || 0),
+      charsOut: effectiveCharsOut,
+      filesWritten: effectiveFiles,
       retriesAndFixes:
         (prev.kpis?.retriesAndFixes || 0) + (isRetryOrFix ? 1 : 0),
     };
 
-    const events = [ev, ...(prev.events || [])].slice(0, MAX_LIVE_EVENTS);
+    const pipelineStatus: LiveDashboardState["pipelineStatus"] =
+      status === "error"
+        ? "error"
+        : isPipelineTerminal
+          ? "completed"
+          : "running";
+
+    const activeNode: LiveNodeId =
+      status === "done" || isPipelineTerminal ? "orchestrator" : targetNode;
+    const activeStage =
+      isPipelineTerminal && status === "done"
+        ? "completed"
+        : status === "done"
+          ? `${input.stage} (done)`
+          : input.stage;
+
+    const events = [ev, ...syntheticEvents, ...(prev.events || [])].slice(
+      0,
+      MAX_LIVE_EVENTS
+    );
     const next: LiveDashboardState = {
       ...prev,
       workflow: input.workflow || prev.workflow || "full",
       projectType: input.projectType || prev.projectType || "core",
-      activeStage: input.stage,
-      activeNode: targetNode,
+      activeStage,
+      activeNode,
+      pipelineStatus,
       seq,
       kpis,
       nodes,
@@ -514,6 +741,16 @@ export function buildLiveDashboardHtml(): string {
   .pill:hover, .pill.active {
     color: var(--text);
     border-color: var(--accent);
+  }
+  .pill.completed {
+    color: var(--green);
+    border-color: var(--green);
+    background: rgba(34, 197, 94, 0.1);
+  }
+  .pill.error {
+    color: var(--red);
+    border-color: var(--red);
+    background: rgba(239, 68, 68, 0.1);
   }
   .status-dot {
     width: 8px;
@@ -699,7 +936,7 @@ export function buildLiveDashboardHtml(): string {
     </div>
     <div class="controls">
       <button class="pill" id="btnSimulate" title="Fire a demo pulse across all agents">⚡ Simulate Pulse</button>
-      <span class="pill active"><span class="status-dot" id="liveDot"></span><span id="liveStatus">Polling .docs/zteam-live.js</span></span>
+      <span class="pill active" id="statusPill"><span class="status-dot" id="liveDot"></span><span id="liveStatus">Polling .docs/zteam-live.js</span></span>
     </div>
   </header>
 
@@ -720,9 +957,9 @@ export function buildLiveDashboardHtml(): string {
       <div class="kpi-sub" id="kpiFiles">0 files touched</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Output Chars</div>
+      <div class="kpi-label">Output / Disk Chars</div>
       <div class="kpi-val val-green" id="kpiCharsOut">0</div>
-      <div class="kpi-sub">Agent generations</div>
+      <div class="kpi-sub">Generated artefacts</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Retries / Fixes</div>
@@ -791,6 +1028,7 @@ export function buildLiveDashboardHtml(): string {
     projectType: "core",
     activeStage: "idle",
     activeNode: "orchestrator",
+    pipelineStatus: "idle",
     seq: 0,
     kpis: { totalEvents: 0, specsDone: 0, specsTotal: 0, charsIn: 0, charsOut: 0, filesWritten: 0, retriesAndFixes: 0 },
     nodes: {
@@ -859,6 +1097,11 @@ export function buildLiveDashboardHtml(): string {
         setTimeout(() => {
           spawnPulse(id, "orchestrator", "#22c55e");
           state.nodes[id].status = "done";
+          if (idx === order.length - 1) {
+            state.activeNode = "orchestrator";
+            state.activeStage = "completed";
+            state.pipelineStatus = "completed";
+          }
         }, 650);
       }, idx * 450);
     });
@@ -905,8 +1148,14 @@ export function buildLiveDashboardHtml(): string {
 
     const hub = getCoords("orchestrator", w, h);
 
-    // Keep continuous subtle pulse on activeNode
-    if (state.activeNode && state.activeNode !== "orchestrator" && Math.random() < 0.06) {
+    // Keep continuous subtle pulse ONLY while an agent is actively running
+    if (
+      state.pipelineStatus !== "completed" &&
+      state.activeNode &&
+      state.activeNode !== "orchestrator" &&
+      state.nodes?.[state.activeNode]?.status === "active" &&
+      Math.random() < 0.06
+    ) {
       spawnPulse("orchestrator", state.activeNode, NODE_LAYOUT[state.activeNode]?.color);
     }
 
@@ -915,7 +1164,9 @@ export function buildLiveDashboardHtml(): string {
       if (id === "orchestrator") return;
       const target = getCoords(id, w, h);
       const nodeState = state.nodes?.[id] || {};
-      const isActive = state.activeNode === id || nodeState.status === "active";
+      const isActive =
+        state.pipelineStatus !== "completed" &&
+        (state.activeNode === id || nodeState.status === "active");
       const isDone = nodeState.status === "done";
       const ctrl = {
         x: (hub.x + target.x) / 2,
@@ -963,7 +1214,8 @@ export function buildLiveDashboardHtml(): string {
       const lay = NODE_LAYOUT[id];
       const n = state.nodes?.[id] || { label: id, sublabel: "", status: "idle", calls: 0 };
       const isHub = id === "orchestrator";
-      const isActive = state.activeNode === id || n.status === "active";
+      const isCompleted = state.pipelineStatus === "completed";
+      const isActive = !isCompleted && (state.activeNode === id || n.status === "active");
       const cardW = (isHub ? 190 : 176) * zoom;
       const cardH = (isHub ? 58 : 54) * zoom;
       const x = pos.x - cardW / 2;
@@ -973,8 +1225,8 @@ export function buildLiveDashboardHtml(): string {
       ctx.beginPath();
       ctx.roundRect(x, y, cardW, cardH, 10 * zoom);
       ctx.fillStyle = isHub ? "#191516" : "#131621";
-      if (isActive) {
-        ctx.shadowColor = lay.color;
+      if (isActive || (isHub && isCompleted)) {
+        ctx.shadowColor = isHub && isCompleted ? "#22c55e" : lay.color;
         ctx.shadowBlur = 18;
       }
       ctx.fill();
@@ -982,7 +1234,7 @@ export function buildLiveDashboardHtml(): string {
 
       ctx.lineWidth = isActive ? 2 : 1.2;
       ctx.strokeStyle = isHub
-        ? "#f97316"
+        ? (isCompleted ? "#22c55e" : "#f97316")
         : n.status === "error"
           ? "#ef4444"
           : isActive
@@ -1059,9 +1311,26 @@ export function buildLiveDashboardHtml(): string {
     document.getElementById("projMeta").textContent =
       "workflow: " + (state.workflow || "full") + " · projectType: " + (state.projectType || "core") + " · updated " + relTime(state.updatedAt);
 
+    const statusPill = document.getElementById("statusPill");
+    const liveStatus = document.getElementById("liveStatus");
+    const liveDot = document.getElementById("liveDot");
+    if (state.pipelineStatus === "completed") {
+      statusPill.className = "pill completed";
+      liveStatus.textContent = "Pipeline Completed ✓";
+      liveDot.style.background = "#22c55e";
+    } else if (state.pipelineStatus === "error") {
+      statusPill.className = "pill error";
+      liveStatus.textContent = "Pipeline Error ✗";
+      liveDot.style.background = "#ef4444";
+    } else {
+      statusPill.className = "pill active";
+      liveStatus.textContent = "Polling .docs/zteam-live.js";
+      liveDot.style.background = "#22c55e";
+    }
+
     const k = state.kpis || {};
     document.getElementById("kpiEvents").textContent = fmtNum(k.totalEvents);
-    document.getElementById("kpiActiveStage").textContent = "Active: " + (state.activeStage || "idle");
+    document.getElementById("kpiActiveStage").textContent = "Stage: " + (state.activeStage || "idle");
     document.getElementById("kpiCharsIn").textContent = fmtNum(k.charsIn);
     document.getElementById("kpiSpecs").textContent = (k.specsDone || 0) + " / " + (k.specsTotal || 0);
     document.getElementById("kpiFiles").textContent = fmtNum(k.filesWritten) + " files touched";
@@ -1138,13 +1407,16 @@ export async function ensureLiveDashboardFiles(
 
   const existingState = await readLiveDashboardState(root);
   if (!existingState) {
-    await writeLiveDashboardState(
-      root,
-      emptyLiveDashboardState(root, {
-        workflow: opts?.workflow,
-        projectType: opts?.projectType,
-      })
-    );
+    const disk = await scanAppDiskMetrics(root);
+    const initial = emptyLiveDashboardState(root, {
+      workflow: opts?.workflow,
+      projectType: opts?.projectType,
+    });
+    initial.kpis.specsDone = disk.specsDone;
+    initial.kpis.specsTotal = disk.specsTotal;
+    initial.kpis.filesWritten = disk.filesCount;
+    initial.kpis.charsOut = disk.artefactChars;
+    await writeLiveDashboardState(root, initial);
   }
   return {
     htmlPath,
